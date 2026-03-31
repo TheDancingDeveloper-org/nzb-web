@@ -1373,6 +1373,19 @@ impl QueueManager {
         self.min_free_space
     }
 
+    /// Lock the database and execute a closure with direct access.
+    ///
+    /// This allows callers (e.g. app-specific handlers) to run arbitrary
+    /// queries against the underlying `Database`, such as newsgroup-browsing
+    /// operations that only exist when the `groups-db` feature is enabled.
+    pub fn with_db<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&Database) -> R,
+    {
+        let db = self.db.lock();
+        f(&db)
+    }
+
     // -----------------------------------------------------------------------
     // History query methods (delegate to DB)
     // -----------------------------------------------------------------------
