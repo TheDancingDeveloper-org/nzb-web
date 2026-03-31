@@ -1299,7 +1299,11 @@ impl QueueManager {
     // -----------------------------------------------------------------------
 
     /// Update the server list at runtime.
-    pub fn update_servers(&self, servers: Vec<ServerConfig>) {
+    ///
+    /// If any enabled servers are present, jobs that were paused due to
+    /// server errors (e.g. auth failure / service unavailable) are
+    /// automatically resumed.
+    pub fn update_servers(self: &Arc<Self>, servers: Vec<ServerConfig>) {
         let enabled = servers.iter().filter(|s| s.enabled).count();
         info!(
             total = servers.len(),
@@ -1307,6 +1311,42 @@ impl QueueManager {
             "Updating server list"
         );
         *self.servers.lock() = servers;
+
+        // Auto-resume jobs paused by server errors now that config changed
+        if enabled > 0 {
+            self.resume_server_paused_jobs();
+        }
+    }
+
+    /// Resume jobs that were paused due to server unavailability.
+    ///
+    /// Only targets jobs where `error_message` is set (i.e. paused by the
+    /// circuit breaker / `NoServersAvailable`), not user-paused jobs.
+    fn resume_server_paused_jobs(self: &Arc<Self>) {
+        let mut resumed = 0u32;
+        {
+            let mut jobs = self.jobs.lock();
+            for (_id, state) in jobs.iter_mut() {
+                if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
+                    let task_running = state
+                        .task_handle
+                        .as_ref()
+                        .is_some_and(|h| !h.is_finished());
+                    state.job.error_message = None;
+                    state.engine.resume();
+                    if task_running {
+                        state.job.status = JobStatus::Downloading;
+                    } else {
+                        state.job.status = JobStatus::Queued;
+                    }
+                    resumed += 1;
+                }
+            }
+        }
+        if resumed > 0 {
+            info!(count = resumed, "Resumed server-paused jobs after config change");
+            self.start_next_queued();
+        }
     }
 
     /// Get current server configs.
