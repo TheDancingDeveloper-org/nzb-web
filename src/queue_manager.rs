@@ -636,6 +636,8 @@ impl QueueManager {
                         }
                     }
                     self.persist_job_progress(&job_id);
+                    // Release the download slot so queued jobs can start
+                    self.start_next_queued();
                     break;
                 }
             }
@@ -1054,26 +1056,31 @@ impl QueueManager {
     }
 
     /// Pause a specific job.
-    pub fn pause_job(&self, id: &str) -> crate::nzb_core::Result<()> {
-        let mut jobs = self.jobs.lock();
-        let state = jobs
-            .get_mut(id)
-            .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
+    pub fn pause_job(self: &Arc<Self>, id: &str) -> crate::nzb_core::Result<()> {
+        {
+            let mut jobs = self.jobs.lock();
+            let state = jobs
+                .get_mut(id)
+                .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
 
-        state.job.status = JobStatus::Paused;
-        state.engine.pause();
+            state.job.status = JobStatus::Paused;
+            state.engine.pause();
 
-        let db = self.db.lock();
-        db.queue_update_progress(
-            id,
-            JobStatus::Paused,
-            state.job.downloaded_bytes,
-            state.job.articles_downloaded,
-            state.job.articles_failed,
-            state.job.files_completed,
-        )?;
+            let db = self.db.lock();
+            db.queue_update_progress(
+                id,
+                JobStatus::Paused,
+                state.job.downloaded_bytes,
+                state.job.articles_downloaded,
+                state.job.articles_failed,
+                state.job.files_completed,
+            )?;
 
-        info!(job_id = %id, "Job paused");
+            info!(job_id = %id, "Job paused");
+        }
+
+        // Release the download slot so queued jobs can start
+        self.start_next_queued();
         Ok(())
     }
 
