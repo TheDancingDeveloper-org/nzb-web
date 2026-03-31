@@ -6,6 +6,10 @@ description = "Usenet download engine: queue management, download orchestration,
 license = "MIT"
 repository = "https://github.com/AusAgentSmith-org/nzb-web"
 
+[features]
+default = []
+groups-db = ["nzb-postproc/groups-db"]
+
 [dependencies]
 nzb-decode = { path = "/home/sprooty/Working/libs/nzb-decode" }
 nzb-postproc = { path = "/home/sprooty/Working/libs/nzb-postproc" }
