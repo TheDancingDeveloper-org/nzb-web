@@ -148,8 +148,8 @@ pub struct QueueManager {
     /// Database for persistence.
     db: Mutex<Database>,
     /// App config (incomplete_dir, complete_dir).
-    incomplete_dir: std::path::PathBuf,
-    complete_dir: std::path::PathBuf,
+    incomplete_dir: Mutex<std::path::PathBuf>,
+    complete_dir: Mutex<std::path::PathBuf>,
     /// Timed pause: when to auto-resume (None = not timed).
     pause_until: Mutex<Option<DateTime<Utc>>>,
     /// History retention limit (None = keep all).
@@ -197,8 +197,8 @@ impl QueueManager {
             globally_paused: AtomicBool::new(false),
             speed: SpeedTracker::new(),
             db: Mutex::new(db),
-            incomplete_dir,
-            complete_dir,
+            incomplete_dir: Mutex::new(incomplete_dir),
+            complete_dir: Mutex::new(complete_dir),
             pause_until: Mutex::new(None),
             history_retention: Mutex::new(None),
             log_buffer: Some(log_buffer),
@@ -400,7 +400,7 @@ impl QueueManager {
         };
 
         // Pre-flight disk space check
-        let free = get_disk_free(&self.incomplete_dir);
+        let free = get_disk_free(&self.incomplete_dir.lock());
         if self.min_free_space > 0 && free > 0 && free < self.min_free_space {
             warn!(
                 job_id = %job_id,
@@ -1192,7 +1192,7 @@ impl QueueManager {
             Some((_, s)) => {
                 s.job.category = category.to_string();
                 // Update the output directory to match the new category
-                let complete_dir = self.complete_dir.join(category).join(&s.job.name);
+                let complete_dir = self.complete_dir.lock().join(category).join(&s.job.name);
                 s.job.output_dir = complete_dir;
                 info!(job_id = %id, category = %category, "Job category changed");
                 Ok(())
@@ -1398,14 +1398,24 @@ impl QueueManager {
         self.jobs.lock().len()
     }
 
-    /// Get a reference to the incomplete_dir.
-    pub fn incomplete_dir(&self) -> &std::path::Path {
-        &self.incomplete_dir
+    /// Get the current incomplete directory.
+    pub fn incomplete_dir(&self) -> std::path::PathBuf {
+        self.incomplete_dir.lock().clone()
     }
 
-    /// Get a reference to the complete_dir.
-    pub fn complete_dir(&self) -> &std::path::Path {
-        &self.complete_dir
+    /// Set the incomplete directory at runtime.
+    pub fn set_incomplete_dir(&self, dir: std::path::PathBuf) {
+        *self.incomplete_dir.lock() = dir;
+    }
+
+    /// Get the current complete directory.
+    pub fn complete_dir(&self) -> std::path::PathBuf {
+        self.complete_dir.lock().clone()
+    }
+
+    /// Set the complete directory at runtime.
+    pub fn set_complete_dir(&self, dir: std::path::PathBuf) {
+        *self.complete_dir.lock() = dir;
     }
 
     /// Get the minimum free disk space threshold.
@@ -1772,7 +1782,7 @@ impl QueueManager {
                 // Periodic disk space check (every 30 seconds)
                 tick_count += 1;
                 if tick_count.is_multiple_of(30) && qm.min_free_space > 0 {
-                    let free = get_disk_free(&qm.incomplete_dir);
+                    let free = get_disk_free(&qm.incomplete_dir.lock());
                     if free > 0
                         && free < qm.min_free_space
                         && !qm.globally_paused.load(Ordering::Relaxed)
