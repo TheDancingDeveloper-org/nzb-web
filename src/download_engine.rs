@@ -803,6 +803,7 @@ async fn download_worker_pipelined(
         }
 
         // Fill the pipeline with work items
+        let mut consecutive_skips: usize = 0;
         while pipeline.pending_count() + pipeline.in_flight_count() < pipe_depth as usize {
             let item = { work_queue.lock().pop_front() };
             let Some(item) = item else {
@@ -811,9 +812,18 @@ async fn download_worker_pipelined(
 
             // Skip if this worker's server was already tried
             if item.tried_servers.contains(&primary_server.id) {
-                work_queue.lock().push_back(item);
+                let queue_len = {
+                    let mut q = work_queue.lock();
+                    q.push_back(item);
+                    q.len()
+                };
+                consecutive_skips += 1;
+                if consecutive_skips > queue_len {
+                    break;
+                }
                 continue;
             }
+            consecutive_skips = 0;
 
             let tag = next_tag;
             next_tag += 1;
