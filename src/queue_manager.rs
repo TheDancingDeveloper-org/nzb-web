@@ -394,6 +394,58 @@ impl QueueManager {
     /// the existing map entry with the engine and task handle.  If the
     /// pre-flight disk-space check fails, the job is set to `Paused`.
     fn launch_download(self: &Arc<Self>, job_id: &str) {
+        // Lazily load NZB data if not in memory (queued jobs skip loading at restore time)
+        {
+            let mut jobs = self.jobs.lock();
+            if let Some(state) = jobs.get_mut(job_id) {
+                if state.nzb_data.is_none() {
+                    let db = self.db.lock();
+                    if let Some(data) = db.queue_get_nzb_data(job_id).unwrap_or(None) {
+                        // Parse NZB to populate files/articles
+                        match nzb_parser::parse_nzb(&state.job.name, &data) {
+                            Ok(parsed) => {
+                                state.job.files = parsed.files;
+                                // Apply checkpoint if available
+                                if let Some(cp_data) = db.queue_load_job_data(job_id).unwrap_or(None) {
+                                    if let Ok(checkpoint) = serde_json::from_slice::<JobCheckpoint>(&cp_data) {
+                                        state.job.downloaded_bytes = checkpoint.downloaded_bytes;
+                                        state.job.articles_downloaded = checkpoint.articles_downloaded;
+                                        state.job.articles_failed = checkpoint.articles_failed;
+                                        state.job.files_completed = checkpoint.files_completed;
+                                        for file in &mut state.job.files {
+                                            if let Some(segments) = checkpoint.files.get(&file.id) {
+                                                let mut fbd: u64 = 0;
+                                                for article in &mut file.articles {
+                                                    if segments.contains(&article.segment_number) {
+                                                        article.downloaded = true;
+                                                        fbd += article.bytes;
+                                                    }
+                                                }
+                                                file.bytes_downloaded = fbd;
+                                                if file.articles.iter().all(|a| a.downloaded) {
+                                                    file.assembled = true;
+                                                }
+                                            }
+                                        }
+                                        info!(
+                                            job_id = %job_id,
+                                            name = %state.job.name,
+                                            articles_downloaded = state.job.articles_downloaded,
+                                            "Lazy-loaded job checkpoint"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(job_id = %job_id, "Failed to lazy-load NZB data: {e}");
+                            }
+                        }
+                        state.nzb_data = Some(data);
+                    }
+                }
+            }
+        }
+
         // Read job data from the map (we need a copy for the spawned task)
         let (job, nzb_data) = {
             let jobs = self.jobs.lock();
@@ -1621,84 +1673,87 @@ impl QueueManager {
             let job_id = job.id.clone();
             let engine = Arc::new(DownloadEngine::new());
 
-            // Try to load NZB data from DB
-            let nzb_data = {
+            // Only load full NZB data + checkpoints for jobs that were actively
+            // downloading. Queued/paused jobs just need metadata — their NZB data
+            // is loaded lazily in launch_download() when they reach the front of
+            // the queue. This keeps memory low with large queues (hundreds of jobs).
+            let was_active = job.status == JobStatus::Downloading;
+
+            let nzb_data = if was_active {
                 let db = self.db.lock();
                 db.queue_get_nzb_data(&job_id).unwrap_or(None)
+            } else {
+                None
             };
 
-            // Re-parse NZB to populate files and articles
-            if let Some(ref data) = nzb_data {
-                match nzb_parser::parse_nzb(&job.name, data) {
-                    Ok(parsed) => {
-                        job.files = parsed.files;
-                    }
-                    Err(e) => {
-                        warn!(job_id = %job_id, "Failed to re-parse NZB data: {e}");
+            if was_active {
+                // Re-parse NZB to populate files and articles
+                if let Some(ref data) = nzb_data {
+                    match nzb_parser::parse_nzb(&job.name, data) {
+                        Ok(parsed) => {
+                            job.files = parsed.files;
+                        }
+                        Err(e) => {
+                            warn!(job_id = %job_id, "Failed to re-parse NZB data: {e}");
+                        }
                     }
                 }
-            }
 
-            // Load and apply checkpoint to mark downloaded articles
-            let checkpoint_data = {
-                let db = self.db.lock();
-                db.queue_load_job_data(&job_id).unwrap_or(None)
-            };
+                // Load and apply checkpoint to mark downloaded articles
+                let checkpoint_data = {
+                    let db = self.db.lock();
+                    db.queue_load_job_data(&job_id).unwrap_or(None)
+                };
 
-            if let Some(ref data) = checkpoint_data {
-                match serde_json::from_slice::<JobCheckpoint>(data) {
-                    Ok(checkpoint) => {
-                        // Restore progress counters from checkpoint
-                        job.downloaded_bytes = checkpoint.downloaded_bytes;
-                        job.articles_downloaded = checkpoint.articles_downloaded;
-                        job.articles_failed = checkpoint.articles_failed;
-                        job.files_completed = checkpoint.files_completed;
+                if let Some(ref data) = checkpoint_data {
+                    match serde_json::from_slice::<JobCheckpoint>(data) {
+                        Ok(checkpoint) => {
+                            job.downloaded_bytes = checkpoint.downloaded_bytes;
+                            job.articles_downloaded = checkpoint.articles_downloaded;
+                            job.articles_failed = checkpoint.articles_failed;
+                            job.files_completed = checkpoint.files_completed;
 
-                        // Mark articles as downloaded based on checkpoint
-                        for file in &mut job.files {
-                            if let Some(segments) = checkpoint.files.get(&file.id) {
-                                let mut file_bytes_downloaded: u64 = 0;
-                                for article in &mut file.articles {
-                                    if segments.contains(&article.segment_number) {
-                                        article.downloaded = true;
-                                        file_bytes_downloaded += article.bytes;
+                            for file in &mut job.files {
+                                if let Some(segments) = checkpoint.files.get(&file.id) {
+                                    let mut file_bytes_downloaded: u64 = 0;
+                                    for article in &mut file.articles {
+                                        if segments.contains(&article.segment_number) {
+                                            article.downloaded = true;
+                                            file_bytes_downloaded += article.bytes;
+                                        }
+                                    }
+                                    file.bytes_downloaded = file_bytes_downloaded;
+                                    if file.articles.iter().all(|a| a.downloaded) {
+                                        file.assembled = true;
                                     }
                                 }
-                                file.bytes_downloaded = file_bytes_downloaded;
-
-                                // Mark file as assembled if all articles are downloaded
-                                if file.articles.iter().all(|a| a.downloaded) {
-                                    file.assembled = true;
-                                }
                             }
-                        }
 
-                        let remaining = job
-                            .article_count
-                            .saturating_sub(job.articles_downloaded + job.articles_failed);
-                        info!(
-                            job_id = %job_id,
-                            name = %job.name,
-                            articles_downloaded = job.articles_downloaded,
-                            articles_failed = job.articles_failed,
-                            remaining,
-                            "Restored job checkpoint — resuming from previous progress"
-                        );
-                    }
-                    Err(e) => {
-                        warn!(
-                            job_id = %job_id,
-                            "Failed to deserialize checkpoint, starting from scratch: {e}"
-                        );
+                            let remaining = job
+                                .article_count
+                                .saturating_sub(job.articles_downloaded + job.articles_failed);
+                            info!(
+                                job_id = %job_id,
+                                name = %job.name,
+                                articles_downloaded = job.articles_downloaded,
+                                articles_failed = job.articles_failed,
+                                remaining,
+                                "Restored job checkpoint — resuming from previous progress"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                job_id = %job_id,
+                                "Failed to deserialize checkpoint, starting from scratch: {e}"
+                            );
+                        }
                     }
                 }
             }
 
             if job.status == JobStatus::Paused && was_paused {
-                // User had globally paused before restart — keep jobs paused
                 engine.pause();
             } else if job.status == JobStatus::Paused || job.status == JobStatus::Downloading {
-                // Not globally paused — resume any paused/downloading jobs
                 job.status = JobStatus::Queued;
             }
 
