@@ -270,6 +270,10 @@ impl QueueManager {
     /// lock acquisition as the active-count check, concurrent callers
     /// cannot both claim the same slot (no TOCTOU race).
     fn claim_next_download_slot(&self, max: usize) -> Option<String> {
+        if self.globally_paused.load(Ordering::Relaxed) {
+            return None;
+        }
+
         let mut jobs = self.jobs.lock();
         let active = jobs
             .values()
@@ -1227,9 +1231,15 @@ impl QueueManager {
         self.db.lock().set_setting("globally_paused", "true");
         let mut jobs = self.jobs.lock();
         for (_id, state) in jobs.iter_mut() {
-            if state.job.status == JobStatus::Downloading {
-                state.engine.pause();
-                state.job.status = JobStatus::Paused;
+            match state.job.status {
+                JobStatus::Downloading => {
+                    state.engine.pause();
+                    state.job.status = JobStatus::Paused;
+                }
+                JobStatus::Queued => {
+                    state.job.status = JobStatus::Paused;
+                }
+                _ => {}
             }
         }
         info!("All downloads paused");
