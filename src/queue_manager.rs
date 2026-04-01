@@ -594,7 +594,7 @@ impl QueueManager {
                                             article.data_size = Some(decoded_bytes);
                                         }
                                     }
-                                    if file_complete {
+                                    if file_complete && !file.assembled {
                                         file.assembled = true;
                                         state.job.files_completed += 1;
                                         info!(
