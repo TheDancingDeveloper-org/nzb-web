@@ -38,7 +38,7 @@ const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 /// Stagger delay between worker initial connections to avoid thundering herd.
 /// Each worker waits conn_idx * WORKER_RAMP_DELAY before its first connect.
 /// This is in addition to the per-host gate in nzb-nntp.
-const WORKER_RAMP_DELAY: Duration = Duration::from_millis(50);
+const WORKER_RAMP_DELAY: Duration = Duration::from_millis(15);
 /// Consecutive connect failures before circuit-breaking a server.
 const CIRCUIT_BREAK_THRESHOLD: u32 = 3;
 /// Cooldown after auth/permission failure (bad credentials, 502, account blocked).
@@ -234,8 +234,11 @@ impl DownloadEngine {
         let job_id = job.id.clone();
         let engine_start = Instant::now();
 
-        // Build work queue from all unfinished articles
-        let work_items: Vec<WorkItem> = job
+        // Build work queue from all unfinished articles.
+        // PAR2 files are prioritised so they're available when post-processing
+        // starts: index files (e.g. "foo.par2") first, then volume files
+        // (e.g. "foo.vol00+01.par2"), then everything else.
+        let mut work_items: Vec<WorkItem> = job
             .files
             .iter()
             .flat_map(|file| {
@@ -253,6 +256,8 @@ impl DownloadEngine {
                     })
             })
             .collect();
+
+        work_items.sort_by_key(|item| par2_sort_key(&item.filename));
 
         if work_items.is_empty() {
             let _ = progress_tx.send(ProgressUpdate::JobFinished {
@@ -1051,6 +1056,26 @@ async fn download_worker_pipelined(
                 pipeline = Pipeline::new(pipe_depth);
             }
         }
+    }
+}
+
+/// Sort key for work-queue prioritisation of PAR2 files.
+///
+/// Returns 0 for PAR2 index files (e.g. `movie.par2`), 1 for PAR2 volume
+/// files (e.g. `movie.vol00+01.par2`), and 2 for everything else.
+/// This ensures PAR2 metadata downloads early so post-processing can start
+/// verification as soon as the download phase ends.
+fn par2_sort_key(filename: &str) -> u8 {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".par2") {
+        // Index files have no ".vol" component — they're small and needed first.
+        if lower.contains(".vol") {
+            1 // volume/recovery block
+        } else {
+            0 // index file
+        }
+    } else {
+        2 // non-par2
     }
 }
 
