@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
-repository = "https://github.com/AusAgentSmith-org/nzb-web"
+repository = "http://100.92.54.45:3002/indexarr/nzb-web"
 
 [features]
 default = []
 groups-db = ["nzb-postproc/groups-db"]
 
 [dependencies]
-nzb-decode = { git = "https://github.com/AusAgentSmith-org/nzb-decode.git", tag = "v0.1.1" }
-nzb-postproc = { git = "https://github.com/AusAgentSmith-org/nzb-postproc.git", tag = "v0.2.1" }
+nzb-decode = { git = "http://100.92.54.45:3002/indexarr/nzb-decode.git", tag = "v0.1.1" }
+nzb-postproc = { git = "http://100.92.54.45:3002/indexarr/nzb-postproc.git", tag = "v0.2.1" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
