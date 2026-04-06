@@ -19,9 +19,10 @@ use crate::nzb_core::config::{CategoryConfig, ServerConfig};
 use crate::nzb_core::db::Database;
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
-use nzb_postproc::{PostProcConfig, run_pipeline};
+use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
 
 use crate::bandwidth::BandwidthLimiter;
+use crate::direct_unpack::DirectUnpacker;
 use crate::download_engine::{DownloadEngine, ProgressUpdate, ServerHealth, ServerHealthMap};
 use crate::log_buffer::LogBuffer;
 
@@ -125,6 +126,8 @@ struct JobState {
     speed: Arc<SpeedTracker>,
     /// Raw NZB data for retry.
     nzb_data: Option<Vec<u8>>,
+    /// Direct unpacker for RAR extraction during download.
+    direct_unpacker: Option<DirectUnpacker>,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +167,8 @@ pub struct QueueManager {
     min_free_space: u64,
     /// Bandwidth limiter for throttling downloads.
     bandwidth: Arc<BandwidthLimiter>,
+    /// Whether direct unpack (RAR extraction during download) is enabled.
+    direct_unpack_enabled: AtomicBool,
 }
 
 impl QueueManager {
@@ -179,6 +184,7 @@ impl QueueManager {
         categories: Vec<CategoryConfig>,
         min_free_space: u64,
         speed_limit_bps: u64,
+        direct_unpack: bool,
     ) -> Arc<Self> {
         use crate::bandwidth::BandwidthConfig;
         use std::num::NonZeroU32;
@@ -206,6 +212,7 @@ impl QueueManager {
             categories: Mutex::new(categories),
             min_free_space,
             bandwidth,
+            direct_unpack_enabled: AtomicBool::new(direct_unpack),
         })
     }
 
@@ -362,6 +369,7 @@ impl QueueManager {
                 task_handle: None,
                 speed: Arc::new(SpeedTracker::new()),
                 nzb_data,
+                direct_unpacker: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -378,6 +386,7 @@ impl QueueManager {
             task_handle: None,
             speed: Arc::new(SpeedTracker::new()),
             nzb_data,
+            direct_unpacker: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -604,6 +613,35 @@ impl QueueManager {
                                             total = state.job.file_count,
                                             "File assembly complete"
                                         );
+
+                                        // Direct unpack: feed completed RAR volumes to the
+                                        // unpacker so extraction overlaps with download.
+                                        if self.direct_unpack_enabled.load(Ordering::Relaxed)
+                                            && state.job.articles_failed == 0
+                                        {
+                                            if let Some(vol_info) = parse_rar_volume(&file.filename) {
+                                                if state.direct_unpacker.is_none() {
+                                                    state.direct_unpacker = DirectUnpacker::new(
+                                                        &state.job.work_dir,
+                                                        &state.job.output_dir,
+                                                    );
+                                                    if state.direct_unpacker.is_some() {
+                                                        info!(
+                                                            job_id = %job_id,
+                                                            "Direct unpack enabled — starting RAR extraction during download"
+                                                        );
+                                                    }
+                                                }
+                                                if let Some(ref du) = state.direct_unpacker {
+                                                    let path = state.job.work_dir.join(&file.filename);
+                                                    du.add_volume(
+                                                        &vol_info.set_name,
+                                                        vol_info.volume_number,
+                                                        path,
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                     break;
                                 }
@@ -645,6 +683,16 @@ impl QueueManager {
                                     bytes_downloaded: 0,
                                 });
                             }
+                        }
+
+                        // Abort direct unpack on first article failure —
+                        // PAR2 repair may be needed before extraction.
+                        if let Some(du) = state.direct_unpacker.take() {
+                            info!(
+                                job_id = %job_id,
+                                "Aborting direct unpack — article failure detected, falling back to normal pipeline"
+                            );
+                            du.abort();
                         }
                     }
                     warn!(job_id = %job_id, "Article failed: {error}");
@@ -713,10 +761,10 @@ impl QueueManager {
     ) {
         let pipeline_start = Instant::now();
 
-        // Extract info needed for post-processing
-        let (work_dir, output_dir, category, pp_level) = {
-            let jobs = self.jobs.lock();
-            let Some(state) = jobs.get(job_id) else {
+        // Extract info needed for post-processing and take the direct unpacker.
+        let (work_dir, output_dir, category, pp_level, direct_unpacker) = {
+            let mut jobs = self.jobs.lock();
+            let Some(state) = jobs.get_mut(job_id) else {
                 return;
             };
 
@@ -738,12 +786,42 @@ impl QueueManager {
                 .find(|c| c.name == cat)
                 .map(|c| c.post_processing)
                 .unwrap_or(3); // default: repair+unpack
+            let du = state.direct_unpacker.take();
             (
                 state.job.work_dir.clone(),
                 state.job.output_dir.clone(),
                 cat,
                 pp,
+                du,
             )
+        };
+
+        // Wait for direct unpack to finish (if active). It may still be
+        // extracting the last volume when the download completes.
+        let direct_unpack_success = if let Some(du) = direct_unpacker {
+            let results = du.finish().await;
+            let all_ok = !results.is_empty() && results.iter().all(|r| r.success);
+            if all_ok {
+                info!(
+                    job_id = %job_id,
+                    sets = results.len(),
+                    "Direct unpack completed successfully — skipping extract stage"
+                );
+            } else {
+                for r in &results {
+                    if !r.success {
+                        warn!(
+                            job_id = %job_id,
+                            set = %r.set_name,
+                            error = ?r.error,
+                            "Direct unpack failed for set — falling back to normal extraction"
+                        );
+                    }
+                }
+            }
+            all_ok
+        } else {
+            false
         };
 
         // Run post-processing pipeline (par2 can repair failed articles)
@@ -759,6 +837,7 @@ impl QueueManager {
                 cleanup_after_extract: true,
                 output_dir: Some(output_dir.clone()),
                 articles_failed,
+                skip_extract: direct_unpack_success,
             };
 
             let result = run_pipeline(&work_dir, &config).await;
@@ -1763,6 +1842,7 @@ impl QueueManager {
                 task_handle: None,
                 speed: Arc::new(SpeedTracker::new()),
                 nzb_data,
+                direct_unpacker: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);

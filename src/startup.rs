@@ -98,6 +98,7 @@ pub async fn initialize(
         config.categories.clone(),
         config.general.min_free_space_bytes,
         config.general.speed_limit_bps,
+        config.general.direct_unpack,
     );
 
     // Set history retention

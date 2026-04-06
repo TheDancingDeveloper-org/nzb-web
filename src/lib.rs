@@ -5,6 +5,7 @@ pub use nzb_postproc::nzb_core;
 pub mod auth;
 pub mod bandwidth;
 pub mod dir_watcher;
+pub mod direct_unpack;
 pub mod download_engine;
 pub mod error;
 pub mod log_buffer;
