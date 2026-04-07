@@ -250,13 +250,17 @@ impl DownloadEngine {
             .flat_map(|file| {
                 file.articles
                     .iter()
-                    .filter(|a| !a.downloaded)
-                    .map(move |article| WorkItem {
+                    .enumerate()
+                    .filter(|(_, a)| !a.downloaded)
+                    .map(move |(idx, article)| WorkItem {
                         job_id: job.id.clone(),
                         file_id: file.id.clone(),
                         filename: file.filename.clone(),
                         message_id: article.message_id.clone(),
-                        segment_number: article.segment_number,
+                        // Use 1-based index within the file, not the raw NZB
+                        // segment number — some NZBs use global numbering
+                        // across all files which exceeds the per-file count.
+                        segment_number: (idx as u32) + 1,
                         tried_servers: Vec::new(),
                         tries_on_current: 0,
                     })
