@@ -23,7 +23,7 @@ use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
 
 use crate::bandwidth::BandwidthLimiter;
 use crate::direct_unpack::DirectUnpacker;
-use crate::download_engine::{DownloadEngine, ProgressUpdate, ServerHealth, ServerHealthMap};
+use crate::download_engine::{DownloadEngine, ProgressUpdate, ServerHealthMap};
 use crate::log_buffer::LogBuffer;
 
 /// Get free disk space for a path (returns 0 on error).
@@ -262,6 +262,7 @@ impl QueueManager {
     }
 
     /// Count currently downloading jobs.
+    #[allow(dead_code)]
     fn active_download_count(&self) -> usize {
         let jobs = self.jobs.lock();
         jobs.values()
@@ -406,62 +407,60 @@ impl QueueManager {
         // Lazily load NZB data if not in memory (queued jobs skip loading at restore time)
         {
             let mut jobs = self.jobs.lock();
-            if let Some(state) = jobs.get_mut(job_id) {
-                if state.nzb_data.is_none() {
-                    let db = self.db.lock();
-                    if let Some(data) = db.queue_get_nzb_data(job_id).unwrap_or(None) {
-                        // Parse NZB to populate files/articles
-                        match nzb_parser::parse_nzb(&state.job.name, &data) {
-                            Ok(parsed) => {
-                                state.job.files = parsed.files;
-                                // Apply checkpoint if available
-                                if let Some(cp_data) =
-                                    db.queue_load_job_data(job_id).unwrap_or(None)
-                                {
-                                    if let Ok(checkpoint) =
-                                        serde_json::from_slice::<JobCheckpoint>(&cp_data)
-                                    {
-                                        state.job.downloaded_bytes = checkpoint.downloaded_bytes;
-                                        state.job.articles_downloaded =
-                                            checkpoint.articles_downloaded;
-                                        state.job.articles_failed = checkpoint.articles_failed;
-                                        state.job.files_completed = checkpoint.files_completed;
-                                        for file in &mut state.job.files {
-                                            if let Some(segments) = checkpoint.files.get(&file.id) {
-                                                let mut fbd: u64 = 0;
-                                                for article in &mut file.articles {
-                                                    if segments.contains(&article.segment_number) {
-                                                        article.downloaded = true;
-                                                        fbd += article.bytes;
-                                                    }
-                                                }
-                                                file.bytes_downloaded = fbd;
-                                                if file.articles.iter().all(|a| a.downloaded) {
-                                                    file.assembled = true;
-                                                }
+            if let Some(state) = jobs.get_mut(job_id)
+                && state.nzb_data.is_none()
+            {
+                let db = self.db.lock();
+                if let Some(data) = db.queue_get_nzb_data(job_id).unwrap_or(None) {
+                    // Parse NZB to populate files/articles
+                    match nzb_parser::parse_nzb(&state.job.name, &data) {
+                        Ok(parsed) => {
+                            state.job.files = parsed.files;
+                            // Apply checkpoint if available
+                            if let Some(cp_data) =
+                                db.queue_load_job_data(job_id).unwrap_or(None)
+                                && let Ok(checkpoint) =
+                                    serde_json::from_slice::<JobCheckpoint>(&cp_data)
+                            {
+                                state.job.downloaded_bytes = checkpoint.downloaded_bytes;
+                                state.job.articles_downloaded =
+                                    checkpoint.articles_downloaded;
+                                state.job.articles_failed = checkpoint.articles_failed;
+                                state.job.files_completed = checkpoint.files_completed;
+                                for file in &mut state.job.files {
+                                    if let Some(segments) = checkpoint.files.get(&file.id) {
+                                        let mut fbd: u64 = 0;
+                                        for article in &mut file.articles {
+                                            if segments.contains(&article.segment_number) {
+                                                article.downloaded = true;
+                                                fbd += article.bytes;
                                             }
                                         }
-                                        info!(
-                                            job_id = %job_id,
-                                            name = %state.job.name,
-                                            articles_downloaded = state.job.articles_downloaded,
-                                            "Lazy-loaded job checkpoint"
-                                        );
+                                        file.bytes_downloaded = fbd;
+                                        if file.articles.iter().all(|a| a.downloaded) {
+                                            file.assembled = true;
+                                        }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                warn!(job_id = %job_id, "Failed to lazy-load NZB data: {e}");
+                                info!(
+                                    job_id = %job_id,
+                                    name = %state.job.name,
+                                    articles_downloaded = state.job.articles_downloaded,
+                                    "Lazy-loaded job checkpoint"
+                                );
                             }
                         }
-                        state.nzb_data = Some(data);
+                        Err(e) => {
+                            warn!(job_id = %job_id, "Failed to lazy-load NZB data: {e}");
+                        }
                     }
+                    state.nzb_data = Some(data);
                 }
             }
         }
 
         // Read job data from the map (we need a copy for the spawned task)
-        let (job, nzb_data) = {
+        let (job, _nzb_data) = {
             let jobs = self.jobs.lock();
             let Some(state) = jobs.get(job_id) else {
                 return;
@@ -623,30 +622,28 @@ impl QueueManager {
                                         // unpacker so extraction overlaps with download.
                                         if self.direct_unpack_enabled.load(Ordering::Relaxed)
                                             && state.job.articles_failed == 0
+                                            && let Some(vol_info) = parse_rar_volume(&file.filename)
                                         {
-                                            if let Some(vol_info) = parse_rar_volume(&file.filename)
-                                            {
-                                                if state.direct_unpacker.is_none() {
-                                                    state.direct_unpacker = DirectUnpacker::new(
-                                                        &state.job.work_dir,
-                                                        &state.job.output_dir,
-                                                    );
-                                                    if state.direct_unpacker.is_some() {
-                                                        info!(
-                                                            job_id = %job_id,
-                                                            "Direct unpack enabled — starting RAR extraction during download"
-                                                        );
-                                                    }
-                                                }
-                                                if let Some(ref du) = state.direct_unpacker {
-                                                    let path =
-                                                        state.job.work_dir.join(&file.filename);
-                                                    du.add_volume(
-                                                        &vol_info.set_name,
-                                                        vol_info.volume_number,
-                                                        path,
+                                            if state.direct_unpacker.is_none() {
+                                                state.direct_unpacker = DirectUnpacker::new(
+                                                    &state.job.work_dir,
+                                                    &state.job.output_dir,
+                                                );
+                                                if state.direct_unpacker.is_some() {
+                                                    info!(
+                                                        job_id = %job_id,
+                                                        "Direct unpack enabled — starting RAR extraction during download"
                                                     );
                                                 }
+                                            }
+                                            if let Some(ref du) = state.direct_unpacker {
+                                                let path =
+                                                    state.job.work_dir.join(&file.filename);
+                                                du.add_volume(
+                                                    &vol_info.set_name,
+                                                    vol_info.volume_number,
+                                                    path,
+                                                );
                                             }
                                         }
                                     }

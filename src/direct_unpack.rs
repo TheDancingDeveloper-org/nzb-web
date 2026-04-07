@@ -46,6 +46,7 @@ pub struct DirectUnpackResult {
 /// Tracks which volumes are available for a single RAR set.
 #[derive(Debug)]
 struct RarSetState {
+    #[allow(dead_code)]
     set_name: String,
     /// volume_number → file path on disk (assembled and ready)
     volumes: BTreeMap<u32, PathBuf>,
@@ -246,6 +247,7 @@ fn run_direct_unpack(
 }
 
 /// Process a single RAR set: spawn unrar, feed volumes as they become available.
+#[allow(clippy::too_many_arguments)]
 fn unpack_set(
     unrar_bin: &str,
     set_name: &str,
@@ -480,10 +482,10 @@ fn wait_for_volume(
         // Check if volume is available.
         {
             let st = state.lock();
-            if let Some(set) = st.sets.get(set_name) {
-                if set.volumes.contains_key(&volume_number) {
-                    return Ok(());
-                }
+            if let Some(set) = st.sets.get(set_name)
+                && set.volumes.contains_key(&volume_number)
+            {
+                return Ok(());
             }
 
             // If download is finished and volume still not available, it's missing.

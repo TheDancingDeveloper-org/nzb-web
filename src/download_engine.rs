@@ -68,6 +68,12 @@ pub struct ServerHealth {
     pub is_auth_failure: bool,
 }
 
+impl Default for ServerHealth {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServerHealth {
     pub fn new() -> Self {
         Self {
@@ -636,16 +642,16 @@ async fn download_worker(
     // exit immediately instead of burning through retry cycles.
     {
         let health = server_health.lock();
-        if let Some(h) = health.get(&primary_server.id) {
-            if !h.is_available() {
-                info!(
-                    worker = %worker_id,
-                    server = %primary_server.name,
-                    reason = h.reason.as_deref().unwrap_or("unknown"),
-                    "Server circuit-broken — worker exiting without connecting"
-                );
-                return;
-            }
+        if let Some(h) = health.get(&primary_server.id)
+            && !h.is_available()
+        {
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                reason = h.reason.as_deref().unwrap_or("unknown"),
+                "Server circuit-broken — worker exiting without connecting"
+            );
+            return;
         }
     }
 
@@ -790,17 +796,17 @@ async fn download_worker_pipelined(
         // Exit if server was circuit-broken (by another worker's failure)
         {
             let health = server_health.lock();
-            if let Some(h) = health.get(&primary_server.id) {
-                if !h.is_available() {
-                    info!(
-                        worker = %worker_id,
-                        server = %primary_server.name,
-                        reason = h.reason.as_deref().unwrap_or("unknown"),
-                        "Server circuit-broken, worker exiting"
-                    );
-                    requeue_all(&mut in_flight_items, work_queue);
-                    break;
-                }
+            if let Some(h) = health.get(&primary_server.id)
+                && !h.is_available()
+            {
+                info!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    reason = h.reason.as_deref().unwrap_or("unknown"),
+                    "Server circuit-broken, worker exiting"
+                );
+                requeue_all(&mut in_flight_items, work_queue);
+                break;
             }
         }
 
@@ -1121,6 +1127,7 @@ fn has_known_extension(name: &str) -> bool {
 }
 
 /// Handle an article that's not available on this server (not found or decode error).
+#[allow(clippy::too_many_arguments)]
 fn handle_article_not_available(
     item: &mut WorkItem,
     primary_server: &ServerConfig,
@@ -1225,16 +1232,16 @@ async fn download_worker_serial(
         // Exit if server was circuit-broken (by another worker's failure)
         {
             let health = server_health.lock();
-            if let Some(h) = health.get(&primary_server.id) {
-                if !h.is_available() {
-                    info!(
-                        worker = %worker_id,
-                        server = %primary_server.name,
-                        reason = h.reason.as_deref().unwrap_or("unknown"),
-                        "Server circuit-broken, worker exiting"
-                    );
-                    break;
-                }
+            if let Some(h) = health.get(&primary_server.id)
+                && !h.is_available()
+            {
+                info!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    reason = h.reason.as_deref().unwrap_or("unknown"),
+                    "Server circuit-broken, worker exiting"
+                );
+                break;
             }
         }
 
@@ -1401,13 +1408,13 @@ async fn connect_with_retry(
         // have already discovered this server is broken.
         {
             let health = server_health.lock();
-            if let Some(h) = health.get(&server.id) {
-                if !h.is_available() {
-                    return Err(format!(
-                        "Server circuit-broken: {}",
-                        h.reason.as_deref().unwrap_or("unknown")
-                    ));
-                }
+            if let Some(h) = health.get(&server.id)
+                && !h.is_available()
+            {
+                return Err(format!(
+                    "Server circuit-broken: {}",
+                    h.reason.as_deref().unwrap_or("unknown")
+                ));
             }
         }
 
@@ -1442,7 +1449,7 @@ async fn connect_with_retry(
                 server_health
                     .lock()
                     .entry(server.id.clone())
-                    .or_insert_with(ServerHealth::new)
+                    .or_default()
                     .record_success();
                 return Ok(());
             }
@@ -1456,7 +1463,7 @@ async fn connect_with_retry(
                     let mut health = server_health.lock();
                     let entry = health
                         .entry(server.id.clone())
-                        .or_insert_with(ServerHealth::new);
+                        .or_default();
                     entry.record_failure(is_auth, &e.to_string());
 
                     if !entry.is_available() {
