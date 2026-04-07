@@ -417,14 +417,12 @@ impl QueueManager {
                         Ok(parsed) => {
                             state.job.files = parsed.files;
                             // Apply checkpoint if available
-                            if let Some(cp_data) =
-                                db.queue_load_job_data(job_id).unwrap_or(None)
+                            if let Some(cp_data) = db.queue_load_job_data(job_id).unwrap_or(None)
                                 && let Ok(checkpoint) =
                                     serde_json::from_slice::<JobCheckpoint>(&cp_data)
                             {
                                 state.job.downloaded_bytes = checkpoint.downloaded_bytes;
-                                state.job.articles_downloaded =
-                                    checkpoint.articles_downloaded;
+                                state.job.articles_downloaded = checkpoint.articles_downloaded;
                                 state.job.articles_failed = checkpoint.articles_failed;
                                 state.job.files_completed = checkpoint.files_completed;
                                 for file in &mut state.job.files {
@@ -637,8 +635,7 @@ impl QueueManager {
                                                 }
                                             }
                                             if let Some(ref du) = state.direct_unpacker {
-                                                let path =
-                                                    state.job.work_dir.join(&file.filename);
+                                                let path = state.job.work_dir.join(&file.filename);
                                                 du.add_volume(
                                                     &vol_info.set_name,
                                                     vol_info.volume_number,

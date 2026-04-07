@@ -1461,9 +1461,7 @@ async fn connect_with_retry(
                 // Update health tracker — may circuit-break the server.
                 {
                     let mut health = server_health.lock();
-                    let entry = health
-                        .entry(server.id.clone())
-                        .or_default();
+                    let entry = health.entry(server.id.clone()).or_default();
                     entry.record_failure(is_auth, &e.to_string());
 
                     if !entry.is_available() {
