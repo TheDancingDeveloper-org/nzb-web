@@ -10,6 +10,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
 jobs:
   check:
     runs-on: ubuntu-latest
