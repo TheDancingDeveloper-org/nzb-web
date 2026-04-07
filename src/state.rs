@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use crate::nzb_core::config::AppConfig;
+use arc_swap::ArcSwap;
 
 use crate::auth::{CredentialStore, TokenStore};
 use crate::log_buffer::LogBuffer;

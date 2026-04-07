@@ -498,10 +498,7 @@ impl DownloadEngine {
                         remaining_articles = remaining_count,
                         "All servers circuit-broken — pausing job for user intervention"
                     );
-                    let _ = progress_tx.send(ProgressUpdate::NoServersAvailable {
-                        job_id,
-                        reason,
-                    });
+                    let _ = progress_tx.send(ProgressUpdate::NoServersAvailable { job_id, reason });
                     return;
                 }
             }
@@ -874,7 +871,10 @@ async fn download_worker_pipelined(
             );
             tokio::time::sleep(RECONNECT_DELAY).await;
             *conn = NntpConnection::new(worker_id.to_string());
-            if let Err(e) = connect_with_retry(conn, primary_server, worker_id, server_health, all_servers).await {
+            if let Err(e) =
+                connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                    .await
+            {
                 warn!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnect FAILED: {e} — worker exiting");
                 break;
             }
@@ -994,7 +994,15 @@ async fn download_worker_pipelined(
                         );
                         tokio::time::sleep(RECONNECT_DELAY).await;
                         *conn = NntpConnection::new(worker_id.to_string());
-                        if let Err(e) = connect_with_retry(conn, primary_server, worker_id, server_health, all_servers).await {
+                        if let Err(e) = connect_with_retry(
+                            conn,
+                            primary_server,
+                            worker_id,
+                            server_health,
+                            all_servers,
+                        )
+                        .await
+                        {
                             warn!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnect FAILED: {e}");
                             break;
                         }
@@ -1048,7 +1056,10 @@ async fn download_worker_pipelined(
                 );
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 *conn = NntpConnection::new(worker_id.to_string());
-                if let Err(e) = connect_with_retry(conn, primary_server, worker_id, server_health, all_servers).await {
+                if let Err(e) =
+                    connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                        .await
+                {
                     warn!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnect FAILED: {e}");
                     break;
                 }
@@ -1128,13 +1139,10 @@ fn handle_article_not_available(
     let all_tried = {
         let servers = all_servers.lock();
         let health = server_health.lock();
-        servers
-            .iter()
-            .filter(|s| s.enabled)
-            .all(|s| {
-                item.tried_servers.contains(&s.id)
-                    || health.get(&s.id).is_some_and(|h| !h.is_available())
-            })
+        servers.iter().filter(|s| s.enabled).all(|s| {
+            item.tried_servers.contains(&s.id)
+                || health.get(&s.id).is_some_and(|h| !h.is_available())
+        })
     };
 
     if all_tried {
@@ -1335,7 +1343,10 @@ async fn download_worker_serial(
                 );
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 *conn = NntpConnection::new(worker_id.to_string());
-                if let Err(e) = connect_with_retry(conn, primary_server, worker_id, server_health, all_servers).await {
+                if let Err(e) =
+                    connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                        .await
+                {
                     warn!(
                         worker = %worker_id,
                         server = %primary_server.name,
@@ -1438,10 +1449,7 @@ async fn connect_with_retry(
             Err(e) => {
                 // Determine if this is an auth/permission error (non-transient)
                 // vs a regular connection error (transient, worth retrying).
-                let is_auth = matches!(
-                    e,
-                    NntpError::Auth(_) | NntpError::ServiceUnavailable(_)
-                );
+                let is_auth = matches!(e, NntpError::Auth(_) | NntpError::ServiceUnavailable(_));
 
                 // Update health tracker — may circuit-break the server.
                 {

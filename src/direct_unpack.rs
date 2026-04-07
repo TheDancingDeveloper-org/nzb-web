@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -189,8 +189,7 @@ fn run_direct_unpack(
             st.sets
                 .iter()
                 .find(|(name, set)| {
-                    set.volumes.contains_key(&0)
-                        && !results.iter().any(|r| r.set_name == **name)
+                    set.volumes.contains_key(&0) && !results.iter().any(|r| r.set_name == **name)
                 })
                 .map(|(name, set)| (name.clone(), set.volumes[&0].clone()))
         };
@@ -230,8 +229,7 @@ fn run_direct_unpack(
             if st.download_finished {
                 // Check if there are unprocessed sets with volume 0 ready.
                 let has_pending = st.sets.iter().any(|(name, set)| {
-                    set.volumes.contains_key(&0)
-                        && !results.iter().any(|r| r.set_name == **name)
+                    set.volumes.contains_key(&0) && !results.iter().any(|r| r.set_name == **name)
                 });
                 if !has_pending {
                     break;
@@ -392,14 +390,7 @@ fn drive_unrar(
                         next_volume,
                         "Unrar requesting next volume"
                     );
-                    match wait_for_volume(
-                        set_name,
-                        next_volume,
-                        state,
-                        volume_ready,
-                        killed,
-                        rt,
-                    ) {
+                    match wait_for_volume(set_name, next_volume, state, volume_ready, killed, rt) {
                         Ok(()) => {
                             // Volume is available — send continue.
                             let mut sin = stdin.lock();
@@ -550,8 +541,10 @@ mod tests {
             volumes: BTreeMap::new(),
         };
 
-        set.volumes.insert(0, PathBuf::from("/tmp/movie.part001.rar"));
-        set.volumes.insert(1, PathBuf::from("/tmp/movie.part002.rar"));
+        set.volumes
+            .insert(0, PathBuf::from("/tmp/movie.part001.rar"));
+        set.volumes
+            .insert(1, PathBuf::from("/tmp/movie.part002.rar"));
 
         assert!(set.volumes.contains_key(&0));
         assert!(set.volumes.contains_key(&1));

@@ -415,10 +415,15 @@ impl QueueManager {
                             Ok(parsed) => {
                                 state.job.files = parsed.files;
                                 // Apply checkpoint if available
-                                if let Some(cp_data) = db.queue_load_job_data(job_id).unwrap_or(None) {
-                                    if let Ok(checkpoint) = serde_json::from_slice::<JobCheckpoint>(&cp_data) {
+                                if let Some(cp_data) =
+                                    db.queue_load_job_data(job_id).unwrap_or(None)
+                                {
+                                    if let Ok(checkpoint) =
+                                        serde_json::from_slice::<JobCheckpoint>(&cp_data)
+                                    {
                                         state.job.downloaded_bytes = checkpoint.downloaded_bytes;
-                                        state.job.articles_downloaded = checkpoint.articles_downloaded;
+                                        state.job.articles_downloaded =
+                                            checkpoint.articles_downloaded;
                                         state.job.articles_failed = checkpoint.articles_failed;
                                         state.job.files_completed = checkpoint.files_completed;
                                         for file in &mut state.job.files {
@@ -619,7 +624,8 @@ impl QueueManager {
                                         if self.direct_unpack_enabled.load(Ordering::Relaxed)
                                             && state.job.articles_failed == 0
                                         {
-                                            if let Some(vol_info) = parse_rar_volume(&file.filename) {
+                                            if let Some(vol_info) = parse_rar_volume(&file.filename)
+                                            {
                                                 if state.direct_unpacker.is_none() {
                                                     state.direct_unpacker = DirectUnpacker::new(
                                                         &state.job.work_dir,
@@ -633,7 +639,8 @@ impl QueueManager {
                                                     }
                                                 }
                                                 if let Some(ref du) = state.direct_unpacker {
-                                                    let path = state.job.work_dir.join(&file.filename);
+                                                    let path =
+                                                        state.job.work_dir.join(&file.filename);
                                                     du.add_volume(
                                                         &vol_info.set_name,
                                                         vol_info.volume_number,
@@ -1236,10 +1243,7 @@ impl QueueManager {
 
             let state = jobs.get_mut(id).unwrap();
 
-            let task_running = state
-                .task_handle
-                .as_ref()
-                .is_some_and(|h| !h.is_finished());
+            let task_running = state.task_handle.as_ref().is_some_and(|h| !h.is_finished());
 
             if task_running {
                 // Engine is running, just resume it
@@ -1421,10 +1425,7 @@ impl QueueManager {
             for (_id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused {
                     state.job.error_message = None;
-                    let task_running = state
-                        .task_handle
-                        .as_ref()
-                        .is_some_and(|h| !h.is_finished());
+                    let task_running = state.task_handle.as_ref().is_some_and(|h| !h.is_finished());
                     state.engine.resume();
                     if task_running {
                         state.job.status = JobStatus::Downloading;
@@ -1453,11 +1454,7 @@ impl QueueManager {
     /// automatically resumed.
     pub fn update_servers(self: &Arc<Self>, servers: Vec<ServerConfig>) {
         let enabled = servers.iter().filter(|s| s.enabled).count();
-        info!(
-            total = servers.len(),
-            enabled,
-            "Updating server list"
-        );
+        info!(total = servers.len(), enabled, "Updating server list");
         *self.servers.lock() = servers;
 
         // Auto-resume jobs paused by server errors now that config changed
@@ -1476,10 +1473,7 @@ impl QueueManager {
             let mut jobs = self.jobs.lock();
             for (_id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
-                    let task_running = state
-                        .task_handle
-                        .as_ref()
-                        .is_some_and(|h| !h.is_finished());
+                    let task_running = state.task_handle.as_ref().is_some_and(|h| !h.is_finished());
                     state.job.error_message = None;
                     state.engine.resume();
                     if task_running {
@@ -1492,7 +1486,10 @@ impl QueueManager {
             }
         }
         if resumed > 0 {
-            info!(count = resumed, "Resumed server-paused jobs after config change");
+            info!(
+                count = resumed,
+                "Resumed server-paused jobs after config change"
+            );
             self.start_next_queued();
         }
     }
