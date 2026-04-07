@@ -772,6 +772,19 @@ async fn download_worker_pipelined(
     let mut next_tag: u64 = 0;
     let mut consecutive_errors: u32 = 0;
 
+    // --- Perf metrics (accumulated per worker, logged periodically) ---
+    let mut perf_articles: u64 = 0;
+    let mut perf_bytes: u64 = 0;
+    let mut perf_queue_lock_us: u64 = 0;
+    let mut perf_receive_us: u64 = 0;
+    let mut perf_decode_us: u64 = 0;
+    let mut perf_assemble_us: u64 = 0;
+    let mut perf_bandwidth_us: u64 = 0;
+    let mut perf_yield_us: u64 = 0;
+    let mut perf_flush_us: u64 = 0;
+    let mut perf_last_log = Instant::now();
+    const PERF_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
     loop {
         if cancelled.load(Ordering::Relaxed) {
             break;
@@ -817,7 +830,9 @@ async fn download_worker_pipelined(
         // Fill the pipeline with work items
         let mut consecutive_skips: usize = 0;
         while pipeline.pending_count() + pipeline.in_flight_count() < pipe_depth as usize {
+            let lock_t = Instant::now();
             let item = { work_queue.lock().pop_front() };
+            perf_queue_lock_us += lock_t.elapsed().as_micros() as u64;
             let Some(item) = item else {
                 break;
             };
@@ -850,6 +865,7 @@ async fn download_worker_pipelined(
         }
 
         // Flush pending sends
+        let flush_t = Instant::now();
         if let Err(e) = pipeline.flush_sends(conn).await {
             warn!(
                 worker = %worker_id,
@@ -893,8 +909,12 @@ async fn download_worker_pipelined(
             continue;
         }
 
+        perf_flush_us += flush_t.elapsed().as_micros() as u64;
+
         // Read one response
+        let recv_t = Instant::now();
         let result = pipeline.receive_one(conn).await;
+        perf_receive_us += recv_t.elapsed().as_micros() as u64;
         match result {
             Ok(Some(pipe_result)) => {
                 let Some(mut item) = in_flight_items.remove(&pipe_result.request.tag) else {
@@ -907,9 +927,15 @@ async fn download_worker_pipelined(
                         let raw_data = response.data.unwrap_or_default();
                         // Yield to the runtime so other tasks (HTTP server, etc.)
                         // get scheduled between CPU-bound decode+assemble work.
+                        let yield_t = Instant::now();
                         tokio::task::yield_now().await;
+                        perf_yield_us += yield_t.elapsed().as_micros() as u64;
                         match decode_and_assemble(&item, &raw_data, assembler) {
                             Ok(process_result) => {
+                                perf_decode_us += process_result.decode_us;
+                                perf_assemble_us += process_result.assemble_us;
+                                perf_bytes += process_result.decoded_bytes;
+                                perf_articles += 1;
                                 total_decode_us
                                     .fetch_add(process_result.decode_us, Ordering::Relaxed);
                                 total_assemble_us
@@ -922,11 +948,13 @@ async fn download_worker_pipelined(
                                         .or_insert_with(|| crate::util::normalize_nfc(yname));
                                 }
                                 // Throttle via bandwidth limiter
+                                let bw_t = Instant::now();
                                 if let Some(n) =
                                     std::num::NonZeroU32::new(process_result.decoded_bytes as u32)
                                 {
                                     let _ = bandwidth.acquire_download(n).await;
                                 }
+                                perf_bandwidth_us += bw_t.elapsed().as_micros() as u64;
                                 let _ = progress_tx.send(ProgressUpdate::ArticleComplete {
                                     job_id: item.job_id.clone(),
                                     file_id: item.file_id.clone(),
@@ -935,6 +963,35 @@ async fn download_worker_pipelined(
                                     file_complete: process_result.file_complete,
                                     server_id: Some(primary_server.id.clone()),
                                 });
+
+                                // Periodic perf log
+                                if perf_last_log.elapsed() >= PERF_LOG_INTERVAL {
+                                    let elapsed = perf_last_log.elapsed().as_secs_f64();
+                                    let mbps = perf_bytes as f64 / elapsed / (1024.0 * 1024.0);
+                                    info!(
+                                        worker = %worker_id,
+                                        articles = perf_articles,
+                                        throughput_mbps = format!("{mbps:.1}"),
+                                        recv_ms = perf_receive_us / 1000,
+                                        decode_ms = perf_decode_us / 1000,
+                                        assemble_ms = perf_assemble_us / 1000,
+                                        queue_lock_ms = perf_queue_lock_us / 1000,
+                                        flush_ms = perf_flush_us / 1000,
+                                        yield_ms = perf_yield_us / 1000,
+                                        bw_wait_ms = perf_bandwidth_us / 1000,
+                                        "Worker perf summary"
+                                    );
+                                    perf_articles = 0;
+                                    perf_bytes = 0;
+                                    perf_queue_lock_us = 0;
+                                    perf_receive_us = 0;
+                                    perf_decode_us = 0;
+                                    perf_assemble_us = 0;
+                                    perf_bandwidth_us = 0;
+                                    perf_yield_us = 0;
+                                    perf_flush_us = 0;
+                                    perf_last_log = Instant::now();
+                                }
                             }
                             Err(ArticleError::DecodeError(msg)) => {
                                 handle_article_not_available(
