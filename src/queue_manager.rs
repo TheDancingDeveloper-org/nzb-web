@@ -626,6 +626,7 @@ impl QueueManager {
                                                 state.direct_unpacker = DirectUnpacker::new(
                                                     &state.job.work_dir,
                                                     &state.job.output_dir,
+                                                    state.job.password.clone(),
                                                 );
                                                 if state.direct_unpacker.is_some() {
                                                     info!(
@@ -763,7 +764,7 @@ impl QueueManager {
         let pipeline_start = Instant::now();
 
         // Extract info needed for post-processing and take the direct unpacker.
-        let (work_dir, output_dir, category, pp_level, direct_unpacker) = {
+        let (work_dir, output_dir, category, pp_level, direct_unpacker, password) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
                 return;
@@ -788,12 +789,14 @@ impl QueueManager {
                 .map(|c| c.post_processing)
                 .unwrap_or(3); // default: repair+unpack
             let du = state.direct_unpacker.take();
+            let pw = state.job.password.clone();
             (
                 state.job.work_dir.clone(),
                 state.job.output_dir.clone(),
                 cat,
                 pp,
                 du,
+                pw,
             )
         };
 
@@ -839,6 +842,7 @@ impl QueueManager {
                 output_dir: Some(output_dir.clone()),
                 articles_failed,
                 skip_extract: direct_unpack_success,
+                password: password.clone(),
             };
 
             let result = run_pipeline(&work_dir, &config).await;

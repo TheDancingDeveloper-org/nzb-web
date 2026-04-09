@@ -79,7 +79,7 @@ impl DirectUnpacker {
     /// Create a new direct unpacker for a job.
     ///
     /// Returns `None` if `unrar` is not available on PATH.
-    pub fn new(work_dir: &Path, output_dir: &Path) -> Option<Self> {
+    pub fn new(work_dir: &Path, output_dir: &Path, password: Option<String>) -> Option<Self> {
         let unrar_bin = find_unrar()?;
 
         let state = Arc::new(Mutex::new(DirectUnpackState {
@@ -101,6 +101,7 @@ impl DirectUnpacker {
                     &unrar_bin,
                     &work_dir,
                     &output_dir,
+                    password.as_deref(),
                     &state,
                     &volume_ready,
                     &killed,
@@ -171,6 +172,7 @@ fn run_direct_unpack(
     unrar_bin: &str,
     _work_dir: &Path,
     output_dir: &Path,
+    password: Option<&str>,
     state: &Mutex<DirectUnpackState>,
     volume_ready: &Notify,
     killed: &AtomicBool,
@@ -207,6 +209,7 @@ fn run_direct_unpack(
                 &set_name,
                 &first_vol_path,
                 output_dir,
+                password,
                 state,
                 volume_ready,
                 killed,
@@ -253,6 +256,7 @@ fn unpack_set(
     set_name: &str,
     first_volume: &Path,
     output_dir: &Path,
+    password: Option<&str>,
     state: &Mutex<DirectUnpackState>,
     volume_ready: &Notify,
     killed: &AtomicBool,
@@ -267,10 +271,16 @@ fn unpack_set(
         };
     }
 
+    let pw_flag = match password {
+        Some(pw) => format!("-p{pw}"),
+        None => "-p-".to_string(),
+    };
+
     // Spawn unrar with -vp (pause between volumes).
     // -o+ = overwrite, -y = assume yes, -vp = pause between volumes
     let mut child = match Command::new(unrar_bin)
         .args(["x", "-o+", "-y", "-vp"])
+        .arg(&pw_flag)
         .arg(first_volume)
         .arg(format!("{}/", output_dir.display()))
         .stdin(Stdio::piped())
@@ -562,7 +572,7 @@ mod tests {
         let output_dir = tempfile::tempdir().unwrap();
         // This will return Some if unrar is installed, None otherwise.
         // Either way, it shouldn't panic.
-        let _du = DirectUnpacker::new(work_dir.path(), output_dir.path());
+        let _du = DirectUnpacker::new(work_dir.path(), output_dir.path(), None);
     }
 
     #[tokio::test]
@@ -570,7 +580,7 @@ mod tests {
         let work_dir = tempfile::tempdir().unwrap();
         let output_dir = tempfile::tempdir().unwrap();
 
-        if let Some(du) = DirectUnpacker::new(work_dir.path(), output_dir.path()) {
+        if let Some(du) = DirectUnpacker::new(work_dir.path(), output_dir.path(), None) {
             // Abort immediately — should complete without hanging.
             du.abort();
             let results = du.finish().await;
