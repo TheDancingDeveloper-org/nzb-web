@@ -30,6 +30,7 @@ pub struct SabApiRequest {
     pub priority: Option<String>,
     pub start: Option<usize>,
     pub limit: Option<usize>,
+    pub password: Option<String>,
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -78,6 +79,7 @@ pub async fn h_sabnzbd_api_post(
     let mut name = query_req.name.clone();
     let mut nzb_data: Option<(String, Vec<u8>)> = None;
     let mut nzb_url: Option<String> = None;
+    let mut password: Option<String> = query_req.password.clone();
 
     while let Some(field) = multipart
         .next_field()
@@ -142,6 +144,13 @@ pub async fn h_sabnzbd_api_post(
                     nzb_url = Some(text);
                 }
             }
+            "password" => {
+                if let Ok(text) = field.text().await
+                    && !text.is_empty()
+                {
+                    password = Some(text);
+                }
+            }
             _ => {
                 let _ = field.bytes().await;
             }
@@ -181,6 +190,11 @@ pub async fn h_sabnzbd_api_post(
                     }
                     if let Some(ref p) = priority {
                         job.priority = sab_priority_to_priority(p);
+                    }
+
+                    // API-provided password overrides NZB metadata password
+                    if let Some(ref pw) = password {
+                        job.password = Some(pw.clone());
                     }
 
                     let qm = &state.queue_manager;
@@ -274,6 +288,11 @@ pub async fn h_sabnzbd_api_post(
                         job.priority = sab_priority_to_priority(p);
                     }
 
+                    // API-provided password overrides NZB metadata password
+                    if let Some(ref pw) = password {
+                        job.password = Some(pw.clone());
+                    }
+
                     let qm = &state.queue_manager;
                     job.work_dir = qm.incomplete_dir().join(&job.id);
                     job.output_dir = qm.complete_dir().join(&job.category).join(&job.name);
@@ -314,6 +333,7 @@ pub async fn h_sabnzbd_api_post(
                 priority,
                 start: query_req.start,
                 limit: query_req.limit,
+                password,
             };
             Ok(dispatch_mode(
                 &state,
