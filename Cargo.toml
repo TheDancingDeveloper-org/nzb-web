@@ -12,7 +12,7 @@ groups-db = ["nzb-postproc/groups-db"]
 
 [dependencies]
 nzb-decode = { version = "0.1.2", registry = "forgejo" }
-nzb-postproc = { version = "0.2.1", registry = "forgejo" }
+nzb-postproc = { version = "0.2.2", registry = "forgejo" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
