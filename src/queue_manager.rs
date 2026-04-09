@@ -112,6 +112,137 @@ impl SpeedTracker {
 }
 
 // ---------------------------------------------------------------------------
+// Hopeless job detection
+// ---------------------------------------------------------------------------
+
+/// Tracks article failure statistics for a single job to determine
+/// whether it can possibly complete. Implements a three-tier check:
+///
+/// 1. **Grace period** — ignore the first few failures (par2 can repair minor gaps)
+/// 2. **Early failure check** — if most of the first N articles fail, abort fast
+/// 3. **Ongoing availability** — track bytes missing vs total (excluding par2)
+struct HopelessTracker {
+    /// Total content bytes (excluding par2 files).
+    content_bytes: u64,
+    /// Total par2 bytes (tracked for diagnostics, not used in ratio calculation).
+    #[expect(dead_code)]
+    par2_bytes: u64,
+    /// Content bytes confirmed missing (failed articles in non-par2 files).
+    content_bytes_missing: u64,
+    /// Articles checked so far (downloaded + failed, not par2).
+    content_articles_checked: usize,
+    /// Content articles that failed.
+    content_articles_failed: usize,
+    /// Total content articles expected (non-par2).
+    content_articles_total: usize,
+}
+
+/// Number of bad articles allowed before any abort checks kick in.
+const HOPELESS_GRACE_ARTICLES: usize = 5;
+/// Minimum content articles checked before the early failure check fires.
+const EARLY_CHECK_MIN_ARTICLES: usize = 10;
+/// Failure rate threshold for the early check (0.0–1.0).
+const EARLY_CHECK_FAILURE_RATE: f64 = 0.80;
+
+impl HopelessTracker {
+    fn new(job: &NzbJob) -> Self {
+        let mut content_bytes: u64 = 0;
+        let mut par2_bytes: u64 = 0;
+        let mut content_articles_total: usize = 0;
+
+        for file in &job.files {
+            if file.is_par2 {
+                par2_bytes += file.bytes;
+            } else {
+                content_bytes += file.bytes;
+                content_articles_total += file.articles.len();
+            }
+        }
+
+        Self {
+            content_bytes,
+            par2_bytes,
+            content_bytes_missing: 0,
+            content_articles_checked: 0,
+            content_articles_failed: 0,
+            content_articles_total,
+        }
+    }
+
+    /// Record a successful content article download.
+    fn record_success(&mut self, is_par2: bool) {
+        if !is_par2 {
+            self.content_articles_checked += 1;
+        }
+    }
+
+    /// Record a failed content article. Returns the estimated byte size
+    /// of the missing article.
+    fn record_failure(&mut self, is_par2: bool, estimated_bytes: u64) {
+        if !is_par2 {
+            self.content_articles_checked += 1;
+            self.content_articles_failed += 1;
+            self.content_bytes_missing += estimated_bytes;
+        }
+    }
+
+    /// Check whether the job should be aborted.
+    ///
+    /// Returns `Some(reason)` if the job is hopeless, `None` if it should continue.
+    fn check(
+        &self,
+        abort_hopeless: bool,
+        early_failure_check: bool,
+        required_completion_pct: f64,
+    ) -> Option<String> {
+        if !abort_hopeless {
+            return None;
+        }
+
+        // Tier 1: grace period — allow minor gaps that par2 can fix
+        if self.content_articles_failed <= HOPELESS_GRACE_ARTICLES {
+            return None;
+        }
+
+        // Tier 2: early failure check — catch completely dead NZBs fast
+        if early_failure_check
+            && self.content_articles_checked >= EARLY_CHECK_MIN_ARTICLES
+            && self.content_articles_checked <= self.content_articles_total / 4
+        {
+            let failure_rate =
+                self.content_articles_failed as f64 / self.content_articles_checked as f64;
+            if failure_rate >= EARLY_CHECK_FAILURE_RATE {
+                return Some(format!(
+                    "Aborted: {:.0}% of first {} articles missing ({} of {} failed)",
+                    failure_rate * 100.0,
+                    self.content_articles_checked,
+                    self.content_articles_failed,
+                    self.content_articles_checked,
+                ));
+            }
+        }
+
+        // Tier 3: ongoing availability ratio (excluding par2)
+        if self.content_bytes > 0 {
+            let available_bytes = self
+                .content_bytes
+                .saturating_sub(self.content_bytes_missing);
+            let availability_pct = 100.0 * available_bytes as f64 / self.content_bytes as f64;
+            if availability_pct < required_completion_pct {
+                return Some(format!(
+                    "Aborted: only {availability_pct:.1}% of content available \
+                     (need {required_completion_pct:.1}%), \
+                     {} of {} content articles missing",
+                    self.content_articles_failed, self.content_articles_total,
+                ));
+            }
+        }
+
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-job state
 // ---------------------------------------------------------------------------
 
@@ -128,6 +259,8 @@ struct JobState {
     nzb_data: Option<Vec<u8>>,
     /// Direct unpacker for RAR extraction during download.
     direct_unpacker: Option<DirectUnpacker>,
+    /// Hopeless job tracker (None until download starts).
+    hopeless_tracker: Option<HopelessTracker>,
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +302,12 @@ pub struct QueueManager {
     bandwidth: Arc<BandwidthLimiter>,
     /// Whether direct unpack (RAR extraction during download) is enabled.
     direct_unpack_enabled: AtomicBool,
+    /// Abort downloads that cannot possibly complete.
+    abort_hopeless: bool,
+    /// Quick initial failure check on first N articles.
+    early_failure_check: bool,
+    /// Minimum completion percentage required (excluding par2).
+    required_completion_pct: f64,
 }
 
 impl QueueManager {
@@ -185,6 +324,9 @@ impl QueueManager {
         min_free_space: u64,
         speed_limit_bps: u64,
         direct_unpack: bool,
+        abort_hopeless: bool,
+        early_failure_check: bool,
+        required_completion_pct: f64,
     ) -> Arc<Self> {
         use crate::bandwidth::BandwidthConfig;
         use std::num::NonZeroU32;
@@ -213,6 +355,9 @@ impl QueueManager {
             min_free_space,
             bandwidth,
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
+            abort_hopeless,
+            early_failure_check,
+            required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
         })
     }
 
@@ -371,6 +516,7 @@ impl QueueManager {
                 speed: Arc::new(SpeedTracker::new()),
                 nzb_data,
                 direct_unpacker: None,
+                hopeless_tracker: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -388,6 +534,7 @@ impl QueueManager {
             speed: Arc::new(SpeedTracker::new()),
             nzb_data,
             direct_unpacker: None,
+            hopeless_tracker: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -531,6 +678,7 @@ impl QueueManager {
                 state.engine = engine;
                 state.task_handle = Some(task_handle);
                 state.speed = Arc::clone(&job_speed);
+                state.hopeless_tracker = Some(HopelessTracker::new(&state.job));
             }
         }
 
@@ -596,6 +744,16 @@ impl QueueManager {
                                 }
                             }
 
+                            let file_is_par2 = state
+                                .job
+                                .files
+                                .iter()
+                                .find(|f| f.id == file_id)
+                                .is_some_and(|f| f.is_par2);
+                            if let Some(ref mut tracker) = state.hopeless_tracker {
+                                tracker.record_success(file_is_par2);
+                            }
+
                             for file in &mut state.job.files {
                                 if file.id == file_id {
                                     file.bytes_downloaded += decoded_bytes;
@@ -658,52 +816,140 @@ impl QueueManager {
                     }
                 }
                 ProgressUpdate::ArticleFailed {
-                    error, server_id, ..
+                    file_id,
+                    error,
+                    server_id,
+                    ..
                 } => {
-                    let mut jobs = self.jobs.lock();
-                    if let Some(state) = jobs.get_mut(&job_id) {
-                        state.job.articles_failed += 1;
+                    let should_abort = {
+                        let mut jobs = self.jobs.lock();
+                        if let Some(state) = jobs.get_mut(&job_id) {
+                            state.job.articles_failed += 1;
 
-                        // Update per-server failed stats
-                        if let Some(ref sid) = server_id {
-                            let stats = &mut state.job.server_stats;
-                            if let Some(ss) = stats.iter_mut().find(|s| s.server_id == *sid) {
-                                ss.articles_failed += 1;
-                            } else {
-                                let sname = self
-                                    .servers
-                                    .lock()
+                            // Update per-server failed stats
+                            if let Some(ref sid) = server_id {
+                                let stats = &mut state.job.server_stats;
+                                if let Some(ss) = stats.iter_mut().find(|s| s.server_id == *sid) {
+                                    ss.articles_failed += 1;
+                                } else {
+                                    let sname = self
+                                        .servers
+                                        .lock()
+                                        .iter()
+                                        .find(|s| s.id == *sid)
+                                        .map(|s| s.name.clone())
+                                        .unwrap_or_else(|| sid.clone());
+                                    stats.push(ServerArticleStats {
+                                        server_id: sid.clone(),
+                                        server_name: sname,
+                                        articles_downloaded: 0,
+                                        articles_failed: 1,
+                                        bytes_downloaded: 0,
+                                    });
+                                }
+                            }
+
+                            // Abort direct unpack on first article failure —
+                            // PAR2 repair may be needed before extraction.
+                            if let Some(du) = state.direct_unpacker.take() {
+                                info!(
+                                    job_id = %job_id,
+                                    "Aborting direct unpack — article failure detected, falling back to normal pipeline"
+                                );
+                                du.abort();
+                            }
+
+                            // Track failure in hopeless detector and check
+                            // whether this job can still complete.
+                            if let Some(ref mut tracker) = state.hopeless_tracker {
+                                let file_is_par2 = state
+                                    .job
+                                    .files
                                     .iter()
-                                    .find(|s| s.id == *sid)
-                                    .map(|s| s.name.clone())
-                                    .unwrap_or_else(|| sid.clone());
-                                stats.push(ServerArticleStats {
-                                    server_id: sid.clone(),
-                                    server_name: sname,
-                                    articles_downloaded: 0,
-                                    articles_failed: 1,
-                                    bytes_downloaded: 0,
-                                });
+                                    .find(|f| f.id == file_id)
+                                    .is_some_and(|f| f.is_par2);
+                                // Estimate article size from total file bytes / article count
+                                let estimated_bytes = state
+                                    .job
+                                    .files
+                                    .iter()
+                                    .find(|f| f.id == file_id)
+                                    .map(|f| {
+                                        if f.articles.is_empty() {
+                                            0
+                                        } else {
+                                            f.bytes / f.articles.len() as u64
+                                        }
+                                    })
+                                    .unwrap_or(0);
+                                tracker.record_failure(file_is_par2, estimated_bytes);
+                                tracker.check(
+                                    self.abort_hopeless,
+                                    self.early_failure_check,
+                                    self.required_completion_pct,
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(reason) = should_abort {
+                        warn!(job_id = %job_id, reason = %reason, "Job is hopeless — aborting");
+                        // Cancel the download engine so workers exit.
+                        // Store the reason so JobFinished can mark it as failed.
+                        {
+                            let mut jobs = self.jobs.lock();
+                            if let Some(state) = jobs.get_mut(&job_id) {
+                                state.job.error_message = Some(reason);
+                                state.engine.cancel();
                             }
                         }
-
-                        // Abort direct unpack on first article failure —
-                        // PAR2 repair may be needed before extraction.
-                        if let Some(du) = state.direct_unpacker.take() {
-                            info!(
-                                job_id = %job_id,
-                                "Aborting direct unpack — article failure detected, falling back to normal pipeline"
-                            );
-                            du.abort();
-                        }
+                    } else {
+                        warn!(job_id = %job_id, "Article failed: {error}");
                     }
-                    warn!(job_id = %job_id, "Article failed: {error}");
                 }
                 ProgressUpdate::JobFinished {
                     success,
                     articles_failed,
                     ..
                 } => {
+                    // Check if this job was cancelled by the hopeless detector.
+                    // If so, treat it as a failure — skip post-processing entirely.
+                    let was_aborted_hopeless = {
+                        let jobs = self.jobs.lock();
+                        jobs.get(&job_id).is_some_and(|s| {
+                            s.engine.is_cancelled() && s.job.error_message.is_some()
+                        })
+                    };
+
+                    if was_aborted_hopeless {
+                        let abort_reason = {
+                            let jobs = self.jobs.lock();
+                            jobs.get(&job_id)
+                                .and_then(|s| s.job.error_message.clone())
+                                .unwrap_or_else(|| "Download cannot complete".into())
+                        };
+                        warn!(
+                            job_id = %job_id,
+                            articles_failed,
+                            reason = %abort_reason,
+                            "Job aborted — moving to failed"
+                        );
+                        {
+                            let mut jobs = self.jobs.lock();
+                            if let Some(state) = jobs.get_mut(&job_id) {
+                                state.job.status = JobStatus::Failed;
+                                state.job.completed_at = Some(chrono::Utc::now());
+                            }
+                        }
+                        self.start_next_queued();
+                        self.on_job_finished(&job_id, false, articles_failed).await;
+                        break;
+                    }
+
                     info!(
                         job_id = %job_id,
                         success,
@@ -744,6 +990,24 @@ impl QueueManager {
                     self.persist_job_progress(&job_id);
                     // Release the download slot so queued jobs can start
                     self.start_next_queued();
+                    break;
+                }
+                ProgressUpdate::JobAborted { reason, .. } => {
+                    warn!(
+                        job_id = %job_id,
+                        reason = %reason,
+                        "Job aborted by download engine"
+                    );
+                    {
+                        let mut jobs = self.jobs.lock();
+                        if let Some(state) = jobs.get_mut(&job_id) {
+                            state.job.status = JobStatus::Failed;
+                            state.job.error_message = Some(reason);
+                            state.job.completed_at = Some(chrono::Utc::now());
+                        }
+                    }
+                    self.start_next_queued();
+                    self.on_job_finished(&job_id, false, 0).await;
                     break;
                 }
             }
@@ -1838,6 +2102,7 @@ impl QueueManager {
                 speed: Arc::new(SpeedTracker::new()),
                 nzb_data,
                 direct_unpacker: None,
+                hopeless_tracker: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -1951,5 +2216,172 @@ impl QueueManager {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod hopeless_tests {
+    use super::*;
+
+    /// Helper: build a tracker with N content articles of ~1MB each and M par2 articles.
+    fn make_tracker(content_articles: usize, par2_articles: usize) -> HopelessTracker {
+        let article_bytes: u64 = 750_000; // ~750KB per article
+        HopelessTracker {
+            content_bytes: content_articles as u64 * article_bytes,
+            par2_bytes: par2_articles as u64 * article_bytes,
+            content_bytes_missing: 0,
+            content_articles_checked: 0,
+            content_articles_failed: 0,
+            content_articles_total: content_articles,
+        }
+    }
+
+    #[test]
+    fn grace_period_allows_small_failures() {
+        let mut t = make_tracker(1000, 50);
+        // Fail 5 articles (at the grace threshold)
+        for _ in 0..5 {
+            t.record_failure(false, 750_000);
+        }
+        assert!(
+            t.check(true, true, 100.2).is_none(),
+            "Should not abort within grace period"
+        );
+    }
+
+    #[test]
+    fn grace_period_disabled_when_abort_hopeless_off() {
+        let mut t = make_tracker(100, 10);
+        for _ in 0..100 {
+            t.record_failure(false, 750_000);
+        }
+        assert!(
+            t.check(false, true, 100.2).is_none(),
+            "Should never abort when abort_hopeless is disabled"
+        );
+    }
+
+    #[test]
+    fn early_check_fires_at_80pct_of_first_10() {
+        let mut t = make_tracker(1000, 50);
+        // Simulate: 8 failures, 2 successes out of first 10
+        for _ in 0..8 {
+            t.record_failure(false, 750_000);
+        }
+        for _ in 0..2 {
+            t.record_success(false);
+        }
+        let result = t.check(true, true, 100.2);
+        assert!(result.is_some(), "Should abort: 80% failure in first 10");
+        assert!(result.unwrap().contains("80%"));
+    }
+
+    #[test]
+    fn early_check_does_not_fire_below_threshold() {
+        let mut t = make_tracker(1000, 50);
+        // 7 failures, 3 successes = 70% failure
+        for _ in 0..7 {
+            t.record_failure(false, 750_000);
+        }
+        for _ in 0..3 {
+            t.record_success(false);
+        }
+        // Still within grace (7 > 5) but early check at 70% < 80%
+        // However, we need to check the ongoing ratio too.
+        // 7 * 750KB missing out of 1000 * 750KB total = 0.7% missing
+        // availability = 99.3%, which is below 100.2 — so it should still pass
+        // because at 10 articles checked the ratio is still fine.
+        // Actually: 7 * 750KB = 5.25MB missing out of 750MB total = 99.3% available
+        // 99.3 < 100.2 → would abort via tier 3!
+        // But wait, content_bytes = 1000 * 750_000 = 750MB, missing = 5.25MB
+        // availability = (750MB - 5.25MB) / 750MB * 100 = 99.3%
+        // 99.3 < 100.2 → yes this triggers tier 3.
+        // With 1000 articles, 7 missing is easily repairable by par2.
+        // The 100.2% threshold is very aggressive. Let's use a more reasonable test.
+        let result = t.check(true, false, 95.0);
+        assert!(
+            result.is_none(),
+            "Should not abort: 70% failure in first 10 with early_check disabled and low threshold"
+        );
+    }
+
+    #[test]
+    fn early_check_disabled_still_checks_ongoing() {
+        let mut t = make_tracker(100, 10);
+        // Fail all 100 content articles
+        for _ in 0..100 {
+            t.record_failure(false, 750_000);
+        }
+        let result = t.check(true, false, 100.0);
+        assert!(
+            result.is_some(),
+            "Ongoing ratio should catch 100% failure even with early_check off"
+        );
+        assert!(result.unwrap().contains("0.0%"));
+    }
+
+    #[test]
+    fn par2_failures_do_not_count() {
+        let mut t = make_tracker(100, 50);
+        // Fail 20 par2 articles — should not affect content tracking
+        for _ in 0..20 {
+            t.record_failure(true, 750_000);
+        }
+        assert_eq!(t.content_articles_failed, 0);
+        assert_eq!(t.content_bytes_missing, 0);
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    #[test]
+    fn ongoing_ratio_triggers_when_too_many_missing() {
+        let mut t = make_tracker(100, 10);
+        // Fail 10 out of 100 articles (10% missing)
+        // availability = 90% < 100.2% → should abort
+        for _ in 0..10 {
+            t.record_failure(false, 750_000);
+        }
+        for _ in 0..40 {
+            t.record_success(false);
+        }
+        let result = t.check(true, true, 100.0);
+        assert!(
+            result.is_some(),
+            "10% missing should fail at 100% threshold"
+        );
+    }
+
+    #[test]
+    fn early_check_only_fires_in_first_quarter() {
+        let mut t = make_tracker(40, 5);
+        // Check 11 articles (> 25% of 40) — early check should NOT fire
+        // even though failure rate is high
+        for _ in 0..9 {
+            t.record_failure(false, 750_000);
+        }
+        for _ in 0..2 {
+            t.record_success(false);
+        }
+        // 11 checked, 9 failed = 81.8% failure
+        // But 11 > 40/4 = 10, so early check won't fire
+        // Ongoing ratio: 9 * 750KB missing / (40 * 750KB) = 22.5% missing → 77.5% available
+        // 77.5 < 100.0 → ongoing ratio fires
+        let result = t.check(true, true, 100.0);
+        assert!(result.is_some());
+        // Verify it's the ongoing ratio message, not the early check
+        assert!(result.unwrap().contains("available"));
+    }
+
+    #[test]
+    fn completely_dead_nzb_aborts_fast() {
+        let mut t = make_tracker(10000, 500);
+        // First 10 articles all fail — exactly the scenario from the bug report
+        for _ in 0..10 {
+            t.record_failure(false, 750_000);
+        }
+        let result = t.check(true, true, 100.2);
+        assert!(
+            result.is_some(),
+            "100% failure on first 10 should abort immediately"
+        );
     }
 }

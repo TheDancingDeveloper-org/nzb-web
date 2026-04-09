@@ -149,6 +149,8 @@ pub enum ProgressUpdate {
     },
     /// No servers could be reached — job should be paused, not moved to history.
     NoServersAvailable { job_id: String, reason: String },
+    /// Job aborted because it cannot possibly complete (too many missing articles).
+    JobAborted { job_id: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------
