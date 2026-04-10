@@ -644,7 +644,9 @@ impl QueueManager {
             "Starting download job"
         );
 
-        let engine = Arc::new(DownloadEngine::with_stall_timeout(self.article_timeout_secs));
+        let engine = Arc::new(DownloadEngine::with_stall_timeout(
+            self.article_timeout_secs,
+        ));
         let job_speed = Arc::new(SpeedTracker::new());
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
 

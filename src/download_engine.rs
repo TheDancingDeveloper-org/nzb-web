@@ -952,9 +952,14 @@ async fn download_worker_pipelined(
                     // Connection is in an unknown state — drop and reconnect
                     requeue_all(&mut in_flight_items, work_queue);
                     *conn = NntpConnection::new(worker_id.to_string());
-                    if let Err(e) =
-                        connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                            .await
+                    if let Err(e) = connect_with_retry(
+                        conn,
+                        primary_server,
+                        worker_id,
+                        server_health,
+                        all_servers,
+                    )
+                    .await
                     {
                         warn!(worker = %worker_id, server = %primary_server.name, "Stall reconnect FAILED: {e} — worker exiting");
                         break;
@@ -1406,9 +1411,14 @@ async fn download_worker_serial(
                     work_queue.lock().push_front(item);
                     // Connection is in an unknown state — drop and reconnect
                     *conn = NntpConnection::new(worker_id.to_string());
-                    if let Err(e) =
-                        connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                            .await
+                    if let Err(e) = connect_with_retry(
+                        conn,
+                        primary_server,
+                        worker_id,
+                        server_health,
+                        all_servers,
+                    )
+                    .await
                     {
                         warn!(worker = %worker_id, server = %primary_server.name, "Stall reconnect FAILED: {e} — worker exiting");
                         return;
