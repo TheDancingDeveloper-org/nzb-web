@@ -1,22 +1,44 @@
-//! Download engine — fetches articles via NNTP, decodes yEnc, assembles files.
+//! Download engine — shared NNTP worker pool that services all active jobs.
 //!
-//! Retry logic:
-//! 1. Try article on current server (up to MAX_TRIES_PER_SERVER attempts with reconnect)
-//! 2. On ArticleNotFound (430) — immediately try next server (no local retry)
-//! 3. On connection error — reconnect same server, re-queue article
-//! 4. On decode error — try next server (data may differ)
-//! 5. Only mark article as failed after ALL servers exhausted
-//! 6. Job continues even with failed articles (par2 can repair)
-//! 7. Job only fails if failed articles exceed threshold AND no par2 recovery possible
+//! Architecture:
+//! - A single long-lived [`WorkerPool`] is owned by [`crate::queue_manager::QueueManager`].
+//! - For each enabled server, exactly `server.connections` workers are
+//!   spawned and live as long as the server stays enabled. When the server
+//!   list or per-server connection limit changes, the pool reconciles.
+//! - Jobs register a [`JobContext`] and push their work items into a
+//!   [`SharedWorkQueue`]. Workers pop items tagged with `job_id` and look up
+//!   per-job state (assembler, progress sink, pause/cancel flags) via the
+//!   shared [`JobContextMap`].
+//! - Pause / cancel / completion are per-job flags; workers themselves are
+//!   never torn down on job transitions. Pausing a job causes workers holding
+//!   one of its items to return that item to the queue and pull something
+//!   else. Cancelling a job drains its items and drops in-flight results.
+//! - A supervisor task detects "all enabled servers circuit-broken for a
+//!   given job" and emits [`ProgressUpdate::NoServersAvailable`] so the user
+//!   can fix config and resume, matching the prior per-engine behaviour.
+//!
+//! Retry logic (per article):
+//! 1. Try the article on the current server up to [`MAX_TRIES_PER_SERVER`]
+//!    times, reconnecting on transient errors.
+//! 2. On `ArticleNotFound` (430) — requeue with the current server added to
+//!    `tried_servers`; another worker on a different server picks it up.
+//! 3. On connection loss — requeue and reconnect.
+//! 4. On decode error — treated like "not available on this server", try
+//!    another.
+//! 5. When every enabled server is in `tried_servers` (or circuit-broken),
+//!    the article is marked failed.
+//! 6. A job only fails if failed articles exceed the threshold and no par2
+//!    recovery is possible.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::ServerConfig;
@@ -30,18 +52,42 @@ use nzb_decode::yenc::decode_yenc;
 use crate::bandwidth::BandwidthLimiter;
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Max times to retry an article on the SAME server before trying the next.
+const MAX_TRIES_PER_SERVER: u32 = 3;
+/// Delay between reconnection attempts.
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+/// Max reconnect attempts before giving up on a server for this session.
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+/// Stagger delay between worker initial connections to avoid thundering herd.
+/// Each worker waits conn_idx * WORKER_RAMP_DELAY before its first connect.
+const WORKER_RAMP_DELAY: Duration = Duration::from_millis(15);
+/// Consecutive connect failures before circuit-breaking a server.
+const CIRCUIT_BREAK_THRESHOLD: u32 = 3;
+/// Cooldown after auth/permission failure (bad credentials, 502, account blocked).
+const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
+/// Cooldown after transient connection failures exceed threshold.
+const TRANSIENT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
+/// Supervisor tick interval for detecting stuck jobs.
+const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
+/// Worker idle poll interval when the shared queue is empty.
+const WORKER_IDLE_POLL: Duration = Duration::from_millis(500);
+
+// ---------------------------------------------------------------------------
 // Global connection tracking
 // ---------------------------------------------------------------------------
 
-/// Tracks active NNTP connections per server across all concurrent download jobs.
+/// Tracks active NNTP connections per server for observability.
 ///
-/// Shared via `Arc` between the QueueManager and all DownloadEngine instances.
-/// Workers increment on connect, decrement on disconnect. The speed tracker
-/// periodically logs the counts so connection leaks are visible.
+/// With the shared worker pool, the per-server worker count is the hard cap
+/// on concurrent connections — this tracker exists to validate that invariant
+/// and to surface warnings if anything escapes the pool (e.g. future direct
+/// readers). Workers increment on connect, decrement on disconnect via
+/// [`ConnectionGuard`].
 pub struct ConnectionTracker {
-    /// Per-server active connection count (key = server ID).
     counts: Mutex<HashMap<String, Arc<AtomicUsize>>>,
-    /// Per-server connection limit (key = server ID).
     limits: Mutex<HashMap<String, usize>>,
 }
 
@@ -53,12 +99,10 @@ impl ConnectionTracker {
         }
     }
 
-    /// Update the configured limit for a server.
     pub fn set_limit(&self, server_id: &str, limit: usize) {
         self.limits.lock().insert(server_id.to_string(), limit);
     }
 
-    /// Get or create the counter for a server.
     fn counter(&self, server_id: &str) -> Arc<AtomicUsize> {
         let mut counts = self.counts.lock();
         counts
@@ -67,7 +111,6 @@ impl ConnectionTracker {
             .clone()
     }
 
-    /// Record a new connection. Returns the new count and whether it exceeds the limit.
     pub fn connect(&self, server_id: &str, server_name: &str) -> usize {
         let counter = self.counter(server_id);
         let new_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -83,17 +126,14 @@ impl ConnectionTracker {
         new_count
     }
 
-    /// Record a disconnection.
     pub fn disconnect(&self, server_id: &str) {
         let counter = self.counter(server_id);
         let prev = counter.fetch_sub(1, Ordering::Relaxed);
         if prev == 0 {
-            // Underflow protection — shouldn't happen but don't wrap to usize::MAX
             counter.store(0, Ordering::Relaxed);
         }
     }
 
-    /// Get a snapshot of all connection counts for logging.
     pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
         let counts = self.counts.lock();
         let limits = self.limits.lock();
@@ -106,7 +146,6 @@ impl ConnectionTracker {
             .collect()
     }
 
-    /// Total active connections across all servers.
     pub fn total(&self) -> usize {
         self.counts
             .lock()
@@ -123,7 +162,6 @@ impl Default for ConnectionTracker {
 }
 
 /// RAII guard that decrements the connection counter on drop.
-/// Ensures connections are tracked even if a worker panics or exits early.
 struct ConnectionGuard {
     server_id: String,
     tracker: Arc<ConnectionTracker>,
@@ -139,22 +177,6 @@ impl ConnectionGuard {
             active: true,
         }
     }
-
-    /// Temporarily release the connection (e.g. during pause).
-    fn release(&mut self) {
-        if self.active {
-            self.tracker.disconnect(&self.server_id);
-            self.active = false;
-        }
-    }
-
-    /// Re-acquire after release (e.g. after unpause).
-    fn reacquire(&mut self, server_name: &str) {
-        if !self.active {
-            self.tracker.connect(&self.server_id, server_name);
-            self.active = true;
-        }
-    }
 }
 
 impl Drop for ConnectionGuard {
@@ -165,42 +187,15 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// Max times to retry an article on the SAME server before trying the next.
-const MAX_TRIES_PER_SERVER: u32 = 3;
-/// Delay between reconnection attempts.
-const RECONNECT_DELAY: Duration = Duration::from_secs(5);
-/// Max reconnect attempts before giving up on a server for this session.
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
-/// Stagger delay between worker initial connections to avoid thundering herd.
-/// Each worker waits conn_idx * WORKER_RAMP_DELAY before its first connect.
-/// This is in addition to the per-host gate in nzb-nntp.
-const WORKER_RAMP_DELAY: Duration = Duration::from_millis(15);
-/// Consecutive connect failures before circuit-breaking a server.
-const CIRCUIT_BREAK_THRESHOLD: u32 = 3;
-/// Cooldown after auth/permission failure (bad credentials, 502, account blocked).
-const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
-/// Cooldown after transient connection failures exceed threshold.
-const TRANSIENT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
-
 // ---------------------------------------------------------------------------
 // Server health tracking (circuit breaker)
 // ---------------------------------------------------------------------------
 
-/// Per-server connection health for circuit-breaking.
-///
-/// When a server repeatedly fails to connect (auth rejected, 502, etc.)
-/// it is temporarily disabled so workers don't waste time retrying.
-/// This prevents the "N workers × M retries" storm when a provider
-/// blocks or rate-limits connections.
 #[derive(Debug)]
 pub struct ServerHealth {
-    /// Consecutive connection failures.
     pub consecutive_failures: u32,
-    /// Server is disabled until this instant (None = healthy).
     pub disabled_until: Option<Instant>,
-    /// Human-readable reason for the circuit break.
     pub reason: Option<String>,
-    /// Whether the last failure was auth/permission (vs transient).
     pub is_auth_failure: bool,
 }
 
@@ -220,7 +215,6 @@ impl ServerHealth {
         }
     }
 
-    /// Returns `true` if the server is available for connections.
     pub fn is_available(&self) -> bool {
         match self.disabled_until {
             None => true,
@@ -228,8 +222,6 @@ impl ServerHealth {
         }
     }
 
-    /// Record a connection failure.  Auth/502 failures circuit-break
-    /// immediately; transient failures circuit-break after a threshold.
     pub fn record_failure(&mut self, is_auth: bool, reason: &str) {
         self.consecutive_failures += 1;
         self.is_auth_failure = is_auth;
@@ -245,13 +237,11 @@ impl ServerHealth {
         }
     }
 
-    /// Record a successful connection — resets the circuit breaker.
     pub fn record_success(&mut self) {
         *self = Self::new();
     }
 }
 
-/// Shared server health state, keyed by server ID.
 pub type ServerHealthMap = Arc<Mutex<HashMap<String, ServerHealth>>>;
 
 // ---------------------------------------------------------------------------
@@ -260,7 +250,6 @@ pub type ServerHealthMap = Arc<Mutex<HashMap<String, ServerHealth>>>;
 
 #[derive(Debug, Clone)]
 pub enum ProgressUpdate {
-    /// An article was successfully downloaded and decoded.
     ArticleComplete {
         job_id: String,
         file_id: String,
@@ -269,7 +258,6 @@ pub enum ProgressUpdate {
         file_complete: bool,
         server_id: Option<String>,
     },
-    /// An article failed on all servers (counted as bad/missing).
     ArticleFailed {
         job_id: String,
         file_id: String,
@@ -277,16 +265,19 @@ pub enum ProgressUpdate {
         error: String,
         server_id: Option<String>,
     },
-    /// The entire job has finished (all articles processed).
     JobFinished {
         job_id: String,
         success: bool,
         articles_failed: usize,
     },
-    /// No servers could be reached — job should be paused, not moved to history.
-    NoServersAvailable { job_id: String, reason: String },
-    /// Job aborted because it cannot possibly complete (too many missing articles).
-    JobAborted { job_id: String, reason: String },
+    NoServersAvailable {
+        job_id: String,
+        reason: String,
+    },
+    JobAborted {
+        job_id: String,
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -294,660 +285,966 @@ pub enum ProgressUpdate {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-struct WorkItem {
-    job_id: String,
-    file_id: String,
-    filename: String,
-    message_id: String,
-    segment_number: u32,
+pub(crate) struct WorkItem {
+    pub(crate) job_id: String,
+    pub(crate) file_id: String,
+    pub(crate) filename: String,
+    pub(crate) message_id: String,
+    pub(crate) segment_number: u32,
     /// Servers already tried for this article (by server ID).
-    tried_servers: Vec<String>,
+    pub(crate) tried_servers: Vec<String>,
     /// Number of attempts on the current server.
-    tries_on_current: u32,
+    pub(crate) tries_on_current: u32,
 }
 
 // ---------------------------------------------------------------------------
-// Download engine
+// Per-job context
 // ---------------------------------------------------------------------------
 
-pub struct DownloadEngine {
-    cancelled: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    /// Cumulative yEnc decode time across all workers (microseconds).
+/// Per-job state that workers reference via `item.job_id`.
+///
+/// Everything a worker needs to process an article for a specific job lives
+/// here. The queue manager owns one `Arc<JobContext>` per active job; the
+/// pool holds a clone in its [`JobContextMap`] so workers can look it up.
+pub(crate) struct JobContext {
+    pub job_id: String,
+    pub work_dir: PathBuf,
+    pub assembler: Arc<FileAssembler>,
+    pub progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
+    pub yenc_names: Arc<Mutex<HashMap<String, String>>>,
+    pub nzb_filenames: HashMap<String, String>,
+    /// Articles that still need a definitive result (success or all-server
+    /// failure). When this reaches zero, `JobFinished` is emitted.
+    pub articles_remaining: AtomicUsize,
+    pub articles_failed: AtomicUsize,
+    pub paused: AtomicBool,
+    pub cancelled: AtomicBool,
+    /// Optional abort reason — if set when articles_remaining hits zero
+    /// (or when cancellation fires), `JobAborted` is emitted instead of
+    /// `JobFinished`.
+    pub abort_reason: Mutex<Option<String>>,
     pub total_decode_us: Arc<AtomicU64>,
-    /// Cumulative file assembly time across all workers (microseconds).
     pub total_assemble_us: Arc<AtomicU64>,
-    /// Total articles successfully decoded.
     pub total_articles_decoded: Arc<AtomicU64>,
-    /// Max time to wait for a single article response before treating the
-    /// connection as stalled.  `None` = no timeout.
-    stall_timeout: Option<Duration>,
+    pub engine_start: Instant,
+    /// Total bytes across all files (for perf summary throughput).
+    pub total_bytes: u64,
+    /// Ensures JobFinished/JobAborted is only emitted once.
+    finished: AtomicBool,
 }
 
-impl Default for DownloadEngine {
+pub(crate) type JobContextMap = Arc<Mutex<HashMap<String, Arc<JobContext>>>>;
+
+impl JobContext {
+    fn new(
+        job: &NzbJob,
+        assembler: Arc<FileAssembler>,
+        progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
+        total_articles: usize,
+    ) -> Self {
+        let nzb_filenames = job
+            .files
+            .iter()
+            .map(|f| (f.id.clone(), f.filename.clone()))
+            .collect();
+        Self {
+            job_id: job.id.clone(),
+            work_dir: job.work_dir.clone(),
+            assembler,
+            progress_tx,
+            yenc_names: Arc::new(Mutex::new(HashMap::new())),
+            nzb_filenames,
+            articles_remaining: AtomicUsize::new(total_articles),
+            articles_failed: AtomicUsize::new(0),
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+            abort_reason: Mutex::new(None),
+            total_decode_us: Arc::new(AtomicU64::new(0)),
+            total_assemble_us: Arc::new(AtomicU64::new(0)),
+            total_articles_decoded: Arc::new(AtomicU64::new(0)),
+            engine_start: Instant::now(),
+            total_bytes: job.total_bytes,
+            finished: AtomicBool::new(false),
+        }
+    }
+
+    /// Decrement articles_remaining. If it reaches zero, run deobfuscation
+    /// and emit the job-finished/aborted terminal update. Idempotent.
+    fn resolve_one(&self) {
+        let prev = self.articles_remaining.fetch_sub(1, Ordering::Relaxed);
+        if prev != 1 {
+            return;
+        }
+        self.emit_terminal();
+    }
+
+    /// Emit the terminal (JobFinished / JobAborted) message. Safe to call
+    /// multiple times; only the first call does anything.
+    fn emit_terminal(&self) {
+        if self.finished.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        // Run deobfuscation before signalling completion so post-processing
+        // sees the final filenames.
+        self.deobfuscate_files();
+
+        let download_elapsed = self.engine_start.elapsed();
+        let decode_total_us = self.total_decode_us.load(Ordering::Relaxed);
+        let assemble_total_us = self.total_assemble_us.load(Ordering::Relaxed);
+        let articles_decoded = self.total_articles_decoded.load(Ordering::Relaxed);
+        let elapsed_us = download_elapsed.as_micros().max(1);
+        let throughput_mbps = (self.total_bytes as f64 / download_elapsed.as_secs_f64().max(0.001))
+            / (1024.0 * 1024.0);
+        info!(
+            job_id = %self.job_id,
+            elapsed_secs = download_elapsed.as_secs_f64(),
+            total_bytes = self.total_bytes,
+            throughput_mbps = format!("{throughput_mbps:.2}"),
+            "Download phase complete"
+        );
+        info!(
+            job_id = %self.job_id,
+            articles_decoded,
+            decode_secs = format!("{:.3}", decode_total_us as f64 / 1_000_000.0),
+            assemble_secs = format!("{:.3}", assemble_total_us as f64 / 1_000_000.0),
+            decode_pct = format!("{:.1}", decode_total_us as f64 / elapsed_us as f64 * 100.0),
+            assemble_pct = format!("{:.1}", assemble_total_us as f64 / elapsed_us as f64 * 100.0),
+            "Decode timing summary (cumulative across all workers)"
+        );
+
+        let abort_reason = self.abort_reason.lock().clone();
+        if let Some(reason) = abort_reason {
+            let _ = self.progress_tx.send(ProgressUpdate::JobAborted {
+                job_id: self.job_id.clone(),
+                reason,
+            });
+            return;
+        }
+
+        let failed = self.articles_failed.load(Ordering::Relaxed);
+        let _ = self.progress_tx.send(ProgressUpdate::JobFinished {
+            job_id: self.job_id.clone(),
+            success: failed == 0,
+            articles_failed: failed,
+        });
+    }
+
+    /// Choose the best filename between NZB subject and yEnc header per file
+    /// and rename on disk if needed. Called exactly once at job completion.
+    fn deobfuscate_files(&self) {
+        let renames = self.yenc_names.lock();
+        for (file_id, yenc_name) in renames.iter() {
+            let Some(nzb_name) = self.nzb_filenames.get(file_id) else {
+                continue;
+            };
+            if nzb_name == yenc_name {
+                continue;
+            }
+            let clean_yenc = std::path::Path::new(yenc_name.as_str())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(yenc_name);
+            if clean_yenc.is_empty() || nzb_name == clean_yenc {
+                continue;
+            }
+
+            let nzb_has_ext = has_known_extension(nzb_name);
+            let yenc_has_ext = has_known_extension(clean_yenc);
+
+            let (old_name, new_name) = if yenc_has_ext && !nzb_has_ext {
+                (nzb_name.as_str(), clean_yenc)
+            } else if nzb_has_ext && !yenc_has_ext {
+                continue;
+            } else if yenc_has_ext && nzb_has_ext {
+                (nzb_name.as_str(), clean_yenc)
+            } else {
+                continue;
+            };
+
+            let old_path = self.work_dir.join(old_name);
+            let new_path = self.work_dir.join(new_name);
+            if old_path.exists() && !new_path.exists() {
+                if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                    warn!(
+                        job_id = %self.job_id,
+                        from = %old_name,
+                        to = %new_name,
+                        "Failed to deobfuscate file: {e}"
+                    );
+                } else {
+                    info!(
+                        job_id = %self.job_id,
+                        from = %old_name,
+                        to = %new_name,
+                        "Deobfuscated file"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared work queue
+// ---------------------------------------------------------------------------
+
+/// Multi-job FIFO work queue with PAR2-first priority within each submission.
+///
+/// Items submitted via [`SharedWorkQueue::submit_items`] are inserted so that
+/// PAR2 index and volume files land ahead of data files (matching the prior
+/// per-job ordering), while data files land at the tail. Cross-job ordering
+/// is FIFO by submission time, per the chosen FIFO priority model.
+pub(crate) struct SharedWorkQueue {
+    inner: Mutex<VecDeque<WorkItem>>,
+    notify: Notify,
+}
+
+impl SharedWorkQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Insert a batch of work items with PAR2 items ahead of data items.
+    /// Cross-batch order is preserved: PAR2 items from this batch go after
+    /// any existing items, then data items.
+    pub fn submit_items(&self, mut items: Vec<WorkItem>) {
+        items.sort_by_key(|item| par2_sort_key(&item.filename));
+        let had_items = !items.is_empty();
+        {
+            let mut q = self.inner.lock();
+            q.reserve(items.len());
+            for item in items {
+                q.push_back(item);
+            }
+        }
+        if had_items {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Push a single item back onto the front (used when a worker is
+    /// returning an item because its job is paused or its server was just
+    /// tried for this item).
+    fn push_front(&self, item: WorkItem) {
+        self.inner.lock().push_front(item);
+        self.notify.notify_waiters();
+    }
+
+    /// Push a single item to the back (used after handle_article_not_available
+    /// when another server can still try it).
+    fn push_back(&self, item: WorkItem) {
+        self.inner.lock().push_back(item);
+        self.notify.notify_waiters();
+    }
+
+    /// Pop the next item that can be processed by a worker on `server_id`.
+    ///
+    /// Skips items that have already tried `server_id`, rotating them to the
+    /// back of the queue. Returns `None` if the queue is empty or if every
+    /// item has already tried this server (the caller should sleep briefly).
+    fn pop_workable(&self, server_id: &str) -> Option<WorkItem> {
+        let mut q = self.inner.lock();
+        let len = q.len();
+        for _ in 0..len {
+            let item = q.pop_front()?;
+            if item.tried_servers.iter().any(|s| s == server_id) {
+                q.push_back(item);
+                continue;
+            }
+            return Some(item);
+        }
+        None
+    }
+
+    /// Remove all items belonging to `job_id`. Used on cancel_job / remove_job.
+    fn drain_job(&self, job_id: &str) -> Vec<WorkItem> {
+        let mut q = self.inner.lock();
+        let mut kept = VecDeque::with_capacity(q.len());
+        let mut drained = Vec::new();
+        while let Some(item) = q.pop_front() {
+            if item.job_id == job_id {
+                drained.push(item);
+            } else {
+                kept.push_back(item);
+            }
+        }
+        *q = kept;
+        drained
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().len()
+    }
+}
+
+impl Default for SharedWorkQueue {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DownloadEngine {
-    pub fn new() -> Self {
-        Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
-            total_decode_us: Arc::new(AtomicU64::new(0)),
-            total_assemble_us: Arc::new(AtomicU64::new(0)),
-            total_articles_decoded: Arc::new(AtomicU64::new(0)),
-            stall_timeout: None,
-        }
-    }
+// ---------------------------------------------------------------------------
+// Worker pool
+// ---------------------------------------------------------------------------
 
-    /// Create a new engine with a per-article stall timeout.
-    /// If `timeout_secs` is 0, no timeout is applied.
-    pub fn with_stall_timeout(timeout_secs: u64) -> Self {
-        let mut engine = Self::new();
-        if timeout_secs > 0 {
-            engine.stall_timeout = Some(Duration::from_secs(timeout_secs));
-        }
-        engine
-    }
+struct ActiveWorker {
+    shutdown: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+}
 
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
+/// Long-lived worker pool that services all active download jobs.
+pub struct WorkerPool {
+    work_queue: Arc<SharedWorkQueue>,
+    job_contexts: JobContextMap,
+    servers: Arc<Mutex<Vec<ServerConfig>>>,
+    server_health: ServerHealthMap,
+    bandwidth: Arc<BandwidthLimiter>,
+    conn_tracker: Arc<ConnectionTracker>,
+    stall_timeout: Option<Duration>,
+    workers: Mutex<HashMap<String, Vec<ActiveWorker>>>,
+    shutdown: Arc<AtomicBool>,
+    supervisor_handle: Mutex<Option<JoinHandle<()>>>,
+}
 
-    pub fn pause(&self) {
-        self.paused.store(true, Ordering::Relaxed);
-    }
-
-    pub fn resume(&self) {
-        self.paused.store(false, Ordering::Relaxed);
-    }
-
-    pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    /// Run the download engine for a single job.
-    ///
-    /// `servers` is the shared live server list from the queue manager —
-    /// workers read from it on each article so they see enables/disables
-    /// in real time.
-    ///
-    /// `server_health` tracks per-server connection health.  When a server
-    /// repeatedly fails (auth rejected, 502, etc.) it is circuit-broken so
-    /// other workers exit immediately instead of retrying.
-    pub async fn run(
-        &self,
-        job: &NzbJob,
+impl WorkerPool {
+    pub fn new(
         servers: Arc<Mutex<Vec<ServerConfig>>>,
-        server_health: ServerHealthMap,
-        progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
         bandwidth: Arc<BandwidthLimiter>,
         conn_tracker: Arc<ConnectionTracker>,
-    ) {
-        let job_id = job.id.clone();
-        let engine_start = Instant::now();
+        stall_timeout_secs: u64,
+    ) -> Arc<Self> {
+        let stall_timeout = if stall_timeout_secs > 0 {
+            Some(Duration::from_secs(stall_timeout_secs))
+        } else {
+            None
+        };
+        Arc::new(Self {
+            work_queue: Arc::new(SharedWorkQueue::new()),
+            job_contexts: Arc::new(Mutex::new(HashMap::new())),
+            servers,
+            server_health: Arc::new(Mutex::new(HashMap::new())),
+            bandwidth,
+            conn_tracker,
+            stall_timeout,
+            workers: Mutex::new(HashMap::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            supervisor_handle: Mutex::new(None),
+        })
+    }
 
-        // Build work queue from all unfinished articles.
-        // PAR2 files are prioritised so they're available when post-processing
-        // starts: index files (e.g. "foo.par2") first, then volume files
-        // (e.g. "foo.vol00+01.par2"), then everything else.
-        let mut work_items: Vec<WorkItem> = job
-            .files
-            .iter()
-            .flat_map(|file| {
-                file.articles
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| !a.downloaded)
-                    .map(move |(idx, article)| WorkItem {
-                        job_id: job.id.clone(),
-                        file_id: file.id.clone(),
-                        filename: file.filename.clone(),
-                        message_id: article.message_id.clone(),
-                        // Use 1-based index within the file, not the raw NZB
-                        // segment number — some NZBs use global numbering
-                        // across all files which exceeds the per-file count.
-                        segment_number: (idx as u32) + 1,
-                        tried_servers: Vec::new(),
-                        tries_on_current: 0,
-                    })
-            })
-            .collect();
+    /// Spawn workers for all currently enabled servers and start the
+    /// supervisor task. Call once at queue-manager startup.
+    pub fn start(self: &Arc<Self>) {
+        self.reconcile_servers();
 
-        work_items.sort_by_key(|item| par2_sort_key(&item.filename));
+        let this = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            this.supervisor_loop().await;
+        });
+        *self.supervisor_handle.lock() = Some(handle);
+    }
 
-        if work_items.is_empty() {
-            let _ = progress_tx.send(ProgressUpdate::JobFinished {
-                job_id,
-                success: true,
-                articles_failed: 0,
-            });
+    /// Create or tear down workers to match the current server list.
+    ///
+    /// For each enabled server, ensures exactly `server.connections` workers
+    /// exist. Extra workers (from a shrunk limit or disabled server) have
+    /// their per-worker shutdown flag flipped so they exit gracefully after
+    /// the current article.
+    pub fn reconcile_servers(self: &Arc<Self>) {
+        if self.shutdown.load(Ordering::Relaxed) {
             return;
         }
 
-        info!(
-            job_id = %job_id,
-            articles = work_items.len(),
-            "Starting download engine"
-        );
+        let servers_snapshot: Vec<ServerConfig> = self.servers.lock().clone();
+        let mut workers = self.workers.lock();
 
-        // Create file assembler and register all files
-        let assembler = Arc::new(FileAssembler::new());
-        for file in &job.files {
-            let output_path = job.work_dir.join(&file.filename);
-            if let Err(e) =
-                assembler.register_file(&job.id, &file.id, output_path, file.articles.len() as u32)
-            {
-                error!(file = %file.filename, "Failed to register file for assembly: {e}");
-                let _ = progress_tx.send(ProgressUpdate::JobFinished {
-                    job_id,
-                    success: false,
-                    articles_failed: work_items.len(),
-                });
-                return;
+        // First pass: retire workers for servers that are gone or disabled.
+        let mut retire: Vec<String> = Vec::new();
+        for key in workers.keys() {
+            let still_active = servers_snapshot.iter().any(|s| s.enabled && &s.id == key);
+            if !still_active {
+                retire.push(key.clone());
+            }
+        }
+        for key in retire {
+            if let Some(list) = workers.remove(&key) {
+                for w in list {
+                    w.shutdown.store(true, Ordering::Relaxed);
+                    // Don't await — workers check shutdown on next loop
+                    // iteration and exit within ~WORKER_IDLE_POLL.
+                    drop(w.handle);
+                }
             }
         }
 
-        // Shared work queue
-        let work_queue = Arc::new(Mutex::new(VecDeque::from(work_items)));
-        let articles_failed = Arc::new(AtomicUsize::new(0));
+        // Second pass: spawn or shrink to match target count per enabled server.
+        for server in &servers_snapshot {
+            if !server.enabled {
+                continue;
+            }
+            let target = (server.connections as usize).min(500);
+            let entry = workers.entry(server.id.clone()).or_default();
 
-        // Reset cumulative decode timing counters for this job
-        self.total_decode_us.store(0, Ordering::Relaxed);
-        self.total_assemble_us.store(0, Ordering::Relaxed);
-        self.total_articles_decoded.store(0, Ordering::Relaxed);
-
-        // Track yEnc-derived real filenames for deobfuscation.
-        // NZB subjects may be obfuscated (random hashes), but yEnc headers
-        // contain the actual filename. We capture these during download and
-        // rename files before post-processing runs.
-        let nzb_filenames: HashMap<String, String> = job
-            .files
-            .iter()
-            .map(|f| (f.id.clone(), f.filename.clone()))
-            .collect();
-        let yenc_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-
-        // Sort servers by priority, filter enabled (snapshot for pre-flight)
-        let sorted_servers: Vec<ServerConfig> = {
-            let srv = servers.lock();
-            let mut v: Vec<ServerConfig> = srv.iter().filter(|s| s.enabled).cloned().collect();
-            v.sort_by_key(|s| s.priority);
-            v
-        };
-
-        info!(
-            job_id = %job_id,
-            total_servers = servers.lock().len(),
-            enabled_servers = sorted_servers.len(),
-            server_names = %sorted_servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "),
-            "Download engine server list"
-        );
-
-        if sorted_servers.is_empty() {
-            error!(job_id = %job_id, "No enabled servers configured");
-            let _ = progress_tx.send(ProgressUpdate::NoServersAvailable {
-                job_id,
-                reason: "No enabled servers configured".into(),
-            });
-            return;
-        }
-
-        // Pre-flight: quick connectivity check with short timeout.
-        // If it fails, log a warning but proceed anyway — workers have their
-        // own retry logic and connection pooling may have all slots busy from
-        // other concurrent downloads.
-        {
-            let mut any_ok = false;
-            for server in &sorted_servers {
-                info!(
-                    job_id = %job_id,
-                    server = %server.name,
-                    host = %server.host,
-                    port = server.port,
-                    ssl = server.ssl,
-                    "Pre-flight: testing server connectivity"
-                );
-                let mut conn = NntpConnection::new(format!("preflight-{}", server.id));
-                match tokio::time::timeout(Duration::from_secs(5), conn.connect(server)).await {
-                    Ok(Ok(())) => {
-                        info!(
-                            job_id = %job_id,
-                            server = %server.name,
-                            "Pre-flight: server OK"
-                        );
-                        let _ = conn.quit().await;
-                        any_ok = true;
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        warn!(
-                            job_id = %job_id,
-                            server = %server.name,
-                            error = %e,
-                            "Pre-flight: server connection failed"
-                        );
-                    }
-                    Err(_) => {
-                        warn!(
-                            job_id = %job_id,
-                            server = %server.name,
-                            "Pre-flight: server connection timed out (5s)"
-                        );
-                    }
+            // Shrink: signal extras to exit.
+            while entry.len() > target {
+                if let Some(w) = entry.pop() {
+                    w.shutdown.store(true, Ordering::Relaxed);
+                    drop(w.handle);
                 }
             }
 
-            if !any_ok {
-                warn!(
-                    job_id = %job_id,
-                    servers_tested = sorted_servers.len(),
-                    "Pre-flight failed — proceeding anyway (workers will retry connections)"
-                );
-            }
-        }
-
-        // Spawn worker tasks: one per connection slot per server
-        let mut worker_handles = Vec::new();
-
-        for server in &sorted_servers {
-            let num_conns = server.connections.min(500) as usize;
-            for conn_idx in 0..num_conns {
-                let handle = tokio::spawn({
-                    let server_config = server.clone();
-                    let work_queue = Arc::clone(&work_queue);
-                    let assembler = Arc::clone(&assembler);
-                    let progress_tx = progress_tx.clone();
-                    let cancelled = Arc::clone(&self.cancelled);
-                    let paused = Arc::clone(&self.paused);
-                    let articles_failed = Arc::clone(&articles_failed);
-                    let all_servers = Arc::clone(&servers);
-                    let server_health = Arc::clone(&server_health);
-                    let yenc_names = Arc::clone(&yenc_names);
-                    let total_decode_us = Arc::clone(&self.total_decode_us);
-                    let total_assemble_us = Arc::clone(&self.total_assemble_us);
-                    let total_articles_decoded = Arc::clone(&self.total_articles_decoded);
-                    let bandwidth = Arc::clone(&bandwidth);
-                    let conn_tracker = Arc::clone(&conn_tracker);
-
-                    let stall_timeout = self.stall_timeout;
-
-                    async move {
-                        download_worker(
-                            server_config,
-                            conn_idx,
-                            work_queue,
-                            assembler,
-                            progress_tx,
-                            cancelled,
-                            paused,
-                            articles_failed,
-                            all_servers,
-                            server_health,
-                            yenc_names,
-                            total_decode_us,
-                            total_assemble_us,
-                            total_articles_decoded,
-                            bandwidth,
-                            stall_timeout,
-                            conn_tracker,
-                        )
-                        .await;
-                    }
+            // Grow: spawn new workers with stagger.
+            let current = entry.len();
+            for conn_idx in current..target {
+                let worker_shutdown = Arc::new(AtomicBool::new(false));
+                let pool = Arc::clone(self);
+                let server_clone = server.clone();
+                let ws_clone = Arc::clone(&worker_shutdown);
+                let handle = tokio::spawn(async move {
+                    pool_worker(pool, server_clone, conn_idx, ws_clone).await;
                 });
-                worker_handles.push(handle);
+                entry.push(ActiveWorker {
+                    shutdown: worker_shutdown,
+                    handle,
+                });
             }
         }
+    }
 
-        // Wait for all workers
-        for handle in worker_handles {
-            let _ = handle.await;
+    /// Register a new job context and submit its unfinished articles to the
+    /// shared queue. Called by QueueManager::launch_download.
+    pub(crate) fn submit_job(self: &Arc<Self>, ctx: Arc<JobContext>, items: Vec<WorkItem>) {
+        let job_id = ctx.job_id.clone();
+        if items.is_empty() {
+            // Nothing to do — emit completion immediately.
+            ctx.emit_terminal();
+            return;
         }
+        self.job_contexts.lock().insert(job_id.clone(), ctx);
+        self.work_queue.submit_items(items);
+        debug!(job_id = %job_id, queue_len = self.work_queue.len(), "Job submitted to worker pool");
+    }
 
-        let download_elapsed = engine_start.elapsed();
-        let total_bytes = job.total_bytes;
-        let throughput_mbps = if download_elapsed.as_secs_f64() > 0.001 {
-            (total_bytes as f64 / download_elapsed.as_secs_f64()) / (1024.0 * 1024.0)
-        } else {
-            0.0
+    /// Pause a job: workers stop pulling its items, and any item currently
+    /// being held while paused is returned to the queue.
+    pub fn pause_job(&self, job_id: &str) {
+        if let Some(ctx) = self.job_contexts.lock().get(job_id) {
+            ctx.paused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Resume a paused job.
+    pub fn resume_job(&self, job_id: &str) {
+        if let Some(ctx) = self.job_contexts.lock().get(job_id) {
+            ctx.paused.store(false, Ordering::Relaxed);
+            // Wake any workers that were idle waiting for work.
+            self.work_queue.notify.notify_waiters();
+        }
+    }
+
+    /// Abort a job with a reason. Drains queued items, sets the abort flag,
+    /// and emits JobAborted via the job's progress channel.
+    pub fn abort_job(&self, job_id: &str, reason: String) {
+        let ctx = self.job_contexts.lock().get(job_id).cloned();
+        let Some(ctx) = ctx else {
+            return;
         };
-        let decode_total_us = self.total_decode_us.load(Ordering::Relaxed);
-        let assemble_total_us = self.total_assemble_us.load(Ordering::Relaxed);
-        let articles_decoded = self.total_articles_decoded.load(Ordering::Relaxed);
+        *ctx.abort_reason.lock() = Some(reason);
+        ctx.cancelled.store(true, Ordering::Relaxed);
+        let drained = self.work_queue.drain_job(job_id);
+        // Decrement the remaining counter for drained items so the terminal
+        // callback fires if nothing is in-flight for this job.
+        for _ in drained {
+            ctx.resolve_one();
+        }
+        ctx.emit_terminal();
+        self.job_contexts.lock().remove(job_id);
+    }
 
-        info!(
-            job_id = %job_id,
-            elapsed_secs = download_elapsed.as_secs_f64(),
-            total_bytes,
-            throughput_mbps = format!("{throughput_mbps:.2}"),
-            "Download phase complete"
-        );
-        info!(
-            job_id = %job_id,
-            articles_decoded,
-            decode_secs = format!("{:.3}", decode_total_us as f64 / 1_000_000.0),
-            assemble_secs = format!("{:.3}", assemble_total_us as f64 / 1_000_000.0),
-            decode_pct = format!("{:.1}", decode_total_us as f64 / download_elapsed.as_micros() as f64 * 100.0),
-            assemble_pct = format!("{:.1}", assemble_total_us as f64 / download_elapsed.as_micros() as f64 * 100.0),
-            "Decode timing summary (cumulative across all workers)"
-        );
+    /// Cancel a job silently (no JobFinished / JobAborted emission).
+    /// Used by `remove_job` when the user deletes a job from the queue —
+    /// the progress receiver is about to be dropped anyway.
+    pub fn cancel_job(&self, job_id: &str) {
+        let ctx = self.job_contexts.lock().remove(job_id);
+        let Some(ctx) = ctx else {
+            return;
+        };
+        ctx.cancelled.store(true, Ordering::Relaxed);
+        let _ = self.work_queue.drain_job(job_id);
+    }
 
-        // If articles remain and all servers are circuit-broken, pause the
-        // job so the user can fix configs and resume, rather than failing
-        // everything permanently.
-        {
-            let remaining_count = work_queue.lock().len();
-            if remaining_count > 0 {
-                let all_broken = {
-                    let health = server_health.lock();
-                    let srv = servers.lock();
-                    srv.iter()
-                        .filter(|s| s.enabled)
-                        .all(|s| health.get(&s.id).is_some_and(|h| !h.is_available()))
-                };
+    /// Emit NoServersAvailable for a stuck job and unregister it.
+    fn mark_no_servers(&self, job_id: &str, reason: String) {
+        let ctx = self.job_contexts.lock().remove(job_id);
+        let Some(ctx) = ctx else {
+            return;
+        };
+        ctx.paused.store(true, Ordering::Relaxed);
+        let _ = ctx.progress_tx.send(ProgressUpdate::NoServersAvailable {
+            job_id: ctx.job_id.clone(),
+            reason,
+        });
+        // Remove pending work for this job so other jobs aren't blocked.
+        let _ = self.work_queue.drain_job(job_id);
+    }
+
+    /// Supervisor loop: periodically detects jobs whose remaining articles
+    /// cannot possibly be fetched (all enabled servers circuit-broken or
+    /// already-tried), and marks them NoServersAvailable.
+    async fn supervisor_loop(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(SUPERVISOR_INTERVAL);
+        loop {
+            ticker.tick().await;
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let enabled_servers: Vec<String> = {
+                let srv = self.servers.lock();
+                srv.iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| s.id.clone())
+                    .collect()
+            };
+
+            if enabled_servers.is_empty() {
+                continue;
+            }
+
+            // Which servers are currently healthy?
+            let healthy_servers: Vec<String> = {
+                let health = self.server_health.lock();
+                enabled_servers
+                    .iter()
+                    .filter(|sid| health.get(sid.as_str()).is_none_or(|h| h.is_available()))
+                    .cloned()
+                    .collect()
+            };
+
+            let all_broken = healthy_servers.is_empty();
+
+            // Snapshot job contexts; don't hold the lock while sending.
+            let ctxs: Vec<Arc<JobContext>> = self.job_contexts.lock().values().cloned().collect();
+
+            for ctx in ctxs {
+                if ctx.articles_remaining.load(Ordering::Relaxed) == 0 {
+                    continue;
+                }
+                if ctx.cancelled.load(Ordering::Relaxed) {
+                    continue;
+                }
                 if all_broken {
                     let reason = {
-                        let health = server_health.lock();
+                        let health = self.server_health.lock();
                         health
                             .values()
-                            .filter_map(|h| h.reason.as_deref())
+                            .filter_map(|h| h.reason.clone())
                             .next()
-                            .unwrap_or("All servers unavailable")
-                            .to_string()
+                            .unwrap_or_else(|| "All servers unavailable".into())
                     };
                     warn!(
-                        job_id = %job_id,
-                        remaining_articles = remaining_count,
+                        job_id = %ctx.job_id,
+                        remaining = ctx.articles_remaining.load(Ordering::Relaxed),
                         "All servers circuit-broken — pausing job for user intervention"
                     );
-                    let _ = progress_tx.send(ProgressUpdate::NoServersAvailable { job_id, reason });
-                    return;
+                    self.mark_no_servers(&ctx.job_id, reason);
                 }
             }
         }
+    }
 
-        // Drain any remaining items (stuck because needed servers exited)
-        let remaining: Vec<WorkItem> = work_queue.lock().drain(..).collect();
-        for item in remaining {
-            articles_failed.fetch_add(1, Ordering::Relaxed);
-            warn!(
-                article = %item.message_id,
-                "Article could not be downloaded — no available server"
-            );
-            let _ = progress_tx.send(ProgressUpdate::ArticleFailed {
-                job_id: item.job_id,
-                file_id: item.file_id,
-                segment_number: item.segment_number,
-                error: "No available server could download this article".into(),
-                server_id: None,
-            });
-        }
-
-        // Deobfuscate: choose the best filename between NZB subject and yEnc header.
-        // Either source may be obfuscated (random hashes without extensions).
-        // We always rename toward the name that has a recognizable file extension.
-        {
-            let renames = yenc_names.lock();
-            for (file_id, yenc_name) in renames.iter() {
-                if let Some(nzb_name) = nzb_filenames.get(file_id) {
-                    if nzb_name == yenc_name {
-                        continue;
-                    }
-                    // Sanitize: strip any path components from yEnc name
-                    let clean_yenc = std::path::Path::new(yenc_name.as_str())
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(yenc_name);
-                    if clean_yenc.is_empty() || nzb_name == clean_yenc {
-                        continue;
-                    }
-
-                    let nzb_has_ext = has_known_extension(nzb_name);
-                    let yenc_has_ext = has_known_extension(clean_yenc);
-
-                    // Determine rename direction: always rename FROM obfuscated TO readable.
-                    // If yEnc has a real extension but NZB doesn't → rename NZB→yEnc (original logic)
-                    // If NZB has a real extension but yEnc doesn't → skip (NZB name is already good)
-                    // If both have extensions → prefer yEnc (original logic)
-                    // If neither has extensions → skip (nothing to improve)
-                    let (old_name, new_name) = if yenc_has_ext && !nzb_has_ext {
-                        (nzb_name.as_str(), clean_yenc)
-                    } else if nzb_has_ext && !yenc_has_ext {
-                        // NZB name is already the good one — skip rename
-                        continue;
-                    } else if yenc_has_ext && nzb_has_ext {
-                        // Both have extensions — prefer yEnc (standard deobfuscation)
-                        (nzb_name.as_str(), clean_yenc)
-                    } else {
-                        // Neither has a recognizable extension — skip
-                        continue;
-                    };
-
-                    let old_path = job.work_dir.join(old_name);
-                    let new_path = job.work_dir.join(new_name);
-                    if old_path.exists() && !new_path.exists() {
-                        if let Err(e) = std::fs::rename(&old_path, &new_path) {
-                            warn!(
-                                job_id = %job_id,
-                                from = %old_name,
-                                to = %new_name,
-                                "Failed to deobfuscate file: {e}"
-                            );
-                        } else {
-                            info!(
-                                job_id = %job_id,
-                                from = %old_name,
-                                to = %new_name,
-                                "Deobfuscated file"
-                            );
-                        }
-                    }
+    /// Shut down all workers gracefully. In-flight articles finish first.
+    pub async fn shutdown(self: &Arc<Self>) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let handles: Vec<JoinHandle<()>> = {
+            let mut workers = self.workers.lock();
+            let mut out = Vec::new();
+            for (_id, list) in workers.drain() {
+                for w in list {
+                    w.shutdown.store(true, Ordering::Relaxed);
+                    out.push(w.handle);
                 }
             }
+            out
+        };
+        // Notify workers so any parked on notify.notified() wake up.
+        self.work_queue.notify.notify_waiters();
+
+        let timeout = Duration::from_secs(10);
+        for h in handles {
+            let _ = tokio::time::timeout(timeout, h).await;
         }
 
-        let failed_count = articles_failed.load(Ordering::Relaxed);
-        let _ = progress_tx.send(ProgressUpdate::JobFinished {
-            job_id,
-            success: failed_count == 0,
-            articles_failed: failed_count,
-        });
+        if let Some(h) = self.supervisor_handle.lock().take() {
+            h.abort();
+        }
+    }
+
+    pub fn conn_tracker(&self) -> &Arc<ConnectionTracker> {
+        &self.conn_tracker
+    }
+
+    /// Whether this job still has an active context in the pool.
+    pub fn has_job(&self, job_id: &str) -> bool {
+        self.job_contexts.lock().contains_key(job_id)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Worker task
+// Worker body
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn download_worker(
+/// Single pool worker. Owns an NNTP connection to `primary_server` and pulls
+/// items from the shared queue until `worker_shutdown` is flipped (server
+/// reconciled away, limit shrunk) or the pool shuts down.
+async fn pool_worker(
+    pool: Arc<WorkerPool>,
     primary_server: ServerConfig,
     conn_idx: usize,
-    work_queue: Arc<Mutex<VecDeque<WorkItem>>>,
-    assembler: Arc<FileAssembler>,
-    progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
-    cancelled: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    articles_failed: Arc<AtomicUsize>,
-    all_servers: Arc<Mutex<Vec<ServerConfig>>>,
-    server_health: ServerHealthMap,
-    yenc_names: Arc<Mutex<HashMap<String, String>>>,
-    total_decode_us: Arc<AtomicU64>,
-    total_assemble_us: Arc<AtomicU64>,
-    total_articles_decoded: Arc<AtomicU64>,
-    bandwidth: Arc<BandwidthLimiter>,
-    stall_timeout: Option<Duration>,
-    conn_tracker: Arc<ConnectionTracker>,
+    worker_shutdown: Arc<AtomicBool>,
 ) {
     let worker_id = format!("{}#{}", primary_server.id, conn_idx);
 
     // Stagger worker startup to avoid thundering herd of connections.
-    // This spreads initial connects over time (e.g., 50 workers * 50ms = 2.5s ramp).
-    // The per-host gate in nzb-nntp provides additional protection.
     if conn_idx > 0 {
         let stagger = WORKER_RAMP_DELAY * conn_idx as u32;
-        debug!(
-            worker = %worker_id,
-            server = %primary_server.name,
-            delay_ms = stagger.as_millis(),
-            "Worker stagger delay before connect"
-        );
         tokio::time::sleep(stagger).await;
     }
 
-    // Check circuit breaker before attempting connection.
-    // If another worker already discovered this server is broken,
-    // exit immediately instead of burning through retry cycles.
-    {
-        let health = server_health.lock();
-        if let Some(h) = health.get(&primary_server.id)
-            && !h.is_available()
-        {
-            info!(
-                worker = %worker_id,
-                server = %primary_server.name,
-                reason = h.reason.as_deref().unwrap_or("unknown"),
-                "Server circuit-broken — worker exiting without connecting"
-            );
+    let should_exit = |worker_shutdown: &Arc<AtomicBool>, pool: &Arc<WorkerPool>| {
+        worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed)
+    };
+
+    'reconnect: loop {
+        if should_exit(&worker_shutdown, &pool) {
             return;
         }
-    }
 
-    info!(
-        worker = %worker_id,
-        server = %primary_server.name,
-        host = %primary_server.host,
-        port = primary_server.port,
-        ssl = primary_server.ssl,
-        conn_idx,
-        "Worker starting — connecting to primary server"
-    );
+        // Check circuit breaker before connecting. Compute an owned bool
+        // so we don't hold the MutexGuard across an await point.
+        let circuit_broken = {
+            let health = pool.server_health.lock();
+            health
+                .get(&primary_server.id)
+                .is_some_and(|h| !h.is_available())
+        };
+        if circuit_broken {
+            tokio::time::sleep(WORKER_IDLE_POLL).await;
+            continue 'reconnect;
+        }
 
-    // Connect to primary server (uses fresh config from shared list)
-    let mut conn = NntpConnection::new(worker_id.clone());
-    if let Err(e) = connect_with_retry(
-        &mut conn,
-        &primary_server,
-        &worker_id,
-        &server_health,
-        &all_servers,
-    )
-    .await
-    {
-        warn!(
+        info!(
             worker = %worker_id,
             server = %primary_server.name,
             host = %primary_server.host,
-            "Worker FAILED to connect after all retries: {e} — worker exiting"
+            port = primary_server.port,
+            ssl = primary_server.ssl,
+            conn_idx,
+            "Worker starting — connecting to primary server"
         );
-        return;
-    }
 
-    // Track this connection globally — the guard decrements on drop.
-    let mut conn_guard = ConnectionGuard::new(
-        Arc::clone(&conn_tracker),
-        &primary_server.id,
-        &primary_server.name,
-    );
-
-    let pipe_depth = primary_server.pipelining.max(1);
-    let active_conns = conn_tracker.total();
-    info!(
-        worker = %worker_id,
-        server = %primary_server.name,
-        host = %primary_server.host,
-        pipelining = pipe_depth,
-        total_nntp_connections = active_conns,
-        "Worker connected and ready"
-    );
-
-    // Use non-pipelined path for depth 1 (simpler, avoids pipeline overhead)
-    if pipe_depth <= 1 {
-        download_worker_serial(
+        let mut conn = NntpConnection::new(worker_id.clone());
+        if let Err(e) = connect_with_retry(
             &mut conn,
             &primary_server,
             &worker_id,
-            &work_queue,
-            &assembler,
-            &progress_tx,
-            &cancelled,
-            &paused,
-            &articles_failed,
-            &all_servers,
-            &server_health,
-            &yenc_names,
-            &total_decode_us,
-            &total_assemble_us,
-            &total_articles_decoded,
-            &bandwidth,
-            stall_timeout,
-            &mut conn_guard,
+            &pool.server_health,
+            &pool.servers,
         )
-        .await;
-    } else {
-        download_worker_pipelined(
-            &mut conn,
-            &primary_server,
-            &worker_id,
-            pipe_depth,
-            &work_queue,
-            &assembler,
-            &progress_tx,
-            &cancelled,
-            &paused,
-            &articles_failed,
-            &all_servers,
-            &server_health,
-            &yenc_names,
-            &total_decode_us,
-            &total_assemble_us,
-            &total_articles_decoded,
-            &bandwidth,
-            stall_timeout,
-            &mut conn_guard,
-        )
-        .await;
-    }
+        .await
+        {
+            warn!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                host = %primary_server.host,
+                "Worker FAILED to connect after all retries: {e}"
+            );
+            if should_exit(&worker_shutdown, &pool) {
+                return;
+            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
+            continue 'reconnect;
+        }
 
-    let _ = conn.quit().await;
+        let mut conn_guard = ConnectionGuard::new(
+            Arc::clone(&pool.conn_tracker),
+            &primary_server.id,
+            &primary_server.name,
+        );
+
+        let pipe_depth = primary_server.pipelining.max(1);
+        let active_conns = pool.conn_tracker.total();
+        info!(
+            worker = %worker_id,
+            server = %primary_server.name,
+            host = %primary_server.host,
+            pipelining = pipe_depth,
+            total_nntp_connections = active_conns,
+            "Worker connected and ready"
+        );
+
+        let reconnect_needed = if pipe_depth <= 1 {
+            run_worker_serial(
+                &pool,
+                &primary_server,
+                &worker_id,
+                &worker_shutdown,
+                &mut conn,
+                &mut conn_guard,
+            )
+            .await
+        } else {
+            run_worker_pipelined(
+                &pool,
+                &primary_server,
+                &worker_id,
+                pipe_depth,
+                &worker_shutdown,
+                &mut conn,
+                &mut conn_guard,
+            )
+            .await
+        };
+
+        let _ = conn.quit().await;
+        drop(conn_guard);
+
+        match reconnect_needed {
+            WorkerExit::Reconnect => {
+                // Loop back to the top and reconnect.
+                continue 'reconnect;
+            }
+            WorkerExit::Exit => {
+                return;
+            }
+        }
+    }
 }
 
-/// Pipelined download: sends multiple ARTICLE commands before reading responses.
-#[allow(clippy::too_many_arguments)]
-async fn download_worker_pipelined(
+enum WorkerExit {
+    /// Exit the worker function entirely (server retired or pool shutdown).
+    Exit,
+    /// Reconnect and keep pulling work (transient connection loss).
+    Reconnect,
+}
+
+/// Wait for work, with early exit on shutdown / server retirement.
+/// Returns `Some(item, ctx)` when a processable item is available, or `None`
+/// if the worker should exit.
+async fn next_work_item(
+    pool: &Arc<WorkerPool>,
+    server_id: &str,
+    worker_shutdown: &Arc<AtomicBool>,
+) -> Option<(WorkItem, Arc<JobContext>)> {
+    loop {
+        if worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        if let Some(item) = pool.work_queue.pop_workable(server_id) {
+            // Look up the job context. If the job is gone or cancelled, drop
+            // the item and keep going.
+            let ctx = pool.job_contexts.lock().get(&item.job_id).cloned();
+            let Some(ctx) = ctx else {
+                continue;
+            };
+            if ctx.cancelled.load(Ordering::Relaxed) {
+                continue;
+            }
+            // Respect per-job pause: return the item and wait.
+            if ctx.paused.load(Ordering::Relaxed) {
+                pool.work_queue.push_back(item);
+                tokio::time::sleep(WORKER_IDLE_POLL).await;
+                continue;
+            }
+            return Some((item, ctx));
+        }
+
+        // Queue empty (or nothing workable for this server) — wait with a
+        // timeout so we still notice shutdown and new work alike.
+        let notified = pool.work_queue.notify.notified();
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(WORKER_IDLE_POLL) => {}
+        }
+    }
+}
+
+async fn run_worker_serial(
+    pool: &Arc<WorkerPool>,
+    primary_server: &ServerConfig,
+    worker_id: &str,
+    worker_shutdown: &Arc<AtomicBool>,
     conn: &mut NntpConnection,
+    _conn_guard: &mut ConnectionGuard,
+) -> WorkerExit {
+    let mut consecutive_errors: u32 = 0;
+
+    loop {
+        // Server runtime checks.
+        let server_disabled = pool
+            .servers
+            .lock()
+            .iter()
+            .find(|s| s.id == primary_server.id)
+            .is_none_or(|s| !s.enabled);
+        if server_disabled {
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "Server disabled, worker exiting"
+            );
+            return WorkerExit::Exit;
+        }
+        {
+            let health = pool.server_health.lock();
+            if let Some(h) = health.get(&primary_server.id)
+                && !h.is_available()
+            {
+                info!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    reason = h.reason.as_deref().unwrap_or("unknown"),
+                    "Server circuit-broken, worker reconnecting after cooldown"
+                );
+                return WorkerExit::Reconnect;
+            }
+        }
+
+        let Some((mut item, ctx)) = next_work_item(pool, &primary_server.id, worker_shutdown).await
+        else {
+            return WorkerExit::Exit;
+        };
+
+        let fetch_fut =
+            fetch_article_with_retry(conn, &item, &ctx.assembler, primary_server, worker_id);
+        let result = if let Some(timeout) = pool.stall_timeout {
+            match tokio::time::timeout(timeout, fetch_fut).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        worker = %worker_id,
+                        server = %primary_server.name,
+                        article = %item.message_id,
+                        "Connection stalled — no response within {}s, reconnecting",
+                        timeout.as_secs()
+                    );
+                    pool.work_queue.push_front(item);
+                    return WorkerExit::Reconnect;
+                }
+            }
+        } else {
+            fetch_fut.await
+        };
+
+        match result {
+            Ok(process_result) => {
+                consecutive_errors = 0;
+                ctx.total_decode_us
+                    .fetch_add(process_result.decode_us, Ordering::Relaxed);
+                ctx.total_assemble_us
+                    .fetch_add(process_result.assemble_us, Ordering::Relaxed);
+                ctx.total_articles_decoded.fetch_add(1, Ordering::Relaxed);
+                if let Some(ref yname) = process_result.yenc_filename {
+                    ctx.yenc_names
+                        .lock()
+                        .entry(item.file_id.clone())
+                        .or_insert_with(|| crate::util::normalize_nfc(yname));
+                }
+                if let Some(n) = std::num::NonZeroU32::new(process_result.decoded_bytes as u32) {
+                    let _ = pool.bandwidth.acquire_download(n).await;
+                }
+                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleComplete {
+                    job_id: item.job_id.clone(),
+                    file_id: item.file_id.clone(),
+                    segment_number: item.segment_number,
+                    decoded_bytes: process_result.decoded_bytes,
+                    file_complete: process_result.file_complete,
+                    server_id: Some(primary_server.id.clone()),
+                });
+                ctx.resolve_one();
+            }
+            Err(ArticleError::ArticleNotFound) => {
+                handle_article_not_available(
+                    &mut item,
+                    primary_server,
+                    &pool.servers,
+                    &pool.server_health,
+                    &ctx,
+                    &pool.work_queue,
+                    "Article not found on any server",
+                );
+            }
+            Err(ArticleError::ConnectionLost(msg)) => {
+                consecutive_errors += 1;
+                warn!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    host = %primary_server.host,
+                    consecutive_errors,
+                    max_reconnects = MAX_RECONNECT_ATTEMPTS,
+                    article = %item.message_id,
+                    "Connection lost: {msg}"
+                );
+                pool.work_queue.push_front(item);
+                if consecutive_errors > MAX_RECONNECT_ATTEMPTS {
+                    warn!(
+                        worker = %worker_id,
+                        server = %primary_server.name,
+                        host = %primary_server.host,
+                        consecutive_errors,
+                        "Too many consecutive errors — worker reconnecting"
+                    );
+                    return WorkerExit::Reconnect;
+                }
+                return WorkerExit::Reconnect;
+            }
+            Err(ArticleError::DecodeError(msg)) => {
+                handle_article_not_available(
+                    &mut item,
+                    primary_server,
+                    &pool.servers,
+                    &pool.server_health,
+                    &ctx,
+                    &pool.work_queue,
+                    &format!("Decode error: {msg}"),
+                );
+            }
+            Err(ArticleError::AssemblyError(msg)) => {
+                error!(article = %item.message_id, "Assembly error: {msg}");
+                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleFailed {
+                    job_id: item.job_id.clone(),
+                    file_id: item.file_id.clone(),
+                    segment_number: item.segment_number,
+                    error: format!("Assembly error: {msg}"),
+                    server_id: Some(primary_server.id.clone()),
+                });
+                ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
+                ctx.resolve_one();
+            }
+        }
+    }
+}
+
+async fn run_worker_pipelined(
+    pool: &Arc<WorkerPool>,
     primary_server: &ServerConfig,
     worker_id: &str,
     pipe_depth: u8,
-    work_queue: &Arc<Mutex<VecDeque<WorkItem>>>,
-    assembler: &Arc<FileAssembler>,
-    progress_tx: &mpsc::UnboundedSender<ProgressUpdate>,
-    cancelled: &Arc<AtomicBool>,
-    paused: &Arc<AtomicBool>,
-    articles_failed: &Arc<AtomicUsize>,
-    all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
-    server_health: &ServerHealthMap,
-    yenc_names: &Arc<Mutex<HashMap<String, String>>>,
-    total_decode_us: &Arc<AtomicU64>,
-    total_assemble_us: &Arc<AtomicU64>,
-    total_articles_decoded: &Arc<AtomicU64>,
-    bandwidth: &Arc<BandwidthLimiter>,
-    stall_timeout: Option<Duration>,
-    conn_guard: &mut ConnectionGuard,
-) {
+    worker_shutdown: &Arc<AtomicBool>,
+    conn: &mut NntpConnection,
+    _conn_guard: &mut ConnectionGuard,
+) -> WorkerExit {
     let mut pipeline = Pipeline::new(pipe_depth);
-    // In-flight items indexed by pipeline tag
     let mut in_flight_items: HashMap<u64, WorkItem> = HashMap::new();
     let mut next_tag: u64 = 0;
     let mut consecutive_errors: u32 = 0;
 
-    // --- Perf metrics (accumulated per worker, logged periodically) ---
+    // Perf metrics
     let mut perf_articles: u64 = 0;
     let mut perf_bytes: u64 = 0;
     let mut perf_queue_lock_us: u64 = 0;
@@ -961,60 +1258,29 @@ async fn download_worker_pipelined(
     const PERF_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
     loop {
-        if cancelled.load(Ordering::Relaxed) {
-            break;
+        if worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed) {
+            requeue_all(&mut in_flight_items, &pool.work_queue);
+            return WorkerExit::Exit;
         }
 
-        // Wait while paused — release the NNTP connection so we don't
-        // hold server connection slots while idle.
-        if paused.load(Ordering::Relaxed) {
-            info!(
-                worker = %worker_id,
-                server = %primary_server.name,
-                "Paused — releasing NNTP connection"
-            );
-            let _ = conn.quit().await;
-            conn_guard.release();
-            while paused.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            // Reconnect after unpause
-            info!(
-                worker = %worker_id,
-                server = %primary_server.name,
-                "Unpaused — reconnecting"
-            );
-            *conn = NntpConnection::new(worker_id.to_string());
-            if let Err(e) =
-                connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                    .await
-            {
-                warn!(worker = %worker_id, server = %primary_server.name, "Reconnect after unpause FAILED: {e} — worker exiting");
-                break;
-            }
-            conn_guard.reacquire(&primary_server.name);
-            pipeline = Pipeline::new(pipe_depth);
-            info!(worker = %worker_id, server = %primary_server.name, "Reconnected after unpause");
-        }
-
-        // Exit if our server was disabled at runtime
-        let server_disabled = all_servers
+        // Server runtime checks.
+        let server_disabled = pool
+            .servers
             .lock()
             .iter()
             .find(|s| s.id == primary_server.id)
             .is_none_or(|s| !s.enabled);
         if server_disabled {
-            info!(worker = %worker_id, server = %primary_server.name, "Server disabled, worker exiting");
-            requeue_all(&mut in_flight_items, work_queue);
-            break;
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "Server disabled, worker exiting"
+            );
+            requeue_all(&mut in_flight_items, &pool.work_queue);
+            return WorkerExit::Exit;
         }
-
-        // Exit if server was circuit-broken (by another worker's failure)
         {
-            let health = server_health.lock();
+            let health = pool.server_health.lock();
             if let Some(h) = health.get(&primary_server.id)
                 && !h.is_available()
             {
@@ -1022,51 +1288,53 @@ async fn download_worker_pipelined(
                     worker = %worker_id,
                     server = %primary_server.name,
                     reason = h.reason.as_deref().unwrap_or("unknown"),
-                    "Server circuit-broken, worker exiting"
+                    "Server circuit-broken, worker reconnecting after cooldown"
                 );
-                requeue_all(&mut in_flight_items, work_queue);
-                break;
+                requeue_all(&mut in_flight_items, &pool.work_queue);
+                return WorkerExit::Reconnect;
             }
         }
 
-        // Fill the pipeline with work items
-        let mut consecutive_skips: usize = 0;
+        // Fill the pipeline.
         while pipeline.pending_count() + pipeline.in_flight_count() < pipe_depth as usize {
             let lock_t = Instant::now();
-            let item = { work_queue.lock().pop_front() };
+            let item = pool.work_queue.pop_workable(&primary_server.id);
             perf_queue_lock_us += lock_t.elapsed().as_micros() as u64;
             let Some(item) = item else {
                 break;
             };
-
-            // Skip if this worker's server was already tried
-            if item.tried_servers.contains(&primary_server.id) {
-                let queue_len = {
-                    let mut q = work_queue.lock();
-                    q.push_back(item);
-                    q.len()
-                };
-                consecutive_skips += 1;
-                if consecutive_skips > queue_len {
-                    break;
-                }
+            // Look up ctx to respect pause/cancel.
+            let ctx = pool.job_contexts.lock().get(&item.job_id).cloned();
+            let Some(ctx) = ctx else {
+                continue;
+            };
+            if ctx.cancelled.load(Ordering::Relaxed) {
                 continue;
             }
-            consecutive_skips = 0;
-
+            if ctx.paused.load(Ordering::Relaxed) {
+                pool.work_queue.push_back(item);
+                break;
+            }
             let tag = next_tag;
             next_tag += 1;
             pipeline.submit(item.message_id.clone(), tag);
             in_flight_items.insert(tag, item);
         }
 
-        // If nothing to do, we're done
+        // If nothing is queued and nothing in flight, wait for work.
         if pipeline.is_empty() && in_flight_items.is_empty() {
-            debug!(worker = %worker_id, "Pipeline empty, work queue exhausted, exiting");
-            break;
+            let Some((first_item, ctx)) =
+                next_work_item(pool, &primary_server.id, worker_shutdown).await
+            else {
+                return WorkerExit::Exit;
+            };
+            let _ = ctx; // ctx is validated in next_work_item
+            let tag = next_tag;
+            next_tag += 1;
+            pipeline.submit(first_item.message_id.clone(), tag);
+            in_flight_items.insert(tag, first_item);
         }
 
-        // Flush pending sends
         let flush_t = Instant::now();
         if let Err(e) = pipeline.flush_sends(conn).await {
             warn!(
@@ -1077,45 +1345,25 @@ async fn download_worker_pipelined(
                 in_flight = in_flight_items.len(),
                 "Pipeline send error — re-queuing all in-flight items"
             );
-            // Re-queue all in-flight items
-            requeue_all(&mut in_flight_items, work_queue);
-            // Try reconnect
+            requeue_all(&mut in_flight_items, &pool.work_queue);
             consecutive_errors += 1;
             if consecutive_errors > MAX_RECONNECT_ATTEMPTS {
                 warn!(
                     worker = %worker_id,
                     server = %primary_server.name,
                     consecutive_errors,
-                    "Too many pipeline errors — worker exiting permanently"
+                    "Too many pipeline errors — worker reconnecting"
                 );
-                break;
+                return WorkerExit::Reconnect;
             }
-            info!(
-                worker = %worker_id,
-                server = %primary_server.name,
-                delay_secs = RECONNECT_DELAY.as_secs(),
-                consecutive_errors,
-                "Waiting before pipeline reconnect"
-            );
             tokio::time::sleep(RECONNECT_DELAY).await;
-            *conn = NntpConnection::new(worker_id.to_string());
-            if let Err(e) =
-                connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                    .await
-            {
-                warn!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnect FAILED: {e} — worker exiting");
-                break;
-            }
-            info!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnected successfully");
-            pipeline = Pipeline::new(pipe_depth);
-            continue;
+            return WorkerExit::Reconnect;
         }
-
         perf_flush_us += flush_t.elapsed().as_micros() as u64;
 
-        // Read one response (with optional stall timeout)
+        // Read one response.
         let recv_t = Instant::now();
-        let result = if let Some(timeout) = stall_timeout {
+        let result = if let Some(timeout) = pool.stall_timeout {
             match tokio::time::timeout(timeout, pipeline.receive_one(conn)).await {
                 Ok(r) => r,
                 Err(_) => {
@@ -1128,71 +1376,61 @@ async fn download_worker_pipelined(
                         "Connection stalled — no response within {}s, reconnecting",
                         timeout.as_secs()
                     );
-                    // Connection is in an unknown state — drop and reconnect
-                    requeue_all(&mut in_flight_items, work_queue);
-                    *conn = NntpConnection::new(worker_id.to_string());
-                    if let Err(e) = connect_with_retry(
-                        conn,
-                        primary_server,
-                        worker_id,
-                        server_health,
-                        all_servers,
-                    )
-                    .await
-                    {
-                        warn!(worker = %worker_id, server = %primary_server.name, "Stall reconnect FAILED: {e} — worker exiting");
-                        break;
-                    }
-                    info!(worker = %worker_id, server = %primary_server.name, "Stall reconnect successful");
-                    pipeline = Pipeline::new(pipe_depth);
-                    continue;
+                    requeue_all(&mut in_flight_items, &pool.work_queue);
+                    return WorkerExit::Reconnect;
                 }
             }
         } else {
             pipeline.receive_one(conn).await
         };
         perf_receive_us += recv_t.elapsed().as_micros() as u64;
+
         match result {
             Ok(Some(pipe_result)) => {
                 let Some(mut item) = in_flight_items.remove(&pipe_result.request.tag) else {
                     continue;
                 };
+                // Look up the ctx for this item's job (may have been cancelled).
+                let ctx = pool.job_contexts.lock().get(&item.job_id).cloned();
+                let Some(ctx) = ctx else {
+                    continue;
+                };
+                if ctx.cancelled.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 match pipe_result.result {
                     Ok(response) => {
                         consecutive_errors = 0;
                         let raw_data = response.data.unwrap_or_default();
-                        // Yield to the runtime so other tasks (HTTP server, etc.)
-                        // get scheduled between CPU-bound decode+assemble work.
                         let yield_t = Instant::now();
                         tokio::task::yield_now().await;
                         perf_yield_us += yield_t.elapsed().as_micros() as u64;
-                        match decode_and_assemble(&item, &raw_data, assembler) {
+                        match decode_and_assemble(&item, &raw_data, &ctx.assembler) {
                             Ok(process_result) => {
                                 perf_decode_us += process_result.decode_us;
                                 perf_assemble_us += process_result.assemble_us;
                                 perf_bytes += process_result.decoded_bytes;
                                 perf_articles += 1;
-                                total_decode_us
+                                ctx.total_decode_us
                                     .fetch_add(process_result.decode_us, Ordering::Relaxed);
-                                total_assemble_us
+                                ctx.total_assemble_us
                                     .fetch_add(process_result.assemble_us, Ordering::Relaxed);
-                                total_articles_decoded.fetch_add(1, Ordering::Relaxed);
+                                ctx.total_articles_decoded.fetch_add(1, Ordering::Relaxed);
                                 if let Some(ref yname) = process_result.yenc_filename {
-                                    yenc_names
+                                    ctx.yenc_names
                                         .lock()
                                         .entry(item.file_id.clone())
                                         .or_insert_with(|| crate::util::normalize_nfc(yname));
                                 }
-                                // Throttle via bandwidth limiter
                                 let bw_t = Instant::now();
                                 if let Some(n) =
                                     std::num::NonZeroU32::new(process_result.decoded_bytes as u32)
                                 {
-                                    let _ = bandwidth.acquire_download(n).await;
+                                    let _ = pool.bandwidth.acquire_download(n).await;
                                 }
                                 perf_bandwidth_us += bw_t.elapsed().as_micros() as u64;
-                                let _ = progress_tx.send(ProgressUpdate::ArticleComplete {
+                                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleComplete {
                                     job_id: item.job_id.clone(),
                                     file_id: item.file_id.clone(),
                                     segment_number: item.segment_number,
@@ -1200,8 +1438,8 @@ async fn download_worker_pipelined(
                                     file_complete: process_result.file_complete,
                                     server_id: Some(primary_server.id.clone()),
                                 });
+                                ctx.resolve_one();
 
-                                // Periodic perf log
                                 if perf_last_log.elapsed() >= PERF_LOG_INTERVAL {
                                     let elapsed = perf_last_log.elapsed().as_secs_f64();
                                     let mbps = perf_bytes as f64 / elapsed / (1024.0 * 1024.0);
@@ -1234,24 +1472,24 @@ async fn download_worker_pipelined(
                                 handle_article_not_available(
                                     &mut item,
                                     primary_server,
-                                    all_servers,
-                                    server_health,
-                                    articles_failed,
-                                    work_queue,
-                                    progress_tx,
+                                    &pool.servers,
+                                    &pool.server_health,
+                                    &ctx,
+                                    &pool.work_queue,
                                     &format!("Decode error: {msg}"),
                                 );
                             }
                             Err(ArticleError::AssemblyError(msg)) => {
-                                articles_failed.fetch_add(1, Ordering::Relaxed);
                                 error!(article = %item.message_id, "Assembly error: {msg}");
-                                let _ = progress_tx.send(ProgressUpdate::ArticleFailed {
+                                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleFailed {
                                     job_id: item.job_id.clone(),
                                     file_id: item.file_id.clone(),
                                     segment_number: item.segment_number,
                                     error: format!("Assembly error: {msg}"),
                                     server_id: Some(primary_server.id.clone()),
                                 });
+                                ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
+                                ctx.resolve_one();
                             }
                             Err(_) => {}
                         }
@@ -1260,16 +1498,14 @@ async fn download_worker_pipelined(
                         handle_article_not_available(
                             &mut item,
                             primary_server,
-                            all_servers,
-                            server_health,
-                            articles_failed,
-                            work_queue,
-                            progress_tx,
+                            &pool.servers,
+                            &pool.server_health,
+                            &ctx,
+                            &pool.work_queue,
                             "Article not found on any server",
                         );
                     }
                     Err(NntpError::Connection(_) | NntpError::Io(_)) => {
-                        // Connection lost — requeue this item and all remaining in-flight
                         warn!(
                             worker = %worker_id,
                             server = %primary_server.name,
@@ -1279,58 +1515,31 @@ async fn download_worker_pipelined(
                             consecutive_errors,
                             "Pipeline: connection lost during receive — re-queuing all"
                         );
-                        work_queue.lock().push_front(item);
-                        requeue_all(&mut in_flight_items, work_queue);
+                        pool.work_queue.push_front(item);
+                        requeue_all(&mut in_flight_items, &pool.work_queue);
                         consecutive_errors += 1;
                         if consecutive_errors > MAX_RECONNECT_ATTEMPTS {
-                            warn!(
-                                worker = %worker_id,
-                                server = %primary_server.name,
-                                consecutive_errors,
-                                "Too many pipeline connection losses — worker exiting"
-                            );
-                            break;
+                            return WorkerExit::Reconnect;
                         }
-                        info!(
-                            worker = %worker_id,
-                            delay_secs = RECONNECT_DELAY.as_secs(),
-                            "Waiting before pipeline reconnect"
-                        );
                         tokio::time::sleep(RECONNECT_DELAY).await;
-                        *conn = NntpConnection::new(worker_id.to_string());
-                        if let Err(e) = connect_with_retry(
-                            conn,
-                            primary_server,
-                            worker_id,
-                            server_health,
-                            all_servers,
-                        )
-                        .await
-                        {
-                            warn!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnect FAILED: {e}");
-                            break;
-                        }
-                        info!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnected after connection loss");
-                        pipeline = Pipeline::new(pipe_depth);
-                        continue;
+                        return WorkerExit::Reconnect;
                     }
                     Err(e) => {
                         warn!(worker = %worker_id, article = %item.message_id, "Pipeline error: {e}");
                         handle_article_not_available(
                             &mut item,
                             primary_server,
-                            all_servers,
-                            server_health,
-                            articles_failed,
-                            work_queue,
-                            progress_tx,
+                            &pool.servers,
+                            &pool.server_health,
+                            &ctx,
+                            &pool.work_queue,
                             &format!("Pipeline error: {e}"),
                         );
                     }
                 }
             }
             Ok(None) => {
-                // No in-flight requests — loop will either fill more or exit
+                // No in-flight requests — loop will fill more.
             }
             Err(e) => {
                 warn!(
@@ -1342,410 +1551,13 @@ async fn download_worker_pipelined(
                     consecutive_errors,
                     "Pipeline receive error"
                 );
-                requeue_all(&mut in_flight_items, work_queue);
+                requeue_all(&mut in_flight_items, &pool.work_queue);
                 consecutive_errors += 1;
                 if consecutive_errors > MAX_RECONNECT_ATTEMPTS {
-                    warn!(
-                        worker = %worker_id,
-                        server = %primary_server.name,
-                        consecutive_errors,
-                        "Too many pipeline receive errors — worker exiting"
-                    );
-                    break;
+                    return WorkerExit::Reconnect;
                 }
-                info!(
-                    worker = %worker_id,
-                    delay_secs = RECONNECT_DELAY.as_secs(),
-                    "Waiting before pipeline reconnect"
-                );
                 tokio::time::sleep(RECONNECT_DELAY).await;
-                *conn = NntpConnection::new(worker_id.to_string());
-                if let Err(e) =
-                    connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                        .await
-                {
-                    warn!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnect FAILED: {e}");
-                    break;
-                }
-                info!(worker = %worker_id, server = %primary_server.name, "Pipeline reconnected after receive error");
-                pipeline = Pipeline::new(pipe_depth);
-            }
-        }
-    }
-}
-
-/// Sort key for work-queue prioritisation of PAR2 files.
-///
-/// Returns 0 for PAR2 index files (e.g. `movie.par2`), 1 for PAR2 volume
-/// files (e.g. `movie.vol00+01.par2`), and 2 for everything else.
-/// This ensures PAR2 metadata downloads early so post-processing can start
-/// verification as soon as the download phase ends.
-fn par2_sort_key(filename: &str) -> u8 {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".par2") {
-        // Index files have no ".vol" component — they're small and needed first.
-        if lower.contains(".vol") {
-            1 // volume/recovery block
-        } else {
-            0 // index file
-        }
-    } else {
-        2 // non-par2
-    }
-}
-
-/// Check if a filename has a known file extension (archive, video, par2, etc.).
-/// Used to distinguish real filenames from obfuscated hashes during deobfuscation.
-fn has_known_extension(name: &str) -> bool {
-    let lower = name.to_lowercase();
-    // Check for dot-separated extension
-    if let Some(dot_pos) = lower.rfind('.') {
-        let ext = &lower[dot_pos + 1..];
-        matches!(
-            ext,
-            // Archives
-            "rar" | "r00" | "r01" | "r02" | "r03" | "r04" | "r05"
-            | "zip" | "7z" | "gz" | "bz2" | "xz" | "tar"
-            // Video
-            | "mkv" | "mp4" | "avi" | "wmv" | "ts" | "m4v" | "mov" | "mpg" | "mpeg"
-            // Audio
-            | "mp3" | "flac" | "ogg" | "m4a" | "aac" | "wav"
-            // Subtitles
-            | "srt" | "sub" | "idx" | "ass" | "ssa" | "sup"
-            // Images
-            | "nfo" | "jpg" | "jpeg" | "png" | "gif" | "bmp"
-            // PAR2
-            | "par2"
-            // NZB split archive patterns (e.g., .001, .002)
-            | "001" | "002" | "003" | "004" | "005"
-        )
-    } else {
-        false
-    }
-}
-
-/// Handle an article that's not available on this server (not found or decode error).
-#[allow(clippy::too_many_arguments)]
-fn handle_article_not_available(
-    item: &mut WorkItem,
-    primary_server: &ServerConfig,
-    all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
-    server_health: &ServerHealthMap,
-    articles_failed: &Arc<AtomicUsize>,
-    work_queue: &Arc<Mutex<VecDeque<WorkItem>>>,
-    progress_tx: &mpsc::UnboundedSender<ProgressUpdate>,
-    error_msg: &str,
-) {
-    item.tried_servers.push(primary_server.id.clone());
-    item.tries_on_current = 0;
-
-    // A server counts as "tried" if we actually tried it OR if it's
-    // circuit-broken (no point waiting for a server that can't connect).
-    let all_tried = {
-        let servers = all_servers.lock();
-        let health = server_health.lock();
-        servers.iter().filter(|s| s.enabled).all(|s| {
-            item.tried_servers.contains(&s.id)
-                || health.get(&s.id).is_some_and(|h| !h.is_available())
-        })
-    };
-
-    if all_tried {
-        articles_failed.fetch_add(1, Ordering::Relaxed);
-        warn!(article = %item.message_id, "{error_msg}");
-        let _ = progress_tx.send(ProgressUpdate::ArticleFailed {
-            job_id: item.job_id.clone(),
-            file_id: item.file_id.clone(),
-            segment_number: item.segment_number,
-            error: error_msg.to_string(),
-            server_id: Some(primary_server.id.clone()),
-        });
-    } else {
-        work_queue.lock().push_back(item.clone());
-    }
-}
-
-/// Re-queue all in-flight items back to the work queue (on connection loss).
-fn requeue_all(
-    in_flight: &mut HashMap<u64, WorkItem>,
-    work_queue: &Arc<Mutex<VecDeque<WorkItem>>>,
-) {
-    let items: Vec<WorkItem> = in_flight.drain().map(|(_, item)| item).collect();
-    if !items.is_empty() {
-        let mut q = work_queue.lock();
-        for item in items {
-            q.push_front(item);
-        }
-    }
-}
-
-/// Serial (non-pipelined) download path — used when pipelining depth is 1.
-#[allow(clippy::too_many_arguments)]
-async fn download_worker_serial(
-    conn: &mut NntpConnection,
-    primary_server: &ServerConfig,
-    worker_id: &str,
-    work_queue: &Arc<Mutex<VecDeque<WorkItem>>>,
-    assembler: &Arc<FileAssembler>,
-    progress_tx: &mpsc::UnboundedSender<ProgressUpdate>,
-    cancelled: &Arc<AtomicBool>,
-    paused: &Arc<AtomicBool>,
-    articles_failed: &Arc<AtomicUsize>,
-    all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
-    server_health: &ServerHealthMap,
-    yenc_names: &Arc<Mutex<HashMap<String, String>>>,
-    total_decode_us: &Arc<AtomicU64>,
-    total_assemble_us: &Arc<AtomicU64>,
-    total_articles_decoded: &Arc<AtomicU64>,
-    bandwidth: &Arc<BandwidthLimiter>,
-    stall_timeout: Option<Duration>,
-    conn_guard: &mut ConnectionGuard,
-) {
-    let mut consecutive_errors: u32 = 0;
-    let mut consecutive_skips: usize = 0;
-
-    loop {
-        // Check cancellation
-        if cancelled.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // Wait while paused — release the NNTP connection so we don't
-        // hold server connection slots while idle.
-        if paused.load(Ordering::Relaxed) {
-            info!(
-                worker = %worker_id,
-                server = %primary_server.name,
-                "Paused — releasing NNTP connection"
-            );
-            let _ = conn.quit().await;
-            conn_guard.release();
-            while paused.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            if cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            // Reconnect after unpause
-            info!(
-                worker = %worker_id,
-                server = %primary_server.name,
-                "Unpaused — reconnecting"
-            );
-            *conn = NntpConnection::new(worker_id.to_string());
-            if let Err(e) =
-                connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                    .await
-            {
-                warn!(worker = %worker_id, server = %primary_server.name, "Reconnect after unpause FAILED: {e} — worker exiting");
-                break;
-            }
-            conn_guard.reacquire(&primary_server.name);
-            info!(worker = %worker_id, server = %primary_server.name, "Reconnected after unpause");
-        }
-
-        // Exit if our server was disabled at runtime
-        let server_disabled = all_servers
-            .lock()
-            .iter()
-            .find(|s| s.id == primary_server.id)
-            .is_none_or(|s| !s.enabled);
-        if server_disabled {
-            info!(worker = %worker_id, server = %primary_server.name, "Server disabled, worker exiting");
-            break;
-        }
-
-        // Exit if server was circuit-broken (by another worker's failure)
-        {
-            let health = server_health.lock();
-            if let Some(h) = health.get(&primary_server.id)
-                && !h.is_available()
-            {
-                info!(
-                    worker = %worker_id,
-                    server = %primary_server.name,
-                    reason = h.reason.as_deref().unwrap_or("unknown"),
-                    "Server circuit-broken, worker exiting"
-                );
-                break;
-            }
-        }
-
-        // Pull next work item
-        let item = { work_queue.lock().pop_front() };
-        let Some(mut item) = item else {
-            debug!(worker = %worker_id, "Work queue empty, exiting");
-            break;
-        };
-
-        // Skip if this worker's server was already tried for this article
-        if item.tried_servers.contains(&primary_server.id) {
-            let queue_len = {
-                let mut q = work_queue.lock();
-                q.push_back(item);
-                q.len()
-            };
-            consecutive_skips += 1;
-
-            // If we've skipped more items than exist in the queue,
-            // every remaining item needs a different server — exit
-            if consecutive_skips > queue_len {
-                debug!(worker = %worker_id, "No serviceable articles remaining, exiting");
-                break;
-            }
-
-            // Brief yield to avoid busy-loop
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            continue;
-        }
-        consecutive_skips = 0;
-
-        // Try to fetch on our server (with optional stall timeout)
-        let fetch_fut = fetch_article_with_retry(conn, &item, assembler, primary_server, worker_id);
-        let result = if let Some(timeout) = stall_timeout {
-            match tokio::time::timeout(timeout, fetch_fut).await {
-                Ok(r) => r,
-                Err(_) => {
-                    warn!(
-                        worker = %worker_id,
-                        server = %primary_server.name,
-                        article = %item.message_id,
-                        "Connection stalled — no response within {}s, reconnecting",
-                        timeout.as_secs()
-                    );
-                    // Re-queue this article for another attempt
-                    work_queue.lock().push_front(item);
-                    // Connection is in an unknown state — drop and reconnect
-                    *conn = NntpConnection::new(worker_id.to_string());
-                    if let Err(e) = connect_with_retry(
-                        conn,
-                        primary_server,
-                        worker_id,
-                        server_health,
-                        all_servers,
-                    )
-                    .await
-                    {
-                        warn!(worker = %worker_id, server = %primary_server.name, "Stall reconnect FAILED: {e} — worker exiting");
-                        return;
-                    }
-                    info!(worker = %worker_id, server = %primary_server.name, "Stall reconnect successful");
-                    continue;
-                }
-            }
-        } else {
-            fetch_fut.await
-        };
-
-        match result {
-            Ok(process_result) => {
-                consecutive_errors = 0;
-                total_decode_us.fetch_add(process_result.decode_us, Ordering::Relaxed);
-                total_assemble_us.fetch_add(process_result.assemble_us, Ordering::Relaxed);
-                total_articles_decoded.fetch_add(1, Ordering::Relaxed);
-                if let Some(ref yname) = process_result.yenc_filename {
-                    yenc_names
-                        .lock()
-                        .entry(item.file_id.clone())
-                        .or_insert_with(|| crate::util::normalize_nfc(yname));
-                }
-                // Throttle via bandwidth limiter
-                if let Some(n) = std::num::NonZeroU32::new(process_result.decoded_bytes as u32) {
-                    let _ = bandwidth.acquire_download(n).await;
-                }
-                let _ = progress_tx.send(ProgressUpdate::ArticleComplete {
-                    job_id: item.job_id.clone(),
-                    file_id: item.file_id.clone(),
-                    segment_number: item.segment_number,
-                    decoded_bytes: process_result.decoded_bytes,
-                    file_complete: process_result.file_complete,
-                    server_id: Some(primary_server.id.clone()),
-                });
-            }
-            Err(ArticleError::ArticleNotFound) => {
-                handle_article_not_available(
-                    &mut item,
-                    primary_server,
-                    all_servers,
-                    server_health,
-                    articles_failed,
-                    work_queue,
-                    progress_tx,
-                    "Article not found on any server",
-                );
-            }
-            Err(ArticleError::ConnectionLost(msg)) => {
-                consecutive_errors += 1;
-                warn!(
-                    worker = %worker_id,
-                    server = %primary_server.name,
-                    host = %primary_server.host,
-                    consecutive_errors,
-                    max_reconnects = MAX_RECONNECT_ATTEMPTS,
-                    article = %item.message_id,
-                    "Connection lost: {msg}"
-                );
-
-                // Put article back for retry
-                work_queue.lock().push_front(item);
-
-                // Try to reconnect
-                if consecutive_errors > MAX_RECONNECT_ATTEMPTS {
-                    warn!(
-                        worker = %worker_id,
-                        server = %primary_server.name,
-                        host = %primary_server.host,
-                        consecutive_errors,
-                        "Too many consecutive errors — worker exiting permanently"
-                    );
-                    break;
-                }
-
-                info!(
-                    worker = %worker_id,
-                    server = %primary_server.name,
-                    delay_secs = RECONNECT_DELAY.as_secs(),
-                    "Waiting before reconnect"
-                );
-                tokio::time::sleep(RECONNECT_DELAY).await;
-                *conn = NntpConnection::new(worker_id.to_string());
-                if let Err(e) =
-                    connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
-                        .await
-                {
-                    warn!(
-                        worker = %worker_id,
-                        server = %primary_server.name,
-                        host = %primary_server.host,
-                        "Reconnect FAILED: {e} — worker exiting"
-                    );
-                    break;
-                }
-                info!(worker = %worker_id, server = %primary_server.name, "Reconnected successfully");
-            }
-            Err(ArticleError::DecodeError(msg)) => {
-                handle_article_not_available(
-                    &mut item,
-                    primary_server,
-                    all_servers,
-                    server_health,
-                    articles_failed,
-                    work_queue,
-                    progress_tx,
-                    &format!("Decode error: {msg}"),
-                );
-            }
-            Err(ArticleError::AssemblyError(msg)) => {
-                // Assembly error is local — don't retry on other servers
-                articles_failed.fetch_add(1, Ordering::Relaxed);
-                error!(article = %item.message_id, "Assembly error: {msg}");
-                let _ = progress_tx.send(ProgressUpdate::ArticleFailed {
-                    job_id: item.job_id.clone(),
-                    file_id: item.file_id.clone(),
-                    segment_number: item.segment_number,
-                    error: format!("Assembly error: {msg}"),
-                    server_id: Some(primary_server.id.clone()),
-                });
+                return WorkerExit::Reconnect;
             }
         }
     }
@@ -1763,8 +1575,6 @@ async fn connect_with_retry(
     all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
 ) -> Result<(), String> {
     for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
-        // Check circuit breaker before each attempt — another worker may
-        // have already discovered this server is broken.
         {
             let health = server_health.lock();
             if let Some(h) = health.get(&server.id)
@@ -1777,8 +1587,6 @@ async fn connect_with_retry(
             }
         }
 
-        // Use fresh config from the shared server list so that credential
-        // or host changes made via the UI take effect on reconnect.
         let current_config = all_servers
             .lock()
             .iter()
@@ -1804,7 +1612,6 @@ async fn connect_with_retry(
                     attempt,
                     "Connect attempt succeeded"
                 );
-                // Clear any prior failures for this server.
                 server_health
                     .lock()
                     .entry(server.id.clone())
@@ -1813,16 +1620,11 @@ async fn connect_with_retry(
                 return Ok(());
             }
             Err(e) => {
-                // Determine if this is an auth/permission error (non-transient)
-                // vs a regular connection error (transient, worth retrying).
                 let is_auth = matches!(e, NntpError::Auth(_) | NntpError::ServiceUnavailable(_));
-
-                // Update health tracker — may circuit-break the server.
                 {
                     let mut health = server_health.lock();
                     let entry = health.entry(server.id.clone()).or_default();
                     entry.record_failure(is_auth, &e.to_string());
-
                     if !entry.is_available() {
                         warn!(
                             worker = %worker_id,
@@ -1847,9 +1649,6 @@ async fn connect_with_retry(
                     "Connect attempt FAILED: {e}"
                 );
 
-                // Auth/permission errors won't improve with retries on the
-                // same server — fail immediately so the circuit breaker
-                // threshold is reached faster across workers.
                 if is_auth {
                     return Err(format!("Auth/permission failure: {e}"));
                 }
@@ -1875,14 +1674,179 @@ async fn connect_with_retry(
 }
 
 // ---------------------------------------------------------------------------
+// Helpers: re-queue, not-available routing, par2 sort key
+// ---------------------------------------------------------------------------
+
+/// Handle an article that's not available on this server (not found or decode
+/// error): mark the server as tried and either requeue or mark failed.
+fn handle_article_not_available(
+    item: &mut WorkItem,
+    primary_server: &ServerConfig,
+    all_servers: &Arc<Mutex<Vec<ServerConfig>>>,
+    server_health: &ServerHealthMap,
+    ctx: &Arc<JobContext>,
+    work_queue: &Arc<SharedWorkQueue>,
+    error_msg: &str,
+) {
+    item.tried_servers.push(primary_server.id.clone());
+    item.tries_on_current = 0;
+
+    let all_tried = {
+        let servers = all_servers.lock();
+        let health = server_health.lock();
+        servers.iter().filter(|s| s.enabled).all(|s| {
+            item.tried_servers.contains(&s.id)
+                || health.get(&s.id).is_some_and(|h| !h.is_available())
+        })
+    };
+
+    if all_tried {
+        warn!(article = %item.message_id, "{error_msg}");
+        let _ = ctx.progress_tx.send(ProgressUpdate::ArticleFailed {
+            job_id: item.job_id.clone(),
+            file_id: item.file_id.clone(),
+            segment_number: item.segment_number,
+            error: error_msg.to_string(),
+            server_id: Some(primary_server.id.clone()),
+        });
+        ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
+        ctx.resolve_one();
+    } else {
+        work_queue.push_back(item.clone());
+    }
+}
+
+/// Re-queue all in-flight items back to the work queue (on connection loss).
+fn requeue_all(in_flight: &mut HashMap<u64, WorkItem>, work_queue: &Arc<SharedWorkQueue>) {
+    let items: Vec<WorkItem> = in_flight.drain().map(|(_, item)| item).collect();
+    for item in items {
+        work_queue.push_front(item);
+    }
+}
+
+/// Sort key for work-queue prioritisation of PAR2 files. Index files (0)
+/// first, then volume files (1), then data files (2).
+fn par2_sort_key(filename: &str) -> u8 {
+    let lower = filename.to_lowercase();
+    if lower.ends_with(".par2") {
+        if lower.contains(".vol") { 1 } else { 0 }
+    } else {
+        2
+    }
+}
+
+fn has_known_extension(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if let Some(dot_pos) = lower.rfind('.') {
+        let ext = &lower[dot_pos + 1..];
+        matches!(
+            ext,
+            "rar"
+                | "r00"
+                | "r01"
+                | "r02"
+                | "r03"
+                | "r04"
+                | "r05"
+                | "zip"
+                | "7z"
+                | "gz"
+                | "bz2"
+                | "xz"
+                | "tar"
+                | "mkv"
+                | "mp4"
+                | "avi"
+                | "wmv"
+                | "ts"
+                | "m4v"
+                | "mov"
+                | "mpg"
+                | "mpeg"
+                | "mp3"
+                | "flac"
+                | "ogg"
+                | "m4a"
+                | "aac"
+                | "wav"
+                | "srt"
+                | "sub"
+                | "idx"
+                | "ass"
+                | "ssa"
+                | "sup"
+                | "nfo"
+                | "jpg"
+                | "jpeg"
+                | "png"
+                | "gif"
+                | "bmp"
+                | "par2"
+                | "001"
+                | "002"
+                | "003"
+                | "004"
+                | "005"
+        )
+    } else {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public helper used by queue_manager: build work items + context for a job
+// ---------------------------------------------------------------------------
+
+/// Build the WorkItems for a job's unfinished articles and an initialised
+/// JobContext. Called by QueueManager before [`WorkerPool::submit_job`].
+pub(crate) fn build_job_submission(
+    job: &NzbJob,
+    progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
+) -> (Arc<JobContext>, Vec<WorkItem>) {
+    let assembler = Arc::new(FileAssembler::new());
+    for file in &job.files {
+        let output_path = job.work_dir.join(&file.filename);
+        if let Err(e) =
+            assembler.register_file(&job.id, &file.id, output_path, file.articles.len() as u32)
+        {
+            error!(file = %file.filename, "Failed to register file for assembly: {e}");
+        }
+    }
+
+    let work_items: Vec<WorkItem> = job
+        .files
+        .iter()
+        .flat_map(|file| {
+            file.articles
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.downloaded)
+                .map(move |(idx, article)| WorkItem {
+                    job_id: job.id.clone(),
+                    file_id: file.id.clone(),
+                    filename: file.filename.clone(),
+                    message_id: article.message_id.clone(),
+                    segment_number: (idx as u32) + 1,
+                    tried_servers: Vec::new(),
+                    tries_on_current: 0,
+                })
+        })
+        .collect();
+
+    let total_remaining = work_items.len();
+    let ctx = Arc::new(JobContext::new(
+        job,
+        assembler,
+        progress_tx,
+        total_remaining,
+    ));
+    (ctx, work_items)
+}
+
+// ---------------------------------------------------------------------------
 // Article fetch with per-server retry
 // ---------------------------------------------------------------------------
 
-/// Fetch a single article with retry logic on the same server.
-///
-/// - On transient errors (timeout, connection hiccup): retry up to MAX_TRIES_PER_SERVER
-/// - On ArticleNotFound (430): return immediately (caller should try next server)
-/// - On connection loss: return ConnectionLost (caller should reconnect)
 async fn fetch_article_with_retry(
     conn: &mut NntpConnection,
     item: &WorkItem,
@@ -1946,7 +1910,6 @@ async fn fetch_article_with_retry(
                     error = %e,
                     "Service unavailable (502) during article fetch — likely rate limited or blocked"
                 );
-                // Treat as connection lost so worker reconnects with backoff
                 return Err(ArticleError::ConnectionLost(format!(
                     "Service unavailable: {e}"
                 )));
@@ -1964,7 +1927,6 @@ async fn fetch_article_with_retry(
                 )));
             }
             Err(e) => {
-                // Transient error — retry on same server
                 last_error = Some(format!("{e}"));
                 if attempt < MAX_TRIES_PER_SERVER {
                     warn!(
@@ -1989,8 +1951,6 @@ async fn fetch_article_with_retry(
         }
     }
 
-    // All retries on this server exhausted — report as decode error
-    // so caller tries next server
     Err(ArticleError::DecodeError(
         last_error.unwrap_or_else(|| "Unknown error after retries".into()),
     ))
@@ -2004,11 +1964,8 @@ async fn fetch_article_with_retry(
 struct ProcessResult {
     decoded_bytes: u64,
     file_complete: bool,
-    /// Real filename from yEnc =ybegin header (may differ from NZB subject name).
     yenc_filename: Option<String>,
-    /// yEnc decode time in microseconds.
     decode_us: u64,
-    /// File assembly time in microseconds.
     assemble_us: u64,
 }
 
@@ -2078,6 +2035,10 @@ fn decode_and_assemble(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2116,7 +2077,6 @@ mod tests {
 
     #[test]
     fn has_known_extension_rejects_obfuscated_hashes() {
-        // Typical obfuscated filenames — no extension
         assert!(!has_known_extension("9b6a324d7560b87091685020371ba869"));
         assert!(!has_known_extension("1fG1GP7L2263LHXH213HTNIxZsX7l0cv44BZ"));
         assert!(!has_known_extension("DfKUx3bl7L6PSo6276WSaXSZ7"));
@@ -2138,55 +2098,57 @@ mod tests {
         assert!(has_known_extension("file.MP4"));
     }
 
-    #[test]
-    fn deobfuscation_direction_nzb_readable_yenc_hash() {
-        // Scenario: NZB subject has real name, yEnc header has hash
-        // Should NOT rename (keep the good NZB name)
-        let nzb_name = "DTF.St.Louis.S01E04.part70.rar";
-        let yenc_name = "9b6a324d7560b87091685020371ba869";
-
-        let nzb_has_ext = has_known_extension(nzb_name);
-        let yenc_has_ext = has_known_extension(yenc_name);
-
-        assert!(nzb_has_ext, "NZB name should have known extension");
-        assert!(!yenc_has_ext, "yEnc hash should NOT have known extension");
-        // With nzb_has_ext && !yenc_has_ext → the code skips rename (continue)
+    fn make_item(job_id: &str, msg_id: &str, filename: &str) -> WorkItem {
+        WorkItem {
+            job_id: job_id.to_string(),
+            file_id: "f1".to_string(),
+            filename: filename.to_string(),
+            message_id: msg_id.to_string(),
+            segment_number: 1,
+            tried_servers: Vec::new(),
+            tries_on_current: 0,
+        }
     }
 
     #[test]
-    fn deobfuscation_direction_nzb_hash_yenc_readable() {
-        // Scenario: NZB subject is obfuscated, yEnc has real name
-        // Should rename FROM hash TO real name
-        let nzb_name = "a8f3c72d1e4b5689";
-        let yenc_name = "movie.mkv";
-
-        let nzb_has_ext = has_known_extension(nzb_name);
-        let yenc_has_ext = has_known_extension(yenc_name);
-
-        assert!(!nzb_has_ext, "NZB hash should NOT have known extension");
-        assert!(yenc_has_ext, "yEnc name should have known extension");
-        // With !nzb_has_ext && yenc_has_ext → rename from nzb to yenc
+    fn shared_queue_par2_first() {
+        let q = SharedWorkQueue::new();
+        q.submit_items(vec![
+            make_item("j1", "a", "movie.rar"),
+            make_item("j1", "b", "movie.par2"),
+            make_item("j1", "c", "movie.vol00+01.par2"),
+            make_item("j1", "d", "movie.r00"),
+        ]);
+        let first = q.pop_workable("srv1").unwrap();
+        assert_eq!(first.filename, "movie.par2", "index file first");
+        let second = q.pop_workable("srv1").unwrap();
+        assert_eq!(second.filename, "movie.vol00+01.par2", "vol file second");
     }
 
     #[test]
-    fn deobfuscation_direction_both_readable() {
-        // Both have extensions — prefer yEnc (standard deobfuscation)
-        let nzb_name = "file_from_subject.rar";
-        let yenc_name = "actual_file.rar";
+    fn shared_queue_skips_tried_servers() {
+        let q = SharedWorkQueue::new();
+        let mut item = make_item("j1", "a", "file.rar");
+        item.tried_servers.push("srv1".to_string());
+        q.submit_items(vec![item, make_item("j1", "b", "other.rar")]);
 
-        assert!(has_known_extension(nzb_name));
-        assert!(has_known_extension(yenc_name));
-        // With both having extensions → rename from nzb to yenc
+        // srv1 should skip the first item and return the second.
+        let picked = q.pop_workable("srv1").unwrap();
+        assert_eq!(picked.message_id, "b");
     }
 
     #[test]
-    fn deobfuscation_direction_both_obfuscated() {
-        // Neither has extension — skip (nothing to improve)
-        let nzb_name = "abc123def456";
-        let yenc_name = "789ghi012jkl";
-
-        assert!(!has_known_extension(nzb_name));
-        assert!(!has_known_extension(yenc_name));
-        // With neither having extensions → skip rename
+    fn shared_queue_drain_job_removes_only_target() {
+        let q = SharedWorkQueue::new();
+        q.submit_items(vec![
+            make_item("j1", "a", "a.rar"),
+            make_item("j2", "b", "b.rar"),
+            make_item("j1", "c", "c.rar"),
+        ]);
+        let drained = q.drain_job("j1");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(q.len(), 1);
+        let remaining = q.pop_workable("srv1").unwrap();
+        assert_eq!(remaining.job_id, "j2");
     }
 }

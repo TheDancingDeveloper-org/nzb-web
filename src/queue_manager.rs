@@ -23,7 +23,7 @@ use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
 
 use crate::bandwidth::BandwidthLimiter;
 use crate::direct_unpack::DirectUnpacker;
-use crate::download_engine::{ConnectionTracker, DownloadEngine, ProgressUpdate, ServerHealthMap};
+use crate::download_engine::{ConnectionTracker, ProgressUpdate, WorkerPool, build_job_submission};
 use crate::log_buffer::LogBuffer;
 
 /// Get free disk space for a path (returns 0 on error).
@@ -249,10 +249,8 @@ impl HopelessTracker {
 struct JobState {
     /// The job data (shared with API for reading).
     job: NzbJob,
-    /// The download engine for this job.
-    engine: Arc<DownloadEngine>,
-    /// Handle to the download task (so we can await or abort it).
-    task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to the per-job progress listener task.
+    progress_handle: Option<tokio::task::JoinHandle<()>>,
     /// Per-job speed tracker.
     speed: Arc<SpeedTracker>,
     /// Raw NZB data for retry.
@@ -308,10 +306,10 @@ pub struct QueueManager {
     early_failure_check: bool,
     /// Global NNTP connection tracker (shared across all download jobs).
     conn_tracker: Arc<ConnectionTracker>,
+    /// Shared worker pool that services all active download jobs.
+    worker_pool: Arc<WorkerPool>,
     /// Minimum completion percentage required (excluding par2).
     required_completion_pct: f64,
-    /// Per-article stall timeout in seconds (0 = disabled).
-    article_timeout_secs: u64,
 }
 
 impl QueueManager {
@@ -349,10 +347,19 @@ impl QueueManager {
             conn_tracker.set_limit(&server.id, server.connections as usize);
         }
 
+        let servers_arc = Arc::new(Mutex::new(servers));
+        let worker_pool = WorkerPool::new(
+            Arc::clone(&servers_arc),
+            Arc::clone(&bandwidth),
+            Arc::clone(&conn_tracker),
+            article_timeout_secs,
+        );
+        worker_pool.start();
+
         Arc::new(Self {
             jobs: Mutex::new(HashMap::new()),
             job_order: Mutex::new(Vec::new()),
-            servers: Arc::new(Mutex::new(servers)),
+            servers: servers_arc,
             globally_paused: AtomicBool::new(false),
             speed: SpeedTracker::new(),
             db: Mutex::new(db),
@@ -367,10 +374,10 @@ impl QueueManager {
             bandwidth,
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
             conn_tracker,
+            worker_pool,
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
-            article_timeout_secs,
         })
     }
 
@@ -520,12 +527,9 @@ impl QueueManager {
         // If globally paused, add as paused
         if self.globally_paused.load(Ordering::Relaxed) {
             job.status = JobStatus::Paused;
-            let engine = Arc::new(DownloadEngine::new());
-            engine.pause();
             let state = JobState {
                 job,
-                engine,
-                task_handle: None,
+                progress_handle: None,
                 speed: Arc::new(SpeedTracker::new()),
                 nzb_data,
                 direct_unpacker: None,
@@ -539,11 +543,9 @@ impl QueueManager {
         // Insert as Queued — start_next_queued will atomically claim a
         // download slot if one is available.
         job.status = JobStatus::Queued;
-        let engine = Arc::new(DownloadEngine::new());
         let state = JobState {
             job,
-            engine,
-            task_handle: None,
+            progress_handle: None,
             speed: Arc::new(SpeedTracker::new()),
             nzb_data,
             direct_unpacker: None,
@@ -560,9 +562,9 @@ impl QueueManager {
     /// Launch the download task for a job that is already in the jobs map
     /// with status `Downloading`.
     ///
-    /// Creates a `DownloadEngine`, spawns the download task, and updates
-    /// the existing map entry with the engine and task handle.  If the
-    /// pre-flight disk-space check fails, the job is set to `Paused`.
+    /// Builds a [`JobContext`] and submits work items to the shared worker
+    /// pool, then spawns the per-job progress listener. If the pre-flight
+    /// disk-space check fails, the job is set to `Paused`.
     fn launch_download(self: &Arc<Self>, job_id: &str) {
         // Lazily load NZB data if not in memory (queued jobs skip loading at restore time)
         {
@@ -639,7 +641,6 @@ impl QueueManager {
             if let Some(state) = jobs.get_mut(job_id) {
                 state.job.status = JobStatus::Paused;
                 state.job.error_message = Some("Paused: low disk space".to_string());
-                state.engine.pause();
             }
             return;
         }
@@ -653,64 +654,44 @@ impl QueueManager {
             "Starting download job"
         );
 
-        let engine = Arc::new(DownloadEngine::with_stall_timeout(
-            self.article_timeout_secs,
-        ));
         let job_speed = Arc::new(SpeedTracker::new());
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
 
-        let servers = Arc::clone(&self.servers);
         {
-            let srv = servers.lock();
+            let srv = self.servers.lock();
             let enabled_count = srv.iter().filter(|s| s.enabled).count();
             info!(
                 job_id = %job_id,
                 total_servers = srv.len(),
                 enabled_servers = enabled_count,
-                "Dispatching job to download engine"
+                "Dispatching job to shared worker pool"
             );
             if enabled_count == 0 {
-                warn!(job_id = %job_id, "No enabled servers — job will fail pre-flight");
+                warn!(job_id = %job_id, "No enabled servers — job will stall until servers are added");
             }
         }
 
-        let engine_clone = Arc::clone(&engine);
-        let job_clone = job;
-        let bandwidth = Arc::clone(&self.bandwidth);
-        let server_health: ServerHealthMap = Arc::new(Mutex::new(HashMap::new()));
-        let conn_tracker = Arc::clone(&self.conn_tracker);
+        // Build the per-job context and work items, submit to the worker pool.
+        let (ctx, items) = build_job_submission(&job, progress_tx);
+        self.worker_pool.submit_job(ctx, items);
 
-        // Spawn the download task
-        let task_handle = tokio::spawn(async move {
-            engine_clone
-                .run(
-                    &job_clone,
-                    servers,
-                    server_health,
-                    progress_tx,
-                    bandwidth,
-                    conn_tracker,
-                )
-                .await;
+        // Spawn the per-job progress handler and record its handle.
+        let qm = Arc::clone(self);
+        let jid = job_id.to_string();
+        let speed_for_task = Arc::clone(&job_speed);
+        let progress_handle = tokio::spawn(async move {
+            qm.handle_progress(jid, progress_rx, speed_for_task).await;
         });
 
-        // Update the existing map entry with the engine and task handle
+        // Update the existing map entry with the handle and trackers.
         {
             let mut jobs = self.jobs.lock();
             if let Some(state) = jobs.get_mut(job_id) {
-                state.engine = engine;
-                state.task_handle = Some(task_handle);
+                state.progress_handle = Some(progress_handle);
                 state.speed = Arc::clone(&job_speed);
                 state.hopeless_tracker = Some(HopelessTracker::new(&state.job));
             }
         }
-
-        // Spawn the progress handler
-        let qm = Arc::clone(self);
-        let jid = job_id.to_string();
-        tokio::spawn(async move {
-            qm.handle_progress(jid, progress_rx, job_speed).await;
-        });
     }
 
     /// Handle progress updates from the download engine.
@@ -921,15 +902,16 @@ impl QueueManager {
 
                     if let Some(reason) = should_abort {
                         warn!(job_id = %job_id, reason = %reason, "Job is hopeless — aborting");
-                        // Cancel the download engine so workers exit.
-                        // Store the reason so JobFinished can mark it as failed.
                         {
                             let mut jobs = self.jobs.lock();
                             if let Some(state) = jobs.get_mut(&job_id) {
-                                state.job.error_message = Some(reason);
-                                state.engine.cancel();
+                                state.job.error_message = Some(reason.clone());
                             }
                         }
+                        // Tell the worker pool to drain the job and emit
+                        // JobAborted — the JobAborted arm below handles the
+                        // rest of the teardown.
+                        self.worker_pool.abort_job(&job_id, reason);
                     } else {
                         warn!(job_id = %job_id, "Article failed: {error}");
                     }
@@ -939,40 +921,6 @@ impl QueueManager {
                     articles_failed,
                     ..
                 } => {
-                    // Check if this job was cancelled by the hopeless detector.
-                    // If so, treat it as a failure — skip post-processing entirely.
-                    let was_aborted_hopeless = {
-                        let jobs = self.jobs.lock();
-                        jobs.get(&job_id).is_some_and(|s| {
-                            s.engine.is_cancelled() && s.job.error_message.is_some()
-                        })
-                    };
-
-                    if was_aborted_hopeless {
-                        let abort_reason = {
-                            let jobs = self.jobs.lock();
-                            jobs.get(&job_id)
-                                .and_then(|s| s.job.error_message.clone())
-                                .unwrap_or_else(|| "Download cannot complete".into())
-                        };
-                        warn!(
-                            job_id = %job_id,
-                            articles_failed,
-                            reason = %abort_reason,
-                            "Job aborted — moving to failed"
-                        );
-                        {
-                            let mut jobs = self.jobs.lock();
-                            if let Some(state) = jobs.get_mut(&job_id) {
-                                state.job.status = JobStatus::Failed;
-                                state.job.completed_at = Some(chrono::Utc::now());
-                            }
-                        }
-                        self.start_next_queued();
-                        self.on_job_finished(&job_id, false, articles_failed).await;
-                        break;
-                    }
-
                     info!(
                         job_id = %job_id,
                         success,
@@ -1007,7 +955,6 @@ impl QueueManager {
                         if let Some(state) = jobs.get_mut(&job_id) {
                             state.job.status = JobStatus::Paused;
                             state.job.error_message = Some(reason);
-                            state.engine.pause();
                         }
                     }
                     self.persist_job_progress(&job_id);
@@ -1448,11 +1395,11 @@ impl QueueManager {
                         "Preempting lower-priority download for higher-priority job"
                     );
 
-                    // Pause the lower-priority download
+                    // Pause the lower-priority download via the worker pool.
+                    self.worker_pool.pause_job(d_id);
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(d_id.as_str()) {
-                            state.engine.pause();
                             state.job.status = JobStatus::Paused;
                             // Persist to DB
                             let db = self.db.lock();
@@ -1484,6 +1431,8 @@ impl QueueManager {
 
     /// Pause a specific job.
     pub fn pause_job(self: &Arc<Self>, id: &str) -> crate::nzb_core::Result<()> {
+        // Tell the pool first — workers stop pulling this job's items.
+        self.worker_pool.pause_job(id);
         {
             let mut jobs = self.jobs.lock();
             let state = jobs
@@ -1491,7 +1440,6 @@ impl QueueManager {
                 .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
 
             state.job.status = JobStatus::Paused;
-            state.engine.pause();
 
             let db = self.db.lock();
             db.queue_update_progress(
@@ -1513,14 +1461,14 @@ impl QueueManager {
 
     /// Resume a specific job.
     pub fn resume_job(self: &Arc<Self>, id: &str) -> crate::nzb_core::Result<()> {
+        let ctx_alive = self.worker_pool.has_job(id);
+
         let needs_launch = {
             let mut jobs = self.jobs.lock();
-            // Check existence first
             if !jobs.contains_key(id) {
                 return Err(crate::nzb_core::NzbError::JobNotFound(id.to_string()));
             }
 
-            // Count active downloads before taking a mutable borrow
             let active = jobs
                 .values()
                 .filter(|s| s.job.status == JobStatus::Downloading)
@@ -1528,13 +1476,10 @@ impl QueueManager {
 
             let state = jobs.get_mut(id).unwrap();
 
-            let task_running = state.task_handle.as_ref().is_some_and(|h| !h.is_finished());
-
-            if task_running {
-                // Engine is running, just resume it
+            if ctx_alive {
+                // Job context still lives in the pool — just unpause it.
                 state.job.status = JobStatus::Downloading;
                 state.job.error_message = None;
-                state.engine.resume();
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     id,
@@ -1546,15 +1491,13 @@ impl QueueManager {
                 );
                 false
             } else {
-                // Check concurrency limit
+                // Pool has no context — we need to rebuild work items and submit.
                 let max = self.max_active_downloads.load(Ordering::Relaxed);
                 if max > 0 && active >= max {
-                    // Mark as queued — will start when a slot opens
                     state.job.status = JobStatus::Queued;
                     info!(job_id = %id, "Job queued (active download limit reached)");
                     false
                 } else {
-                    // Atomically mark as Downloading while holding the lock
                     state.job.status = JobStatus::Downloading;
                     state.job.error_message = None;
                     true
@@ -1562,7 +1505,9 @@ impl QueueManager {
             }
         };
 
-        if needs_launch {
+        if ctx_alive {
+            self.worker_pool.resume_job(id);
+        } else if needs_launch {
             self.launch_download(id);
         }
 
@@ -1572,11 +1517,11 @@ impl QueueManager {
 
     /// Remove a specific job from the queue.
     pub fn remove_job(&self, id: &str) -> crate::nzb_core::Result<()> {
+        // Silently cancel in the pool — drains queued items and unregisters.
+        self.worker_pool.cancel_job(id);
         let removed = self.jobs.lock().remove(id);
         if let Some(state) = removed {
-            // Cancel the download
-            state.engine.cancel();
-            if let Some(handle) = state.task_handle {
+            if let Some(handle) = state.progress_handle {
                 handle.abort();
             }
 
@@ -1649,18 +1594,28 @@ impl QueueManager {
     pub fn pause_all(&self) {
         self.globally_paused.store(true, Ordering::Relaxed);
         self.db.lock().set_setting("globally_paused", "true");
-        let mut jobs = self.jobs.lock();
-        for (_id, state) in jobs.iter_mut() {
-            match state.job.status {
-                JobStatus::Downloading => {
-                    state.engine.pause();
-                    state.job.status = JobStatus::Paused;
+
+        // Collect ids to pause in the pool, to avoid holding the jobs lock
+        // while calling into the worker pool.
+        let to_pause: Vec<String> = {
+            let mut jobs = self.jobs.lock();
+            let mut ids = Vec::new();
+            for (id, state) in jobs.iter_mut() {
+                match state.job.status {
+                    JobStatus::Downloading => {
+                        ids.push(id.clone());
+                        state.job.status = JobStatus::Paused;
+                    }
+                    JobStatus::Queued => {
+                        state.job.status = JobStatus::Paused;
+                    }
+                    _ => {}
                 }
-                JobStatus::Queued => {
-                    state.job.status = JobStatus::Paused;
-                }
-                _ => {}
             }
+            ids
+        };
+        for id in to_pause {
+            self.worker_pool.pause_job(&id);
         }
         info!("All downloads paused");
     }
@@ -1704,22 +1659,25 @@ impl QueueManager {
         self.db.lock().set_setting("globally_paused", "false");
         *self.pause_until.lock() = None;
 
-        // Resume already-running paused engines and mark paused jobs as queued
+        // Decide per job whether to just unpause (ctx still in pool) or
+        // mark it as Queued so start_next_queued re-submits it.
+        let mut to_unpause: Vec<String> = Vec::new();
         {
             let mut jobs = self.jobs.lock();
-            for (_id, state) in jobs.iter_mut() {
+            for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused {
                     state.job.error_message = None;
-                    let task_running = state.task_handle.as_ref().is_some_and(|h| !h.is_finished());
-                    state.engine.resume();
-                    if task_running {
+                    if self.worker_pool.has_job(id) {
                         state.job.status = JobStatus::Downloading;
+                        to_unpause.push(id.clone());
                     } else {
-                        // Needs a fresh start — mark as queued for start_next_queued
                         state.job.status = JobStatus::Queued;
                     }
                 }
             }
+        }
+        for id in to_unpause {
+            self.worker_pool.resume_job(&id);
         }
 
         // Start queued jobs up to the concurrency limit
@@ -1747,6 +1705,11 @@ impl QueueManager {
         }
         *self.servers.lock() = servers;
 
+        // Reconcile the worker pool to match the new server list (spawns or
+        // retires workers so per-server connection counts stay exactly in
+        // line with server.connections).
+        self.worker_pool.reconcile_servers();
+
         // Auto-resume jobs paused by server errors now that config changed
         if enabled > 0 {
             self.resume_server_paused_jobs();
@@ -1759,21 +1722,24 @@ impl QueueManager {
     /// circuit breaker / `NoServersAvailable`), not user-paused jobs.
     fn resume_server_paused_jobs(self: &Arc<Self>) {
         let mut resumed = 0u32;
+        let mut to_unpause: Vec<String> = Vec::new();
         {
             let mut jobs = self.jobs.lock();
-            for (_id, state) in jobs.iter_mut() {
+            for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
-                    let task_running = state.task_handle.as_ref().is_some_and(|h| !h.is_finished());
                     state.job.error_message = None;
-                    state.engine.resume();
-                    if task_running {
+                    if self.worker_pool.has_job(id) {
                         state.job.status = JobStatus::Downloading;
+                        to_unpause.push(id.clone());
                     } else {
                         state.job.status = JobStatus::Queued;
                     }
                     resumed += 1;
                 }
             }
+        }
+        for id in to_unpause {
+            self.worker_pool.resume_job(&id);
         }
         if resumed > 0 {
             info!(
@@ -2037,7 +2003,6 @@ impl QueueManager {
 
         for mut job in jobs {
             let job_id = job.id.clone();
-            let engine = Arc::new(DownloadEngine::new());
 
             // Only load full NZB data + checkpoints for jobs that were actively
             // downloading. Queued/paused jobs just need metadata — their NZB data
@@ -2118,15 +2083,15 @@ impl QueueManager {
             }
 
             if job.status == JobStatus::Paused && was_paused {
-                engine.pause();
+                // Keep as Paused — it's globally paused; resume_all will
+                // re-submit it to the pool.
             } else if job.status == JobStatus::Paused || job.status == JobStatus::Downloading {
                 job.status = JobStatus::Queued;
             }
 
             let state = JobState {
                 job,
-                engine,
-                task_handle: None,
+                progress_handle: None,
                 speed: Arc::new(SpeedTracker::new()),
                 nzb_data,
                 direct_unpacker: None,
@@ -2157,29 +2122,32 @@ impl QueueManager {
         // 1. Set globally paused to prevent new downloads from starting
         self.globally_paused.store(true, Ordering::Relaxed);
 
-        // 2. Cancel all download engines and collect task handles
+        // 2. Mark downloading jobs as Queued for next restart, and collect
+        //    progress-handler task handles so they can be aborted after the
+        //    pool drains.
         let mut handles = Vec::new();
         {
             let mut jobs = self.jobs.lock();
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Downloading {
-                    info!(job_id = %id, "Cancelling download for shutdown");
-                    state.engine.cancel();
+                    info!(job_id = %id, "Marking download for shutdown");
                     state.job.status = JobStatus::Queued; // Will resume on restart
                 }
-                if let Some(handle) = state.task_handle.take() {
+                if let Some(handle) = state.progress_handle.take() {
                     handles.push(handle);
                 }
             }
         }
 
-        // 3. Wait for all download tasks to finish (with timeout)
-        if !handles.is_empty() {
-            info!("Waiting for {} download tasks to stop...", handles.len());
-            let timeout = Duration::from_secs(10);
-            for handle in handles {
-                let _ = tokio::time::timeout(timeout, handle).await;
-            }
+        // 3. Shut down the worker pool gracefully. In-flight articles finish
+        //    first (finish-in-flight), then workers exit.
+        self.worker_pool.shutdown().await;
+
+        // 4. Abort the per-job progress listeners (their sender sides are
+        //    dropped, so the loops would exit anyway; we just don't want to
+        //    wait for them).
+        for handle in handles {
+            handle.abort();
         }
 
         // 4. Persist final state for all jobs to DB
@@ -2268,11 +2236,15 @@ impl QueueManager {
                         );
                         qm.globally_paused.store(true, Ordering::Relaxed);
                         qm.db.lock().set_setting("globally_paused", "true");
-                        let jobs = qm.jobs.lock();
-                        for (_id, state) in jobs.iter() {
-                            if state.job.status == JobStatus::Downloading {
-                                state.engine.pause();
-                            }
+                        let to_pause: Vec<String> = {
+                            let jobs = qm.jobs.lock();
+                            jobs.iter()
+                                .filter(|(_, s)| s.job.status == JobStatus::Downloading)
+                                .map(|(id, _)| id.clone())
+                                .collect()
+                        };
+                        for id in to_pause {
+                            qm.worker_pool.pause_job(&id);
                         }
                     }
                 }
