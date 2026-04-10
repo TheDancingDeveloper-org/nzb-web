@@ -308,6 +308,8 @@ pub struct QueueManager {
     early_failure_check: bool,
     /// Minimum completion percentage required (excluding par2).
     required_completion_pct: f64,
+    /// Per-article stall timeout in seconds (0 = disabled).
+    article_timeout_secs: u64,
 }
 
 impl QueueManager {
@@ -327,6 +329,7 @@ impl QueueManager {
         abort_hopeless: bool,
         early_failure_check: bool,
         required_completion_pct: f64,
+        article_timeout_secs: u64,
     ) -> Arc<Self> {
         use crate::bandwidth::BandwidthConfig;
         use std::num::NonZeroU32;
@@ -358,6 +361,7 @@ impl QueueManager {
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
+            article_timeout_secs,
         })
     }
 
@@ -640,7 +644,7 @@ impl QueueManager {
             "Starting download job"
         );
 
-        let engine = Arc::new(DownloadEngine::new());
+        let engine = Arc::new(DownloadEngine::with_stall_timeout(self.article_timeout_secs));
         let job_speed = Arc::new(SpeedTracker::new());
         let (progress_tx, progress_rx) = mpsc::unbounded_channel();
 

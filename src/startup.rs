@@ -102,6 +102,7 @@ pub async fn initialize(
         config.general.abort_hopeless,
         config.general.early_failure_check,
         config.general.required_completion_pct,
+        config.general.article_timeout_secs,
     );
 
     // Set history retention

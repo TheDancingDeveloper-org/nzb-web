@@ -183,6 +183,9 @@ pub struct DownloadEngine {
     pub total_assemble_us: Arc<AtomicU64>,
     /// Total articles successfully decoded.
     pub total_articles_decoded: Arc<AtomicU64>,
+    /// Max time to wait for a single article response before treating the
+    /// connection as stalled.  `None` = no timeout.
+    stall_timeout: Option<Duration>,
 }
 
 impl Default for DownloadEngine {
@@ -199,7 +202,18 @@ impl DownloadEngine {
             total_decode_us: Arc::new(AtomicU64::new(0)),
             total_assemble_us: Arc::new(AtomicU64::new(0)),
             total_articles_decoded: Arc::new(AtomicU64::new(0)),
+            stall_timeout: None,
         }
+    }
+
+    /// Create a new engine with a per-article stall timeout.
+    /// If `timeout_secs` is 0, no timeout is applied.
+    pub fn with_stall_timeout(timeout_secs: u64) -> Self {
+        let mut engine = Self::new();
+        if timeout_secs > 0 {
+            engine.stall_timeout = Some(Duration::from_secs(timeout_secs));
+        }
+        engine
     }
 
     pub fn cancel(&self) {
@@ -424,6 +438,8 @@ impl DownloadEngine {
                     let total_articles_decoded = Arc::clone(&self.total_articles_decoded);
                     let bandwidth = Arc::clone(&bandwidth);
 
+                    let stall_timeout = self.stall_timeout;
+
                     async move {
                         download_worker(
                             server_config,
@@ -441,6 +457,7 @@ impl DownloadEngine {
                             total_assemble_us,
                             total_articles_decoded,
                             bandwidth,
+                            stall_timeout,
                         )
                         .await;
                     }
@@ -626,6 +643,7 @@ async fn download_worker(
     total_assemble_us: Arc<AtomicU64>,
     total_articles_decoded: Arc<AtomicU64>,
     bandwidth: Arc<BandwidthLimiter>,
+    stall_timeout: Option<Duration>,
 ) {
     let worker_id = format!("{}#{}", primary_server.id, conn_idx);
 
@@ -719,6 +737,7 @@ async fn download_worker(
             &total_assemble_us,
             &total_articles_decoded,
             &bandwidth,
+            stall_timeout,
         )
         .await;
     } else {
@@ -740,6 +759,7 @@ async fn download_worker(
             &total_assemble_us,
             &total_articles_decoded,
             &bandwidth,
+            stall_timeout,
         )
         .await;
     }
@@ -767,6 +787,7 @@ async fn download_worker_pipelined(
     total_assemble_us: &Arc<AtomicU64>,
     total_articles_decoded: &Arc<AtomicU64>,
     bandwidth: &Arc<BandwidthLimiter>,
+    stall_timeout: Option<Duration>,
 ) {
     let mut pipeline = Pipeline::new(pipe_depth);
     // In-flight items indexed by pipeline tag
@@ -913,9 +934,39 @@ async fn download_worker_pipelined(
 
         perf_flush_us += flush_t.elapsed().as_micros() as u64;
 
-        // Read one response
+        // Read one response (with optional stall timeout)
         let recv_t = Instant::now();
-        let result = pipeline.receive_one(conn).await;
+        let result = if let Some(timeout) = stall_timeout {
+            match tokio::time::timeout(timeout, pipeline.receive_one(conn)).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let elapsed_ms = recv_t.elapsed().as_millis();
+                    warn!(
+                        worker = %worker_id,
+                        server = %primary_server.name,
+                        elapsed_ms,
+                        in_flight = in_flight_items.len(),
+                        "Connection stalled — no response within {}s, reconnecting",
+                        timeout.as_secs()
+                    );
+                    // Connection is in an unknown state — drop and reconnect
+                    requeue_all(&mut in_flight_items, work_queue);
+                    *conn = NntpConnection::new(worker_id.to_string());
+                    if let Err(e) =
+                        connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                            .await
+                    {
+                        warn!(worker = %worker_id, server = %primary_server.name, "Stall reconnect FAILED: {e} — worker exiting");
+                        break;
+                    }
+                    info!(worker = %worker_id, server = %primary_server.name, "Stall reconnect successful");
+                    pipeline = Pipeline::new(pipe_depth);
+                    continue;
+                }
+            }
+        } else {
+            pipeline.receive_one(conn).await
+        };
         perf_receive_us += recv_t.elapsed().as_micros() as u64;
         match result {
             Ok(Some(pipe_result)) => {
@@ -1263,6 +1314,7 @@ async fn download_worker_serial(
     total_assemble_us: &Arc<AtomicU64>,
     total_articles_decoded: &Arc<AtomicU64>,
     bandwidth: &Arc<BandwidthLimiter>,
+    stall_timeout: Option<Duration>,
 ) {
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_skips: usize = 0;
@@ -1337,9 +1389,37 @@ async fn download_worker_serial(
         }
         consecutive_skips = 0;
 
-        // Try to fetch on our server
-        let result =
-            fetch_article_with_retry(conn, &item, assembler, primary_server, worker_id).await;
+        // Try to fetch on our server (with optional stall timeout)
+        let fetch_fut = fetch_article_with_retry(conn, &item, assembler, primary_server, worker_id);
+        let result = if let Some(timeout) = stall_timeout {
+            match tokio::time::timeout(timeout, fetch_fut).await {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!(
+                        worker = %worker_id,
+                        server = %primary_server.name,
+                        article = %item.message_id,
+                        "Connection stalled — no response within {}s, reconnecting",
+                        timeout.as_secs()
+                    );
+                    // Re-queue this article for another attempt
+                    work_queue.lock().push_front(item);
+                    // Connection is in an unknown state — drop and reconnect
+                    *conn = NntpConnection::new(worker_id.to_string());
+                    if let Err(e) =
+                        connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                            .await
+                    {
+                        warn!(worker = %worker_id, server = %primary_server.name, "Stall reconnect FAILED: {e} — worker exiting");
+                        return;
+                    }
+                    info!(worker = %worker_id, server = %primary_server.name, "Stall reconnect successful");
+                    continue;
+                }
+            }
+        } else {
+            fetch_fut.await
+        };
 
         match result {
             Ok(process_result) => {
