@@ -29,6 +29,142 @@ use nzb_decode::yenc::decode_yenc;
 
 use crate::bandwidth::BandwidthLimiter;
 
+// ---------------------------------------------------------------------------
+// Global connection tracking
+// ---------------------------------------------------------------------------
+
+/// Tracks active NNTP connections per server across all concurrent download jobs.
+///
+/// Shared via `Arc` between the QueueManager and all DownloadEngine instances.
+/// Workers increment on connect, decrement on disconnect. The speed tracker
+/// periodically logs the counts so connection leaks are visible.
+pub struct ConnectionTracker {
+    /// Per-server active connection count (key = server ID).
+    counts: Mutex<HashMap<String, Arc<AtomicUsize>>>,
+    /// Per-server connection limit (key = server ID).
+    limits: Mutex<HashMap<String, usize>>,
+}
+
+impl ConnectionTracker {
+    pub fn new() -> Self {
+        Self {
+            counts: Mutex::new(HashMap::new()),
+            limits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Update the configured limit for a server.
+    pub fn set_limit(&self, server_id: &str, limit: usize) {
+        self.limits.lock().insert(server_id.to_string(), limit);
+    }
+
+    /// Get or create the counter for a server.
+    fn counter(&self, server_id: &str) -> Arc<AtomicUsize> {
+        let mut counts = self.counts.lock();
+        counts
+            .entry(server_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone()
+    }
+
+    /// Record a new connection. Returns the new count and whether it exceeds the limit.
+    pub fn connect(&self, server_id: &str, server_name: &str) -> usize {
+        let counter = self.counter(server_id);
+        let new_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let limit = self.limits.lock().get(server_id).copied().unwrap_or(0);
+        if limit > 0 && new_count > limit {
+            warn!(
+                server = %server_name,
+                active = new_count,
+                limit,
+                "NNTP connections EXCEED configured limit"
+            );
+        }
+        new_count
+    }
+
+    /// Record a disconnection.
+    pub fn disconnect(&self, server_id: &str) {
+        let counter = self.counter(server_id);
+        let prev = counter.fetch_sub(1, Ordering::Relaxed);
+        if prev == 0 {
+            // Underflow protection — shouldn't happen but don't wrap to usize::MAX
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Get a snapshot of all connection counts for logging.
+    pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
+        let counts = self.counts.lock();
+        let limits = self.limits.lock();
+        counts
+            .iter()
+            .map(|(id, count)| {
+                let limit = limits.get(id).copied().unwrap_or(0);
+                (id.clone(), count.load(Ordering::Relaxed), limit)
+            })
+            .collect()
+    }
+
+    /// Total active connections across all servers.
+    pub fn total(&self) -> usize {
+        self.counts
+            .lock()
+            .values()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+impl Default for ConnectionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// RAII guard that decrements the connection counter on drop.
+/// Ensures connections are tracked even if a worker panics or exits early.
+struct ConnectionGuard {
+    server_id: String,
+    tracker: Arc<ConnectionTracker>,
+    active: bool,
+}
+
+impl ConnectionGuard {
+    fn new(tracker: Arc<ConnectionTracker>, server_id: &str, server_name: &str) -> Self {
+        tracker.connect(server_id, server_name);
+        Self {
+            server_id: server_id.to_string(),
+            tracker,
+            active: true,
+        }
+    }
+
+    /// Temporarily release the connection (e.g. during pause).
+    fn release(&mut self) {
+        if self.active {
+            self.tracker.disconnect(&self.server_id);
+            self.active = false;
+        }
+    }
+
+    /// Re-acquire after release (e.g. after unpause).
+    fn reacquire(&mut self, server_name: &str) {
+        if !self.active {
+            self.tracker.connect(&self.server_id, server_name);
+            self.active = true;
+        }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.tracker.disconnect(&self.server_id);
+        }
+    }
+}
+
 /// Max times to retry an article on the SAME server before trying the next.
 const MAX_TRIES_PER_SERVER: u32 = 3;
 /// Delay between reconnection attempts.
@@ -252,6 +388,7 @@ impl DownloadEngine {
         server_health: ServerHealthMap,
         progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
         bandwidth: Arc<BandwidthLimiter>,
+        conn_tracker: Arc<ConnectionTracker>,
     ) {
         let job_id = job.id.clone();
         let engine_start = Instant::now();
@@ -437,6 +574,7 @@ impl DownloadEngine {
                     let total_assemble_us = Arc::clone(&self.total_assemble_us);
                     let total_articles_decoded = Arc::clone(&self.total_articles_decoded);
                     let bandwidth = Arc::clone(&bandwidth);
+                    let conn_tracker = Arc::clone(&conn_tracker);
 
                     let stall_timeout = self.stall_timeout;
 
@@ -458,6 +596,7 @@ impl DownloadEngine {
                             total_articles_decoded,
                             bandwidth,
                             stall_timeout,
+                            conn_tracker,
                         )
                         .await;
                     }
@@ -644,6 +783,7 @@ async fn download_worker(
     total_articles_decoded: Arc<AtomicU64>,
     bandwidth: Arc<BandwidthLimiter>,
     stall_timeout: Option<Duration>,
+    conn_tracker: Arc<ConnectionTracker>,
 ) {
     let worker_id = format!("{}#{}", primary_server.id, conn_idx);
 
@@ -709,12 +849,21 @@ async fn download_worker(
         return;
     }
 
+    // Track this connection globally — the guard decrements on drop.
+    let mut conn_guard = ConnectionGuard::new(
+        Arc::clone(&conn_tracker),
+        &primary_server.id,
+        &primary_server.name,
+    );
+
     let pipe_depth = primary_server.pipelining.max(1);
+    let active_conns = conn_tracker.total();
     info!(
         worker = %worker_id,
         server = %primary_server.name,
         host = %primary_server.host,
         pipelining = pipe_depth,
+        total_nntp_connections = active_conns,
         "Worker connected and ready"
     );
 
@@ -738,6 +887,7 @@ async fn download_worker(
             &total_articles_decoded,
             &bandwidth,
             stall_timeout,
+            &mut conn_guard,
         )
         .await;
     } else {
@@ -760,6 +910,7 @@ async fn download_worker(
             &total_articles_decoded,
             &bandwidth,
             stall_timeout,
+            &mut conn_guard,
         )
         .await;
     }
@@ -788,6 +939,7 @@ async fn download_worker_pipelined(
     total_articles_decoded: &Arc<AtomicU64>,
     bandwidth: &Arc<BandwidthLimiter>,
     stall_timeout: Option<Duration>,
+    conn_guard: &mut ConnectionGuard,
 ) {
     let mut pipeline = Pipeline::new(pipe_depth);
     // In-flight items indexed by pipeline tag
@@ -813,12 +965,39 @@ async fn download_worker_pipelined(
             break;
         }
 
-        // Wait while paused
-        while paused.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        if cancelled.load(Ordering::Relaxed) {
-            break;
+        // Wait while paused — release the NNTP connection so we don't
+        // hold server connection slots while idle.
+        if paused.load(Ordering::Relaxed) {
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "Paused — releasing NNTP connection"
+            );
+            let _ = conn.quit().await;
+            conn_guard.release();
+            while paused.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            // Reconnect after unpause
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "Unpaused — reconnecting"
+            );
+            *conn = NntpConnection::new(worker_id.to_string());
+            if let Err(e) =
+                connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                    .await
+            {
+                warn!(worker = %worker_id, server = %primary_server.name, "Reconnect after unpause FAILED: {e} — worker exiting");
+                break;
+            }
+            conn_guard.reacquire(&primary_server.name);
+            pipeline = Pipeline::new(pipe_depth);
+            info!(worker = %worker_id, server = %primary_server.name, "Reconnected after unpause");
         }
 
         // Exit if our server was disabled at runtime
@@ -1320,6 +1499,7 @@ async fn download_worker_serial(
     total_articles_decoded: &Arc<AtomicU64>,
     bandwidth: &Arc<BandwidthLimiter>,
     stall_timeout: Option<Duration>,
+    conn_guard: &mut ConnectionGuard,
 ) {
     let mut consecutive_errors: u32 = 0;
     let mut consecutive_skips: usize = 0;
@@ -1330,12 +1510,38 @@ async fn download_worker_serial(
             break;
         }
 
-        // Wait while paused
-        while paused.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        if cancelled.load(Ordering::Relaxed) {
-            break;
+        // Wait while paused — release the NNTP connection so we don't
+        // hold server connection slots while idle.
+        if paused.load(Ordering::Relaxed) {
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "Paused — releasing NNTP connection"
+            );
+            let _ = conn.quit().await;
+            conn_guard.release();
+            while paused.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            // Reconnect after unpause
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "Unpaused — reconnecting"
+            );
+            *conn = NntpConnection::new(worker_id.to_string());
+            if let Err(e) =
+                connect_with_retry(conn, primary_server, worker_id, server_health, all_servers)
+                    .await
+            {
+                warn!(worker = %worker_id, server = %primary_server.name, "Reconnect after unpause FAILED: {e} — worker exiting");
+                break;
+            }
+            conn_guard.reacquire(&primary_server.name);
+            info!(worker = %worker_id, server = %primary_server.name, "Reconnected after unpause");
         }
 
         // Exit if our server was disabled at runtime

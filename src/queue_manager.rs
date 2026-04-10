@@ -23,7 +23,7 @@ use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
 
 use crate::bandwidth::BandwidthLimiter;
 use crate::direct_unpack::DirectUnpacker;
-use crate::download_engine::{DownloadEngine, ProgressUpdate, ServerHealthMap};
+use crate::download_engine::{ConnectionTracker, DownloadEngine, ProgressUpdate, ServerHealthMap};
 use crate::log_buffer::LogBuffer;
 
 /// Get free disk space for a path (returns 0 on error).
@@ -306,6 +306,8 @@ pub struct QueueManager {
     abort_hopeless: bool,
     /// Quick initial failure check on first N articles.
     early_failure_check: bool,
+    /// Global NNTP connection tracker (shared across all download jobs).
+    conn_tracker: Arc<ConnectionTracker>,
     /// Minimum completion percentage required (excluding par2).
     required_completion_pct: f64,
     /// Per-article stall timeout in seconds (0 = disabled).
@@ -341,6 +343,12 @@ impl QueueManager {
         };
         let bandwidth = Arc::new(BandwidthLimiter::new(BandwidthConfig { download_bps }));
 
+        // Build connection tracker with per-server limits
+        let conn_tracker = Arc::new(ConnectionTracker::new());
+        for server in &servers {
+            conn_tracker.set_limit(&server.id, server.connections as usize);
+        }
+
         Arc::new(Self {
             jobs: Mutex::new(HashMap::new()),
             job_order: Mutex::new(Vec::new()),
@@ -358,6 +366,7 @@ impl QueueManager {
             min_free_space,
             bandwidth,
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
+            conn_tracker,
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
@@ -669,11 +678,19 @@ impl QueueManager {
         let job_clone = job;
         let bandwidth = Arc::clone(&self.bandwidth);
         let server_health: ServerHealthMap = Arc::new(Mutex::new(HashMap::new()));
+        let conn_tracker = Arc::clone(&self.conn_tracker);
 
         // Spawn the download task
         let task_handle = tokio::spawn(async move {
             engine_clone
-                .run(&job_clone, servers, server_health, progress_tx, bandwidth)
+                .run(
+                    &job_clone,
+                    servers,
+                    server_health,
+                    progress_tx,
+                    bandwidth,
+                    conn_tracker,
+                )
                 .await;
         });
 
@@ -1723,6 +1740,11 @@ impl QueueManager {
     pub fn update_servers(self: &Arc<Self>, servers: Vec<ServerConfig>) {
         let enabled = servers.iter().filter(|s| s.enabled).count();
         info!(total = servers.len(), enabled, "Updating server list");
+        // Update connection tracker limits
+        for server in &servers {
+            self.conn_tracker
+                .set_limit(&server.id, server.connections as usize);
+        }
         *self.servers.lock() = servers;
 
         // Auto-resume jobs paused by server errors now that config changed
@@ -2197,8 +2219,42 @@ impl QueueManager {
                     }
                 }
 
-                // Periodic disk space check (every 30 seconds)
+                // Periodic connection count + disk space checks (every 30 seconds)
                 tick_count += 1;
+                if tick_count.is_multiple_of(30) {
+                    // Log active NNTP connections per server
+                    let snapshot = qm.conn_tracker.snapshot();
+                    let total: usize = snapshot.iter().map(|(_, c, _)| *c).sum();
+                    if total > 0 {
+                        for (server_id, count, limit) in &snapshot {
+                            if *count > 0 {
+                                let server_name = qm
+                                    .servers
+                                    .lock()
+                                    .iter()
+                                    .find(|s| s.id == *server_id)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_else(|| server_id.clone());
+                                if *limit > 0 && *count > *limit {
+                                    warn!(
+                                        server = %server_name,
+                                        active = count,
+                                        limit,
+                                        "NNTP connections EXCEED limit"
+                                    );
+                                } else {
+                                    info!(
+                                        server = %server_name,
+                                        active = count,
+                                        limit,
+                                        "NNTP connection count"
+                                    );
+                                }
+                            }
+                        }
+                        info!(total_nntp_connections = total, "NNTP connection summary");
+                    }
+                }
                 if tick_count.is_multiple_of(30) && qm.min_free_space > 0 {
                     let free = get_disk_free(&qm.incomplete_dir.lock());
                     if free > 0
