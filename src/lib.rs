@@ -2,6 +2,7 @@ pub use nzb_decode;
 pub use nzb_postproc;
 pub use nzb_postproc::nzb_core;
 
+pub mod article_failure;
 pub mod auth;
 pub mod bandwidth;
 pub mod dir_watcher;
@@ -16,6 +17,7 @@ pub mod startup;
 pub mod state;
 pub mod util;
 
+pub use article_failure::{ArticleFailure, ArticleFailureKind};
 pub use log_buffer::{LogBuffer, LogBufferLayer};
 pub use queue_manager::QueueManager;
 pub use startup::{StartupConfig, StartupResult};

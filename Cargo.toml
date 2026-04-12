@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -11,6 +11,7 @@ default = []
 groups-db = ["nzb-postproc/groups-db"]
 
 [dependencies]
+nzb-nntp = { version = "0.2.9", registry = "forgejo" }
 nzb-decode = { version = "0.1.2", registry = "forgejo" }
 nzb-postproc = { version = "0.2.5", registry = "forgejo" }
 axum = { version = "0.8", features = ["multipart"] }
@@ -49,3 +50,5 @@ unused = "warn"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+nzb-nntp = { version = "0.2.9", registry = "forgejo", features = ["test-support"] }
+yenc-simd = { version = "0.1", registry = "forgejo" }

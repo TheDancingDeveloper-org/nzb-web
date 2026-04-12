@@ -116,12 +116,22 @@ impl SpeedTracker {
 // ---------------------------------------------------------------------------
 
 /// Tracks article failure statistics for a single job to determine
-/// whether it can possibly complete. Implements a three-tier check:
+/// whether it can possibly complete. Implements a four-tier check:
 ///
 /// 1. **Grace period** — ignore the first few failures (par2 can repair minor gaps)
-/// 2. **Early failure check** — if most of the first N articles fail, abort fast
+/// 2. **Early failure check** — if most articles fail, abort fast (Phase 6:
+///    no longer capped to the first 25% of articles; the check runs
+///    continuously while the job is downloading)
 /// 3. **Ongoing availability** — track bytes missing vs total (excluding par2)
+/// 4. **No-progress timeout** — Phase 6 addition. Fires when the tracker
+///    has been alive for longer than `no_progress_timeout` without ever
+///    seeing an article complete. Catches the zombie scenario where
+///    workers cycle silently (Phase 5 evicts them) but no failure is ever
+///    recorded against the job.
 struct HopelessTracker {
+    /// When the tracker (and therefore the download attempt) was instantiated.
+    /// Used by `time_based_check` to detect long-running zombie jobs.
+    created_at: Instant,
     /// Total content bytes (excluding par2 files).
     content_bytes: u64,
     /// Total par2 bytes (tracked for diagnostics, not used in ratio calculation).
@@ -160,6 +170,7 @@ impl HopelessTracker {
         }
 
         Self {
+            created_at: Instant::now(),
             content_bytes,
             par2_bytes,
             content_bytes_missing: 0,
@@ -178,9 +189,25 @@ impl HopelessTracker {
 
     /// Record a failed content article. Returns the estimated byte size
     /// of the missing article.
-    fn record_failure(&mut self, is_par2: bool, estimated_bytes: u64) {
-        if !is_par2 {
-            self.content_articles_checked += 1;
+    ///
+    /// Phase 6: takes a typed [`ArticleFailureKind`] so the tracker can
+    /// ignore failures that are likely transient (server-down, auth, etc.)
+    /// and only count failures that genuinely indicate the article cannot
+    /// be retrieved (NotFound, DecodeError).
+    fn record_failure(
+        &mut self,
+        is_par2: bool,
+        estimated_bytes: u64,
+        kind: crate::article_failure::ArticleFailureKind,
+    ) {
+        if is_par2 {
+            return;
+        }
+        self.content_articles_checked += 1;
+        // Only failures that count toward "definitively not retrievable"
+        // increment the failed counter and missing-bytes total. A 502 or
+        // AuthFailed on one server doesn't mean the article is gone.
+        if kind.counts_toward_hopeless() {
             self.content_articles_failed += 1;
             self.content_bytes_missing += estimated_bytes;
         }
@@ -188,13 +215,15 @@ impl HopelessTracker {
 
     /// Check whether the job should be aborted.
     ///
-    /// Returns `Some(reason)` if the job is hopeless, `None` if it should continue.
+    /// Returns `Some(HopelessAbort)` if the job is hopeless, carrying both
+    /// the human-readable reason and a stable `tier` label that operators
+    /// can filter logs by. `None` means the job should continue.
     fn check(
         &self,
         abort_hopeless: bool,
         early_failure_check: bool,
         required_completion_pct: f64,
-    ) -> Option<String> {
+    ) -> Option<HopelessAbort> {
         if !abort_hopeless {
             return None;
         }
@@ -204,21 +233,27 @@ impl HopelessTracker {
             return None;
         }
 
-        // Tier 2: early failure check — catch completely dead NZBs fast
-        if early_failure_check
-            && self.content_articles_checked >= EARLY_CHECK_MIN_ARTICLES
-            && self.content_articles_checked <= self.content_articles_total / 4
-        {
+        // Tier 2: early failure check — catch completely dead NZBs fast.
+        // Phase 6: removed the `<= total/4` window upper bound. The check
+        // now fires whenever the failure rate is above the threshold AND
+        // there are enough samples to be statistically meaningful. The old
+        // window was a footgun: slow-trickle failures crept past the 25%
+        // mark before the rate accumulated, and tier 3's bytes-availability
+        // check wouldn't fire until many more bytes were confirmed missing.
+        if early_failure_check && self.content_articles_checked >= EARLY_CHECK_MIN_ARTICLES {
             let failure_rate =
                 self.content_articles_failed as f64 / self.content_articles_checked as f64;
             if failure_rate >= EARLY_CHECK_FAILURE_RATE {
-                return Some(format!(
-                    "Aborted: {:.0}% of first {} articles missing ({} of {} failed)",
-                    failure_rate * 100.0,
-                    self.content_articles_checked,
-                    self.content_articles_failed,
-                    self.content_articles_checked,
-                ));
+                return Some(HopelessAbort {
+                    tier: "early_failure",
+                    reason: format!(
+                        "Aborted: {:.0}% of {} checked articles missing ({} of {} failed)",
+                        failure_rate * 100.0,
+                        self.content_articles_checked,
+                        self.content_articles_failed,
+                        self.content_articles_checked,
+                    ),
+                });
             }
         }
 
@@ -229,15 +264,52 @@ impl HopelessTracker {
                 .saturating_sub(self.content_bytes_missing);
             let availability_pct = 100.0 * available_bytes as f64 / self.content_bytes as f64;
             if availability_pct < required_completion_pct {
-                return Some(format!(
-                    "Aborted: only {availability_pct:.1}% of content available \
-                     (need {required_completion_pct:.1}%), \
-                     {} of {} content articles missing",
-                    self.content_articles_failed, self.content_articles_total,
-                ));
+                return Some(HopelessAbort {
+                    tier: "ongoing_availability",
+                    reason: format!(
+                        "Aborted: only {availability_pct:.1}% of content available \
+                         (need {required_completion_pct:.1}%), \
+                         {} of {} content articles missing",
+                        self.content_articles_failed, self.content_articles_total,
+                    ),
+                });
             }
         }
 
+        None
+    }
+}
+
+/// Result of a positive [`HopelessTracker::check`] — both the reason string
+/// (for the user-visible error_message) and a stable `tier` label so logs
+/// and metrics can be grouped by which heuristic fired.
+#[derive(Debug, Clone)]
+pub(crate) struct HopelessAbort {
+    pub tier: &'static str,
+    pub reason: String,
+}
+
+impl HopelessTracker {
+    /// Phase 6: time-based hopeless check. Operates on the tracker's
+    /// `created_at` field, not on article counters, so it fires even when
+    /// the engine has stopped emitting progress events entirely (the
+    /// zombie scenario).
+    ///
+    /// Aborts if the tracker has been alive longer than `timeout` AND
+    /// no successful article has ever been recorded against it. The
+    /// caller is the queue manager's periodic tick — see
+    /// [`QueueManager::scan_for_no_progress_jobs`].
+    fn time_based_check(&self, timeout: Duration) -> Option<HopelessAbort> {
+        let elapsed = self.created_at.elapsed();
+        if elapsed >= timeout && self.content_articles_checked == 0 {
+            return Some(HopelessAbort {
+                tier: "no_progress_timeout",
+                reason: format!(
+                    "Aborted: no article completed or failed within {}s of starting download",
+                    elapsed.as_secs()
+                ),
+            });
+        }
         None
     }
 }
@@ -302,6 +374,10 @@ pub struct QueueManager {
     direct_unpack_enabled: AtomicBool,
     /// Abort downloads that cannot possibly complete.
     abort_hopeless: bool,
+    /// Phase 6: maximum time a job may sit in `Downloading` without any
+    /// article event before the time-based hopeless tier fires. Settable
+    /// at runtime via [`Self::set_no_progress_timeout`].
+    no_progress_timeout: Mutex<Duration>,
     /// Quick initial failure check on first N articles.
     early_failure_check: bool,
     /// Global NNTP connection tracker (shared across all download jobs).
@@ -341,10 +417,10 @@ impl QueueManager {
         };
         let bandwidth = Arc::new(BandwidthLimiter::new(BandwidthConfig { download_bps }));
 
-        // Build connection tracker with per-server limits
+        // Build connection tracker with per-server limits.
         let conn_tracker = Arc::new(ConnectionTracker::new());
         for server in &servers {
-            conn_tracker.set_limit(&server.id, server.connections as usize);
+            conn_tracker.set_limit(&server.id, &server.name, server.connections as usize);
         }
 
         let servers_arc = Arc::new(Mutex::new(servers));
@@ -378,6 +454,10 @@ impl QueueManager {
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
+            // Phase 6: 5-minute default. Long enough that a slow first
+            // article doesn't accidentally abort a real download; short
+            // enough that an obvious zombie is killed within minutes.
+            no_progress_timeout: Mutex::new(Duration::from_secs(300)),
         })
     }
 
@@ -394,6 +474,81 @@ impl QueueManager {
     /// Set history retention limit.
     pub fn set_history_retention(&self, limit: Option<usize>) {
         *self.history_retention.lock() = limit;
+    }
+
+    /// Per-server `(server_id, active, limit)` triples for the live NNTP
+    /// connection pool. `active` is by-construction `<= limit` because the
+    /// pool is semaphore-backed.
+    pub fn connection_snapshot(&self) -> Vec<(String, usize, usize)> {
+        self.conn_tracker.snapshot()
+    }
+
+    /// Total currently-held NNTP connection slots across all servers.
+    pub fn connection_total(&self) -> usize {
+        self.conn_tracker.total()
+    }
+
+    /// Override the worker idle eviction threshold (Phase 5 watchdog).
+    /// Test harnesses use this to make the eviction trigger in seconds.
+    pub fn set_max_worker_idle(&self, d: std::time::Duration) {
+        self.worker_pool.set_max_worker_idle(d);
+    }
+
+    /// Lifetime count of worker evictions performed by the Phase 5 idle
+    /// watchdog. Each increment means the supervisor reclaimed a worker
+    /// that had stalled past `max_worker_idle`.
+    pub fn worker_eviction_count(&self) -> u64 {
+        self.worker_pool.eviction_count()
+    }
+
+    /// Phase 6: override the time-based hopeless threshold. Tests use this
+    /// to make the no-progress watchdog converge in seconds.
+    pub fn set_no_progress_timeout(&self, d: std::time::Duration) {
+        *self.no_progress_timeout.lock() = d;
+    }
+
+    /// Phase 6: scan all active jobs and abort any whose hopeless tracker
+    /// reports a `no_progress_timeout` tier. Called from the speed-tracker
+    /// tick (1Hz). Cheap when there's nothing to abort — just a tracker
+    /// `Instant::elapsed()` per job.
+    fn scan_for_no_progress_jobs(self: &Arc<Self>) {
+        if !self.abort_hopeless {
+            return;
+        }
+        let timeout = *self.no_progress_timeout.lock();
+
+        // Snapshot the (job_id, abort) pairs under the jobs lock, then
+        // release before calling abort_job (which re-acquires).
+        let mut to_abort: Vec<(String, HopelessAbort)> = Vec::new();
+        {
+            let jobs = self.jobs.lock();
+            for (id, state) in jobs.iter() {
+                if !matches!(state.job.status, JobStatus::Downloading) {
+                    continue;
+                }
+                if let Some(ref tracker) = state.hopeless_tracker
+                    && let Some(abort) = tracker.time_based_check(timeout)
+                {
+                    to_abort.push((id.clone(), abort));
+                }
+            }
+        }
+
+        for (job_id, abort) in to_abort {
+            warn!(
+                job_id = %job_id,
+                tier = abort.tier,
+                reason = %abort.reason,
+                "Job is hopeless (no-progress timeout) — aborting"
+            );
+            {
+                let mut jobs = self.jobs.lock();
+                if let Some(state) = jobs.get_mut(&job_id) {
+                    state.job.error_message = Some(abort.reason.clone());
+                }
+            }
+            self.worker_pool.abort_job(&job_id, abort.reason);
+        }
     }
 
     /// Set max active downloads and start queued jobs if capacity allows.
@@ -655,7 +810,13 @@ impl QueueManager {
         );
 
         let job_speed = Arc::new(SpeedTracker::new());
-        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        // Phase 7: bounded progress channel. The handler reads at ~articles
+        // per second; under DB-lock contention or post-processing pauses it
+        // can fall behind. Unbounded was a memory hazard. With a 10K cap
+        // the worst case is bounded buffering plus a `WARN` from
+        // `try_send_or_warn` when the channel is full.
+        let (progress_tx, progress_rx) =
+            mpsc::channel::<ProgressUpdate>(crate::download_engine::PROGRESS_CHANNEL_CAPACITY);
 
         {
             let srv = self.servers.lock();
@@ -698,7 +859,7 @@ impl QueueManager {
     async fn handle_progress(
         self: Arc<Self>,
         job_id: String,
-        mut progress_rx: mpsc::UnboundedReceiver<ProgressUpdate>,
+        mut progress_rx: mpsc::Receiver<ProgressUpdate>,
         job_speed: Arc<SpeedTracker>,
     ) {
         let mut last_db_update = Instant::now();
@@ -820,37 +981,34 @@ impl QueueManager {
                     }
                 }
                 ProgressUpdate::ArticleFailed {
-                    file_id,
-                    error,
-                    server_id,
-                    ..
+                    file_id, failure, ..
                 } => {
+                    let _ = &failure.message; // forwarded into logs below
                     let should_abort = {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
                             state.job.articles_failed += 1;
 
                             // Update per-server failed stats
-                            if let Some(ref sid) = server_id {
-                                let stats = &mut state.job.server_stats;
-                                if let Some(ss) = stats.iter_mut().find(|s| s.server_id == *sid) {
-                                    ss.articles_failed += 1;
-                                } else {
-                                    let sname = self
-                                        .servers
-                                        .lock()
-                                        .iter()
-                                        .find(|s| s.id == *sid)
-                                        .map(|s| s.name.clone())
-                                        .unwrap_or_else(|| sid.clone());
-                                    stats.push(ServerArticleStats {
-                                        server_id: sid.clone(),
-                                        server_name: sname,
-                                        articles_downloaded: 0,
-                                        articles_failed: 1,
-                                        bytes_downloaded: 0,
-                                    });
-                                }
+                            let sid = &failure.server_id;
+                            let stats = &mut state.job.server_stats;
+                            if let Some(ss) = stats.iter_mut().find(|s| s.server_id == *sid) {
+                                ss.articles_failed += 1;
+                            } else {
+                                let sname = self
+                                    .servers
+                                    .lock()
+                                    .iter()
+                                    .find(|s| s.id == *sid)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_else(|| sid.clone());
+                                stats.push(ServerArticleStats {
+                                    server_id: sid.clone(),
+                                    server_name: sname,
+                                    articles_downloaded: 0,
+                                    articles_failed: 1,
+                                    bytes_downloaded: 0,
+                                });
                             }
 
                             // Abort direct unpack on first article failure —
@@ -886,7 +1044,7 @@ impl QueueManager {
                                         }
                                     })
                                     .unwrap_or(0);
-                                tracker.record_failure(file_is_par2, estimated_bytes);
+                                tracker.record_failure(file_is_par2, estimated_bytes, failure.kind);
                                 tracker.check(
                                     self.abort_hopeless,
                                     self.early_failure_check,
@@ -900,20 +1058,30 @@ impl QueueManager {
                         }
                     };
 
-                    if let Some(reason) = should_abort {
-                        warn!(job_id = %job_id, reason = %reason, "Job is hopeless — aborting");
+                    if let Some(abort) = should_abort {
+                        warn!(
+                            job_id = %job_id,
+                            tier = abort.tier,
+                            reason = %abort.reason,
+                            "Job is hopeless — aborting"
+                        );
                         {
                             let mut jobs = self.jobs.lock();
                             if let Some(state) = jobs.get_mut(&job_id) {
-                                state.job.error_message = Some(reason.clone());
+                                state.job.error_message = Some(abort.reason.clone());
                             }
                         }
                         // Tell the worker pool to drain the job and emit
                         // JobAborted — the JobAborted arm below handles the
                         // rest of the teardown.
-                        self.worker_pool.abort_job(&job_id, reason);
+                        self.worker_pool.abort_job(&job_id, abort.reason);
                     } else {
-                        warn!(job_id = %job_id, "Article failed: {error}");
+                        warn!(
+                            job_id = %job_id,
+                            kind = failure.kind.as_str(),
+                            server = %failure.server_id,
+                            "Article failed: {}", failure.message
+                        );
                     }
                 }
                 ProgressUpdate::JobFinished {
@@ -1698,10 +1866,27 @@ impl QueueManager {
     pub fn update_servers(self: &Arc<Self>, servers: Vec<ServerConfig>) {
         let enabled = servers.iter().filter(|s| s.enabled).count();
         info!(total = servers.len(), enabled, "Updating server list");
-        // Update connection tracker limits
+
+        // Reconcile the connection tracker:
+        //  - Updated/added servers: set_limit (grows in place or replaces).
+        //  - Removed servers: remove_server (orphans the slot, workers detect
+        //    via slot_is_current and exit on next iteration).
+        let new_ids: std::collections::HashSet<String> =
+            servers.iter().map(|s| s.id.clone()).collect();
+        let old_ids: Vec<String> = self
+            .conn_tracker
+            .snapshot()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect();
+        for old_id in &old_ids {
+            if !new_ids.contains(old_id) {
+                self.conn_tracker.remove_server(old_id);
+            }
+        }
         for server in &servers {
             self.conn_tracker
-                .set_limit(&server.id, server.connections as usize);
+                .set_limit(&server.id, &server.name, server.connections as usize);
         }
         *self.servers.lock() = servers;
 
@@ -2187,6 +2372,13 @@ impl QueueManager {
                     }
                 }
 
+                // Phase 6: time-based hopeless scan. Catches downloads
+                // that have been alive long enough without any progress
+                // event reaching the tracker (the zombie scenario, where
+                // workers cycle silently and never emit ArticleComplete
+                // or ArticleFailed).
+                qm.scan_for_no_progress_jobs();
+
                 // Periodic connection count + disk space checks (every 30 seconds)
                 tick_count += 1;
                 if tick_count.is_multiple_of(30) {
@@ -2261,6 +2453,7 @@ mod hopeless_tests {
     fn make_tracker(content_articles: usize, par2_articles: usize) -> HopelessTracker {
         let article_bytes: u64 = 750_000; // ~750KB per article
         HopelessTracker {
+            created_at: Instant::now(),
             content_bytes: content_articles as u64 * article_bytes,
             par2_bytes: par2_articles as u64 * article_bytes,
             content_bytes_missing: 0,
@@ -2275,7 +2468,11 @@ mod hopeless_tests {
         let mut t = make_tracker(1000, 50);
         // Fail 5 articles (at the grace threshold)
         for _ in 0..5 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         assert!(
             t.check(true, true, 100.2).is_none(),
@@ -2287,7 +2484,11 @@ mod hopeless_tests {
     fn grace_period_disabled_when_abort_hopeless_off() {
         let mut t = make_tracker(100, 10);
         for _ in 0..100 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         assert!(
             t.check(false, true, 100.2).is_none(),
@@ -2300,14 +2501,20 @@ mod hopeless_tests {
         let mut t = make_tracker(1000, 50);
         // Simulate: 8 failures, 2 successes out of first 10
         for _ in 0..8 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         for _ in 0..2 {
             t.record_success(false);
         }
         let result = t.check(true, true, 100.2);
         assert!(result.is_some(), "Should abort: 80% failure in first 10");
-        assert!(result.unwrap().contains("80%"));
+        let abort = result.unwrap();
+        assert_eq!(abort.tier, "early_failure");
+        assert!(abort.reason.contains("80%"));
     }
 
     #[test]
@@ -2315,7 +2522,11 @@ mod hopeless_tests {
         let mut t = make_tracker(1000, 50);
         // 7 failures, 3 successes = 70% failure
         for _ in 0..7 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         for _ in 0..3 {
             t.record_success(false);
@@ -2344,14 +2555,20 @@ mod hopeless_tests {
         let mut t = make_tracker(100, 10);
         // Fail all 100 content articles
         for _ in 0..100 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         let result = t.check(true, false, 100.0);
         assert!(
             result.is_some(),
             "Ongoing ratio should catch 100% failure even with early_check off"
         );
-        assert!(result.unwrap().contains("0.0%"));
+        let abort = result.unwrap();
+        assert_eq!(abort.tier, "ongoing_availability");
+        assert!(abort.reason.contains("0.0%"));
     }
 
     #[test]
@@ -2359,7 +2576,11 @@ mod hopeless_tests {
         let mut t = make_tracker(100, 50);
         // Fail 20 par2 articles — should not affect content tracking
         for _ in 0..20 {
-            t.record_failure(true, 750_000);
+            t.record_failure(
+                true,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         assert_eq!(t.content_articles_failed, 0);
         assert_eq!(t.content_bytes_missing, 0);
@@ -2372,7 +2593,11 @@ mod hopeless_tests {
         // Fail 10 out of 100 articles (10% missing)
         // availability = 90% < 100.2% → should abort
         for _ in 0..10 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         for _ in 0..40 {
             t.record_success(false);
@@ -2385,24 +2610,30 @@ mod hopeless_tests {
     }
 
     #[test]
-    fn early_check_only_fires_in_first_quarter() {
+    fn early_check_fires_continuously_after_phase_6() {
+        // Phase 6 removed the `<= total/4` window cap. Tier 2 now fires
+        // whenever the failure rate is high enough — even past the 25%
+        // mark. Previously this scenario would only trip tier 3
+        // (ongoing_availability); now tier 2 wins because it's checked
+        // first.
         let mut t = make_tracker(40, 5);
-        // Check 11 articles (> 25% of 40) — early check should NOT fire
-        // even though failure rate is high
         for _ in 0..9 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         for _ in 0..2 {
             t.record_success(false);
         }
-        // 11 checked, 9 failed = 81.8% failure
-        // But 11 > 40/4 = 10, so early check won't fire
-        // Ongoing ratio: 9 * 750KB missing / (40 * 750KB) = 22.5% missing → 77.5% available
-        // 77.5 < 100.0 → ongoing ratio fires
+        // 11 checked, 9 failed = 81.8% failure rate, well above the 80%
+        // threshold. Tier 2 should fire regardless of how many articles
+        // remain to check.
         let result = t.check(true, true, 100.0);
         assert!(result.is_some());
-        // Verify it's the ongoing ratio message, not the early check
-        assert!(result.unwrap().contains("available"));
+        let abort = result.unwrap();
+        assert_eq!(abort.tier, "early_failure");
     }
 
     #[test]
@@ -2410,7 +2641,11 @@ mod hopeless_tests {
         let mut t = make_tracker(10000, 500);
         // First 10 articles all fail — exactly the scenario from the bug report
         for _ in 0..10 {
-            t.record_failure(false, 750_000);
+            t.record_failure(
+                false,
+                750_000,
+                crate::article_failure::ArticleFailureKind::NotFound,
+            );
         }
         let result = t.check(true, true, 100.2);
         assert!(

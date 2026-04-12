@@ -71,86 +71,228 @@ const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
 /// Cooldown after transient connection failures exceed threshold.
 const TRANSIENT_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 /// Supervisor tick interval for detecting stuck jobs.
-const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(5);
+const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Default maximum idle time before a worker is evicted by the supervisor.
+/// Tunable per pool via [`WorkerPool::set_max_worker_idle`]. Production code
+/// uses the default; the test harness shrinks this to make Phase 5 tests
+/// converge in seconds rather than minutes.
+const DEFAULT_MAX_WORKER_IDLE: Duration = Duration::from_secs(60);
 /// Worker idle poll interval when the shared queue is empty.
 const WORKER_IDLE_POLL: Duration = Duration::from_millis(500);
 
+/// Phase 7: capacity of the per-job progress channel. The handler reads
+/// this at ~articles per second; under DB-lock contention or
+/// post-processing pauses it can fall behind. With this cap, the worst
+/// case is bounded buffering plus a `WARN` from
+/// [`try_send_progress`] when the channel is full.
+pub const PROGRESS_CHANNEL_CAPACITY: usize = 10_000;
+
+/// Send a progress update to the per-job channel. On `Full` (handler
+/// backpressure), log a warning and drop the update — the alternative is
+/// awaiting and stalling the worker, which would cascade into the entire
+/// download pipeline. On `Closed` (handler shut down), drop silently.
+///
+/// Workers should call this through their `JobContext` rather than
+/// touching `progress_tx` directly.
+fn try_send_progress(tx: &mpsc::Sender<ProgressUpdate>, job_id: &str, update: ProgressUpdate) {
+    if let Err(e) = tx.try_send(update) {
+        match e {
+            mpsc::error::TrySendError::Full(_) => {
+                warn!(
+                    job_id,
+                    capacity = PROGRESS_CHANNEL_CAPACITY,
+                    "Progress channel full — dropping update (handler backpressure)"
+                );
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                // Handler has shut down. Workers can't recover this state;
+                // dropping is correct.
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Global connection tracking
+// Global connection tracking — semaphore-backed permit pools
 // ---------------------------------------------------------------------------
 
-/// Tracks active NNTP connections per server for observability.
+/// Tracks the per-server NNTP connection budget. Each server has a
+/// `tokio::sync::Semaphore` whose initial permit count is the configured
+/// `connections` limit. Workers acquire a permit *before* connecting and
+/// hold it for their entire lifetime; the permit's `Drop` releases the slot
+/// synchronously back to the pool. This makes over-allocation a type-level
+/// impossibility — once `limit` permits are out, the next acquire awaits.
 ///
-/// With the shared worker pool, the per-server worker count is the hard cap
-/// on concurrent connections — this tracker exists to validate that invariant
-/// and to surface warnings if anything escapes the pool (e.g. future direct
-/// readers). Workers increment on connect, decrement on disconnect via
-/// [`ConnectionGuard`].
+/// **Limit changes at runtime** are handled differently for grow vs shrink:
+///
+/// - **Grow** (e.g. 5 → 10): the existing semaphore is given the additional
+///   permits via `add_permits`; existing slot holders are unaffected.
+/// - **Shrink** (e.g. 10 → 5): the entire `ServerSlot` is replaced with a
+///   fresh one. Old permit holders continue to reference the orphaned
+///   semaphore via their `Arc`; their drops release back to it (a no-op
+///   since nothing else points at it). Workers detect the replacement via
+///   [`ConnectionTracker::slot_is_current`] and exit on the next iteration.
 pub struct ConnectionTracker {
-    counts: Mutex<HashMap<String, Arc<AtomicUsize>>>,
-    limits: Mutex<HashMap<String, usize>>,
+    pools: Mutex<HashMap<String, ServerSlot>>,
+}
+
+#[derive(Clone)]
+struct ServerSlot {
+    name: String,
+    limit: usize,
+    semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl ConnectionTracker {
     pub fn new() -> Self {
         Self {
-            counts: Mutex::new(HashMap::new()),
-            limits: Mutex::new(HashMap::new()),
+            pools: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn set_limit(&self, server_id: &str, limit: usize) {
-        self.limits.lock().insert(server_id.to_string(), limit);
-    }
-
-    fn counter(&self, server_id: &str) -> Arc<AtomicUsize> {
-        let mut counts = self.counts.lock();
-        counts
-            .entry(server_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone()
-    }
-
-    pub fn connect(&self, server_id: &str, server_name: &str) -> usize {
-        let counter = self.counter(server_id);
-        let new_count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-        let limit = self.limits.lock().get(server_id).copied().unwrap_or(0);
-        if limit > 0 && new_count > limit {
-            warn!(
-                server = %server_name,
-                active = new_count,
-                limit,
-                "NNTP connections EXCEED configured limit"
-            );
+    /// Set or update the per-server connection limit.
+    ///
+    /// - First call for a `server_id`: creates a fresh semaphore with `limit` permits.
+    /// - Subsequent call with the same `limit` and `server_name`: no-op.
+    /// - Grow (`limit > current`): adds permits in place.
+    /// - Shrink or rename: replaces the slot. Old permit holders detach
+    ///   naturally via [`slot_is_current`].
+    pub fn set_limit(&self, server_id: &str, server_name: &str, limit: usize) {
+        let mut pools = self.pools.lock();
+        match pools.get_mut(server_id) {
+            Some(slot) if slot.limit == limit && slot.name == server_name => {
+                // No change.
+            }
+            Some(slot) if limit > slot.limit && slot.name == server_name => {
+                let added = limit - slot.limit;
+                let old = slot.limit;
+                slot.semaphore.add_permits(added);
+                slot.limit = limit;
+                info!(
+                    server_id,
+                    server = %server_name,
+                    old_limit = old,
+                    new_limit = limit,
+                    added,
+                    "Connection pool grew in place"
+                );
+            }
+            existing => {
+                // Capture diagnostics before re-borrowing `pools` for insert.
+                let (prev_limit, prev_name) = match existing {
+                    Some(s) => (Some(s.limit), Some(s.name.clone())),
+                    None => (None, None),
+                };
+                pools.insert(
+                    server_id.to_string(),
+                    ServerSlot {
+                        name: server_name.to_string(),
+                        limit,
+                        semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+                    },
+                );
+                if let Some(prev) = prev_limit {
+                    let renamed = prev_name.as_deref() != Some(server_name);
+                    info!(
+                        server_id,
+                        server = %server_name,
+                        old_limit = prev,
+                        new_limit = limit,
+                        renamed,
+                        "Connection pool replaced (shrink or rename); old permits orphaned"
+                    );
+                } else {
+                    info!(
+                        server_id,
+                        server = %server_name,
+                        limit,
+                        "Connection pool created"
+                    );
+                }
+            }
         }
-        new_count
     }
 
-    pub fn disconnect(&self, server_id: &str) {
-        let counter = self.counter(server_id);
-        let prev = counter.fetch_sub(1, Ordering::Relaxed);
-        if prev == 0 {
-            counter.store(0, Ordering::Relaxed);
+    /// Forget a server entirely (e.g. on `update_servers` removing it).
+    /// Existing permit holders are unaffected; they will detect that their
+    /// slot is no longer current and exit.
+    pub fn remove_server(&self, server_id: &str) {
+        self.pools.lock().remove(server_id);
+    }
+
+    /// Acquire a connection slot for `server_id`. Awaits if the pool is at
+    /// the limit. Returns `None` if the server isn't registered or its
+    /// limit is zero.
+    pub async fn acquire(&self, server_id: &str) -> Option<ConnectionSlot> {
+        // Snapshot the ServerSlot under lock, release the lock before await.
+        let server_slot = {
+            let pools = self.pools.lock();
+            pools.get(server_id).cloned()?
+        };
+        if server_slot.limit == 0 {
+            return None;
+        }
+        let permit = Arc::clone(&server_slot.semaphore)
+            .acquire_owned()
+            .await
+            .ok()?;
+        Some(ConnectionSlot {
+            server_id: server_id.to_string(),
+            server_name: server_slot.name,
+            semaphore_origin: server_slot.semaphore,
+            _permit: permit,
+        })
+    }
+
+    /// Returns true if `slot` was acquired from the *current* semaphore for
+    /// its server. False if the limit was changed (semaphore replaced) or
+    /// the server was removed — the worker should exit at its next safe
+    /// checkpoint.
+    pub fn slot_is_current(&self, slot: &ConnectionSlot) -> bool {
+        matches!(self.slot_status(slot), SlotStatus::Current)
+    }
+
+    /// Like [`slot_is_current`] but distinguishes the reason a slot is no
+    /// longer current — useful for diagnostics on the worker exit path.
+    pub fn slot_status(&self, slot: &ConnectionSlot) -> SlotStatus {
+        let pools = self.pools.lock();
+        match pools.get(&slot.server_id) {
+            Some(server_slot) => {
+                if Arc::ptr_eq(&server_slot.semaphore, &slot.semaphore_origin) {
+                    SlotStatus::Current
+                } else {
+                    SlotStatus::PoolReplaced
+                }
+            }
+            None => SlotStatus::ServerRemoved,
         }
     }
 
+    /// `(server_id, active, limit)` triples for the live pool. `active` is
+    /// derived from the semaphore's available permits and is always
+    /// `<= limit` by construction.
     pub fn snapshot(&self) -> Vec<(String, usize, usize)> {
-        let counts = self.counts.lock();
-        let limits = self.limits.lock();
-        counts
+        let pools = self.pools.lock();
+        pools
             .iter()
-            .map(|(id, count)| {
-                let limit = limits.get(id).copied().unwrap_or(0);
-                (id.clone(), count.load(Ordering::Relaxed), limit)
+            .map(|(id, slot)| {
+                let active = slot
+                    .limit
+                    .saturating_sub(slot.semaphore.available_permits());
+                (id.clone(), active, slot.limit)
             })
             .collect()
     }
 
+    /// Total currently-held permits across all servers in the live pool.
+    /// Permits held against orphaned (replaced) semaphores are NOT counted —
+    /// they'll go away as the holding workers exit.
     pub fn total(&self) -> usize {
-        self.counts
-            .lock()
+        let pools = self.pools.lock();
+        pools
             .values()
-            .map(|c| c.load(Ordering::Relaxed))
+            .map(|s| s.limit.saturating_sub(s.semaphore.available_permits()))
             .sum()
     }
 }
@@ -161,29 +303,38 @@ impl Default for ConnectionTracker {
     }
 }
 
-/// RAII guard that decrements the connection counter on drop.
-struct ConnectionGuard {
+/// Why a `ConnectionSlot` may no longer match its server's live pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotStatus {
+    /// Slot is still attached to the current semaphore for its server.
+    Current,
+    /// The semaphore was replaced (set_limit shrunk or rebuilt the pool).
+    /// Old permit holders should exit at their next safe checkpoint.
+    PoolReplaced,
+    /// The server has been removed entirely from the tracker.
+    ServerRemoved,
+}
+
+/// RAII handle for one acquired NNTP connection slot. The underlying
+/// semaphore permit is released synchronously on drop. Workers should hold
+/// a `ConnectionSlot` for their entire lifetime — across reconnects, even
+/// across temporary connect failures — and only drop it when exiting.
+pub struct ConnectionSlot {
     server_id: String,
-    tracker: Arc<ConnectionTracker>,
-    active: bool,
+    server_name: String,
+    /// The Arc identity of the semaphore the permit was issued by.
+    /// Used by `ConnectionTracker::slot_is_current` to detect a stale slot
+    /// after a `set_limit` shrink (which replaces the semaphore).
+    semaphore_origin: Arc<tokio::sync::Semaphore>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
-impl ConnectionGuard {
-    fn new(tracker: Arc<ConnectionTracker>, server_id: &str, server_name: &str) -> Self {
-        tracker.connect(server_id, server_name);
-        Self {
-            server_id: server_id.to_string(),
-            tracker,
-            active: true,
-        }
+impl ConnectionSlot {
+    pub fn server_id(&self) -> &str {
+        &self.server_id
     }
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        if self.active {
-            self.tracker.disconnect(&self.server_id);
-        }
+    pub fn server_name(&self) -> &str {
+        &self.server_name
     }
 }
 
@@ -258,12 +409,14 @@ pub enum ProgressUpdate {
         file_complete: bool,
         server_id: Option<String>,
     },
+    /// An article could not be retrieved. `failure` carries the typed
+    /// classification of *why* (NotFound, ServerDown, AuthFailed, …).
+    /// See `crate::article_failure` for the taxonomy.
     ArticleFailed {
         job_id: String,
         file_id: String,
         segment_number: u32,
-        error: String,
-        server_id: Option<String>,
+        failure: crate::article_failure::ArticleFailure,
     },
     JobFinished {
         job_id: String,
@@ -310,7 +463,7 @@ pub(crate) struct JobContext {
     pub job_id: String,
     pub work_dir: PathBuf,
     pub assembler: Arc<FileAssembler>,
-    pub progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
+    pub progress_tx: mpsc::Sender<ProgressUpdate>,
     pub yenc_names: Arc<Mutex<HashMap<String, String>>>,
     pub nzb_filenames: HashMap<String, String>,
     /// Articles that still need a definitive result (success or all-server
@@ -339,7 +492,7 @@ impl JobContext {
     fn new(
         job: &NzbJob,
         assembler: Arc<FileAssembler>,
-        progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
+        progress_tx: mpsc::Sender<ProgressUpdate>,
         total_articles: usize,
     ) -> Self {
         let nzb_filenames = job
@@ -415,19 +568,27 @@ impl JobContext {
 
         let abort_reason = self.abort_reason.lock().clone();
         if let Some(reason) = abort_reason {
-            let _ = self.progress_tx.send(ProgressUpdate::JobAborted {
-                job_id: self.job_id.clone(),
-                reason,
-            });
+            try_send_progress(
+                &self.progress_tx,
+                &self.job_id,
+                ProgressUpdate::JobAborted {
+                    job_id: self.job_id.clone(),
+                    reason,
+                },
+            );
             return;
         }
 
         let failed = self.articles_failed.load(Ordering::Relaxed);
-        let _ = self.progress_tx.send(ProgressUpdate::JobFinished {
-            job_id: self.job_id.clone(),
-            success: failed == 0,
-            articles_failed: failed,
-        });
+        try_send_progress(
+            &self.progress_tx,
+            &self.job_id,
+            ProgressUpdate::JobFinished {
+                job_id: self.job_id.clone(),
+                success: failed == 0,
+                articles_failed: failed,
+            },
+        );
     }
 
     /// Choose the best filename between NZB subject and yEnc header per file
@@ -541,6 +702,21 @@ impl SharedWorkQueue {
         self.notify.notify_waiters();
     }
 
+    /// `(workable, total)` for `server_id`. `workable` is the number of
+    /// items in the queue that have NOT yet been tried on `server_id`;
+    /// `total` is the queue length. Used by the supervisor's starvation
+    /// diagnostic — if `workable == 0` while `total > 0`, the server has
+    /// items it can't service and the operator should know.
+    pub(crate) fn workable_count_for(&self, server_id: &str) -> (usize, usize) {
+        let q = self.inner.lock();
+        let total = q.len();
+        let workable = q
+            .iter()
+            .filter(|i| !i.tried_servers.iter().any(|s| s == server_id))
+            .count();
+        (workable, total)
+    }
+
     /// Pop the next item that can be processed by a worker on `server_id`.
     ///
     /// Skips items that have already tried `server_id`, rotating them to the
@@ -593,6 +769,11 @@ impl Default for SharedWorkQueue {
 
 struct ActiveWorker {
     shutdown: Arc<AtomicBool>,
+    /// Worker heartbeat: monotonic millis since pool creation
+    /// (`WorkerPool::created_at`). Updated by the worker on every
+    /// "definitive progress" event (successful decode or definitive
+    /// failure). The supervisor reads this to detect zombie workers.
+    last_progress: Arc<AtomicU64>,
     handle: JoinHandle<()>,
 }
 
@@ -605,6 +786,20 @@ pub struct WorkerPool {
     bandwidth: Arc<BandwidthLimiter>,
     conn_tracker: Arc<ConnectionTracker>,
     stall_timeout: Option<Duration>,
+    /// Reference epoch for worker heartbeats. All `last_progress` values
+    /// store millis elapsed since this instant.
+    created_at: Instant,
+    /// Idle threshold above which the supervisor evicts a worker.
+    /// Mutable so the harness (and runtime config reload) can adjust it
+    /// without recreating the pool.
+    max_worker_idle: Mutex<Duration>,
+    /// Per-server "last starvation log" timestamp; rate-limits the
+    /// "no workable items" diagnostic to once per minute per server.
+    starvation_log: Mutex<HashMap<String, Instant>>,
+    /// Lifetime count of worker evictions performed by the heartbeat
+    /// watchdog. Useful for tests and observability — a non-zero value
+    /// means at least one worker stalled long enough to be reclaimed.
+    evictions: AtomicU64,
     workers: Mutex<HashMap<String, Vec<ActiveWorker>>>,
     shutdown: Arc<AtomicBool>,
     supervisor_handle: Mutex<Option<JoinHandle<()>>>,
@@ -630,10 +825,39 @@ impl WorkerPool {
             bandwidth,
             conn_tracker,
             stall_timeout,
+            created_at: Instant::now(),
+            max_worker_idle: Mutex::new(DEFAULT_MAX_WORKER_IDLE),
+            starvation_log: Mutex::new(HashMap::new()),
+            evictions: AtomicU64::new(0),
             workers: Mutex::new(HashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
             supervisor_handle: Mutex::new(None),
         })
+    }
+
+    /// Override the worker idle eviction threshold. Tests use this to make
+    /// the supervisor's heartbeat check converge in seconds.
+    pub fn set_max_worker_idle(&self, d: Duration) {
+        *self.max_worker_idle.lock() = d;
+    }
+
+    /// Read current worker idle eviction threshold.
+    pub fn max_worker_idle(&self) -> Duration {
+        *self.max_worker_idle.lock()
+    }
+
+    /// Millis elapsed since the pool was constructed. Used as the
+    /// monotonic clock for `ActiveWorker::last_progress`.
+    fn elapsed_ms(&self) -> u64 {
+        self.created_at.elapsed().as_millis() as u64
+    }
+
+    /// Lifetime count of worker evictions performed by the heartbeat
+    /// watchdog. Increases by 1 each time the supervisor reclaims a stalled
+    /// worker. Test harnesses use this as a positive signal that the Phase
+    /// 5 idle watchdog actually fired.
+    pub fn eviction_count(&self) -> u64 {
+        self.evictions.load(Ordering::Relaxed)
     }
 
     /// Spawn workers for all currently enabled servers and start the
@@ -701,14 +925,19 @@ impl WorkerPool {
             let current = entry.len();
             for conn_idx in current..target {
                 let worker_shutdown = Arc::new(AtomicBool::new(false));
+                // Initialize heartbeat to *now* so the worker has a full
+                // grace period before its first eviction check.
+                let last_progress = Arc::new(AtomicU64::new(self.elapsed_ms()));
                 let pool = Arc::clone(self);
                 let server_clone = server.clone();
                 let ws_clone = Arc::clone(&worker_shutdown);
+                let lp_clone = Arc::clone(&last_progress);
                 let handle = tokio::spawn(async move {
-                    pool_worker(pool, server_clone, conn_idx, ws_clone).await;
+                    pool_worker(pool, server_clone, conn_idx, ws_clone, lp_clone).await;
                 });
                 entry.push(ActiveWorker {
                     shutdown: worker_shutdown,
+                    last_progress,
                     handle,
                 });
             }
@@ -784,17 +1013,23 @@ impl WorkerPool {
             return;
         };
         ctx.paused.store(true, Ordering::Relaxed);
-        let _ = ctx.progress_tx.send(ProgressUpdate::NoServersAvailable {
-            job_id: ctx.job_id.clone(),
-            reason,
-        });
+        try_send_progress(
+            &ctx.progress_tx,
+            &ctx.job_id,
+            ProgressUpdate::NoServersAvailable {
+                job_id: ctx.job_id.clone(),
+                reason,
+            },
+        );
         // Remove pending work for this job so other jobs aren't blocked.
         let _ = self.work_queue.drain_job(job_id);
     }
 
     /// Supervisor loop: periodically detects jobs whose remaining articles
     /// cannot possibly be fetched (all enabled servers circuit-broken or
-    /// already-tried), and marks them NoServersAvailable.
+    /// Per-tick checks that maintain pool health: idle-worker eviction,
+    /// dead-worker reaping, reconcile (respawn missing workers), starvation
+    /// diagnostics, and the legacy "all servers broken" pause.
     async fn supervisor_loop(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(SUPERVISOR_INTERVAL);
         loop {
@@ -803,6 +1038,48 @@ impl WorkerPool {
                 break;
             }
 
+            // ---------- 1. Heartbeat eviction ----------
+            // Compute idle threshold + current epoch outside the workers lock.
+            let now_ms = self.elapsed_ms();
+            let max_idle_ms = self.max_worker_idle().as_millis() as u64;
+
+            {
+                let workers = self.workers.lock();
+                for (server_id, list) in workers.iter() {
+                    for (idx, w) in list.iter().enumerate() {
+                        if w.shutdown.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        let last = w.last_progress.load(Ordering::Relaxed);
+                        let idle = now_ms.saturating_sub(last);
+                        if idle > max_idle_ms {
+                            warn!(
+                                server = %server_id,
+                                worker_idx = idx,
+                                idle_ms = idle,
+                                max_idle_ms,
+                                "Idle-worker watchdog: evicting stalled worker"
+                            );
+                            w.shutdown.store(true, Ordering::Relaxed);
+                            self.evictions.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+
+            // ---------- 2. Reap finished workers and respawn ----------
+            {
+                let mut workers = self.workers.lock();
+                for (_id, list) in workers.iter_mut() {
+                    list.retain(|w| !w.handle.is_finished());
+                }
+            }
+            // Reconcile fills any gaps left by reaped workers.
+            self.reconcile_servers();
+
+            // ---------- 3. Starvation diagnostic ----------
+            // For each enabled server: if the queue has items but none are
+            // workable for this server, log once per minute.
             let enabled_servers: Vec<String> = {
                 let srv = self.servers.lock();
                 srv.iter()
@@ -810,12 +1087,30 @@ impl WorkerPool {
                     .map(|s| s.id.clone())
                     .collect()
             };
+            let now_instant = Instant::now();
+            for sid in &enabled_servers {
+                let (workable, total) = self.work_queue.workable_count_for(sid);
+                if workable == 0 && total > 0 {
+                    let mut log = self.starvation_log.lock();
+                    let should_log = log
+                        .get(sid)
+                        .map(|t| now_instant.duration_since(*t) >= Duration::from_secs(60))
+                        .unwrap_or(true);
+                    if should_log {
+                        log.insert(sid.clone(), now_instant);
+                        info!(
+                            server = %sid,
+                            total_items = total,
+                            "Queue has items but none are workable for this server (every item has been tried here already)"
+                        );
+                    }
+                }
+            }
 
+            // ---------- 4. Legacy "all servers broken" pause ----------
             if enabled_servers.is_empty() {
                 continue;
             }
-
-            // Which servers are currently healthy?
             let healthy_servers: Vec<String> = {
                 let health = self.server_health.lock();
                 enabled_servers
@@ -824,12 +1119,9 @@ impl WorkerPool {
                     .cloned()
                     .collect()
             };
-
             let all_broken = healthy_servers.is_empty();
 
-            // Snapshot job contexts; don't hold the lock while sending.
             let ctxs: Vec<Arc<JobContext>> = self.job_contexts.lock().values().cloned().collect();
-
             for ctx in ctxs {
                 if ctx.articles_remaining.load(Ordering::Relaxed) == 0 {
                     continue;
@@ -901,11 +1193,17 @@ impl WorkerPool {
 /// Single pool worker. Owns an NNTP connection to `primary_server` and pulls
 /// items from the shared queue until `worker_shutdown` is flipped (server
 /// reconciled away, limit shrunk) or the pool shuts down.
+///
+/// The worker acquires its connection slot (a semaphore permit from the
+/// per-server pool) **before** the first connect attempt and holds it for
+/// the entire lifetime of the worker, across every reconnect. This bounds
+/// concurrent connections to `server.connections` by construction.
 async fn pool_worker(
     pool: Arc<WorkerPool>,
     primary_server: ServerConfig,
     conn_idx: usize,
     worker_shutdown: Arc<AtomicBool>,
+    last_progress: Arc<AtomicU64>,
 ) {
     let worker_id = format!("{}#{}", primary_server.id, conn_idx);
 
@@ -919,9 +1217,47 @@ async fn pool_worker(
         worker_shutdown.load(Ordering::Relaxed) || pool.shutdown.load(Ordering::Relaxed)
     };
 
+    // Acquire the slot up-front. If the server isn't registered or its limit
+    // is zero, the worker has nothing to do — exit.
+    let mut conn_slot = match pool.conn_tracker.acquire(&primary_server.id).await {
+        Some(slot) => slot,
+        None => {
+            info!(
+                worker = %worker_id,
+                server = %primary_server.name,
+                "No connection slot available (server removed or limit=0); worker exiting"
+            );
+            return;
+        }
+    };
+
     'reconnect: loop {
         if should_exit(&worker_shutdown, &pool) {
             return;
+        }
+
+        // If the limit was shrunk under us, the semaphore will have been
+        // replaced. Drop our (now-orphaned) slot and exit cleanly.
+        match pool.conn_tracker.slot_status(&conn_slot) {
+            SlotStatus::Current => {}
+            SlotStatus::PoolReplaced => {
+                info!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    reason = "pool_replaced",
+                    "Connection slot is stale (connection limit changed); worker exiting"
+                );
+                return;
+            }
+            SlotStatus::ServerRemoved => {
+                info!(
+                    worker = %worker_id,
+                    server = %primary_server.name,
+                    reason = "server_removed",
+                    "Connection slot is stale (server removed from tracker); worker exiting"
+                );
+                return;
+            }
         }
 
         // Check circuit breaker before connecting. Compute an owned bool
@@ -970,12 +1306,6 @@ async fn pool_worker(
             continue 'reconnect;
         }
 
-        let mut conn_guard = ConnectionGuard::new(
-            Arc::clone(&pool.conn_tracker),
-            &primary_server.id,
-            &primary_server.name,
-        );
-
         let pipe_depth = primary_server.pipelining.max(1);
         let active_conns = pool.conn_tracker.total();
         info!(
@@ -987,6 +1317,11 @@ async fn pool_worker(
             "Worker connected and ready"
         );
 
+        // NOTE: do not tick heartbeat here. Reconnects are *not* progress
+        // — counting them masks the zombie cycle (worker reconnects forever
+        // without ever decoding an article). The heartbeat is initialised
+        // to spawn time in `reconcile_servers`, which gives every worker a
+        // full grace period to first-connect and process its first article.
         let reconnect_needed = if pipe_depth <= 1 {
             run_worker_serial(
                 &pool,
@@ -994,7 +1329,8 @@ async fn pool_worker(
                 &worker_id,
                 &worker_shutdown,
                 &mut conn,
-                &mut conn_guard,
+                &mut conn_slot,
+                &last_progress,
             )
             .await
         } else {
@@ -1005,20 +1341,21 @@ async fn pool_worker(
                 pipe_depth,
                 &worker_shutdown,
                 &mut conn,
-                &mut conn_guard,
+                &mut conn_slot,
+                &last_progress,
             )
             .await
         };
 
         let _ = conn.quit().await;
-        drop(conn_guard);
 
         match reconnect_needed {
             WorkerExit::Reconnect => {
-                // Loop back to the top and reconnect.
+                // Loop back to the top and reconnect — slot is preserved.
                 continue 'reconnect;
             }
             WorkerExit::Exit => {
+                // Slot drops here when conn_slot goes out of scope.
                 return;
             }
         }
@@ -1080,7 +1417,8 @@ async fn run_worker_serial(
     worker_id: &str,
     worker_shutdown: &Arc<AtomicBool>,
     conn: &mut NntpConnection,
-    _conn_guard: &mut ConnectionGuard,
+    _conn_slot: &mut ConnectionSlot,
+    last_progress: &Arc<AtomicU64>,
 ) -> WorkerExit {
     let mut consecutive_errors: u32 = 0;
 
@@ -1158,26 +1496,35 @@ async fn run_worker_serial(
                 if let Some(n) = std::num::NonZeroU32::new(process_result.decoded_bytes as u32) {
                     let _ = pool.bandwidth.acquire_download(n).await;
                 }
-                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleComplete {
-                    job_id: item.job_id.clone(),
-                    file_id: item.file_id.clone(),
-                    segment_number: item.segment_number,
-                    decoded_bytes: process_result.decoded_bytes,
-                    file_complete: process_result.file_complete,
-                    server_id: Some(primary_server.id.clone()),
-                });
+                try_send_progress(
+                    &ctx.progress_tx,
+                    &item.job_id,
+                    ProgressUpdate::ArticleComplete {
+                        job_id: item.job_id.clone(),
+                        file_id: item.file_id.clone(),
+                        segment_number: item.segment_number,
+                        decoded_bytes: process_result.decoded_bytes,
+                        file_complete: process_result.file_complete,
+                        server_id: Some(primary_server.id.clone()),
+                    },
+                );
                 ctx.resolve_one();
+                // Heartbeat: definitive forward progress.
+                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
             }
             Err(ArticleError::ArticleNotFound) => {
-                handle_article_not_available(
+                if handle_article_not_available(
                     &mut item,
                     primary_server,
                     &pool.servers,
                     &pool.server_health,
                     &ctx,
                     &pool.work_queue,
+                    crate::article_failure::ArticleFailureKind::NotFound,
                     "Article not found on any server",
-                );
+                ) {
+                    last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                }
             }
             Err(ArticleError::ConnectionLost(msg)) => {
                 consecutive_errors += 1;
@@ -1204,32 +1551,43 @@ async fn run_worker_serial(
                 return WorkerExit::Reconnect;
             }
             Err(ArticleError::DecodeError(msg)) => {
-                handle_article_not_available(
+                if handle_article_not_available(
                     &mut item,
                     primary_server,
                     &pool.servers,
                     &pool.server_health,
                     &ctx,
                     &pool.work_queue,
+                    crate::article_failure::ArticleFailureKind::DecodeError,
                     &format!("Decode error: {msg}"),
-                );
+                ) {
+                    last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                }
             }
             Err(ArticleError::AssemblyError(msg)) => {
                 error!(article = %item.message_id, "Assembly error: {msg}");
-                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleFailed {
-                    job_id: item.job_id.clone(),
-                    file_id: item.file_id.clone(),
-                    segment_number: item.segment_number,
-                    error: format!("Assembly error: {msg}"),
-                    server_id: Some(primary_server.id.clone()),
-                });
+                try_send_progress(
+                    &ctx.progress_tx,
+                    &item.job_id,
+                    ProgressUpdate::ArticleFailed {
+                        job_id: item.job_id.clone(),
+                        file_id: item.file_id.clone(),
+                        segment_number: item.segment_number,
+                        failure: crate::article_failure::ArticleFailure::decode_error(
+                            &primary_server.id,
+                            format!("Assembly error: {msg}"),
+                        ),
+                    },
+                );
                 ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
                 ctx.resolve_one();
+                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker_pipelined(
     pool: &Arc<WorkerPool>,
     primary_server: &ServerConfig,
@@ -1237,7 +1595,8 @@ async fn run_worker_pipelined(
     pipe_depth: u8,
     worker_shutdown: &Arc<AtomicBool>,
     conn: &mut NntpConnection,
-    _conn_guard: &mut ConnectionGuard,
+    _conn_slot: &mut ConnectionSlot,
+    last_progress: &Arc<AtomicU64>,
 ) -> WorkerExit {
     let mut pipeline = Pipeline::new(pipe_depth);
     let mut in_flight_items: HashMap<u64, WorkItem> = HashMap::new();
@@ -1430,15 +1789,21 @@ async fn run_worker_pipelined(
                                     let _ = pool.bandwidth.acquire_download(n).await;
                                 }
                                 perf_bandwidth_us += bw_t.elapsed().as_micros() as u64;
-                                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleComplete {
-                                    job_id: item.job_id.clone(),
-                                    file_id: item.file_id.clone(),
-                                    segment_number: item.segment_number,
-                                    decoded_bytes: process_result.decoded_bytes,
-                                    file_complete: process_result.file_complete,
-                                    server_id: Some(primary_server.id.clone()),
-                                });
+                                try_send_progress(
+                                    &ctx.progress_tx,
+                                    &item.job_id,
+                                    ProgressUpdate::ArticleComplete {
+                                        job_id: item.job_id.clone(),
+                                        file_id: item.file_id.clone(),
+                                        segment_number: item.segment_number,
+                                        decoded_bytes: process_result.decoded_bytes,
+                                        file_complete: process_result.file_complete,
+                                        server_id: Some(primary_server.id.clone()),
+                                    },
+                                );
                                 ctx.resolve_one();
+                                // Heartbeat: definitive forward progress.
+                                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
 
                                 if perf_last_log.elapsed() >= PERF_LOG_INTERVAL {
                                     let elapsed = perf_last_log.elapsed().as_secs_f64();
@@ -1469,41 +1834,55 @@ async fn run_worker_pipelined(
                                 }
                             }
                             Err(ArticleError::DecodeError(msg)) => {
-                                handle_article_not_available(
+                                if handle_article_not_available(
                                     &mut item,
                                     primary_server,
                                     &pool.servers,
                                     &pool.server_health,
                                     &ctx,
                                     &pool.work_queue,
+                                    crate::article_failure::ArticleFailureKind::DecodeError,
                                     &format!("Decode error: {msg}"),
-                                );
+                                ) {
+                                    last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                                }
                             }
                             Err(ArticleError::AssemblyError(msg)) => {
                                 error!(article = %item.message_id, "Assembly error: {msg}");
-                                let _ = ctx.progress_tx.send(ProgressUpdate::ArticleFailed {
-                                    job_id: item.job_id.clone(),
-                                    file_id: item.file_id.clone(),
-                                    segment_number: item.segment_number,
-                                    error: format!("Assembly error: {msg}"),
-                                    server_id: Some(primary_server.id.clone()),
-                                });
+                                try_send_progress(
+                                    &ctx.progress_tx,
+                                    &item.job_id,
+                                    ProgressUpdate::ArticleFailed {
+                                        job_id: item.job_id.clone(),
+                                        file_id: item.file_id.clone(),
+                                        segment_number: item.segment_number,
+                                        failure:
+                                            crate::article_failure::ArticleFailure::decode_error(
+                                                &primary_server.id,
+                                                format!("Assembly error: {msg}"),
+                                            ),
+                                    },
+                                );
                                 ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
                                 ctx.resolve_one();
+                                last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
                             }
                             Err(_) => {}
                         }
                     }
                     Err(NntpError::ArticleNotFound(_)) => {
-                        handle_article_not_available(
+                        if handle_article_not_available(
                             &mut item,
                             primary_server,
                             &pool.servers,
                             &pool.server_health,
                             &ctx,
                             &pool.work_queue,
+                            crate::article_failure::ArticleFailureKind::NotFound,
                             "Article not found on any server",
-                        );
+                        ) {
+                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                        }
                     }
                     Err(NntpError::Connection(_) | NntpError::Io(_)) => {
                         warn!(
@@ -1526,15 +1905,23 @@ async fn run_worker_pipelined(
                     }
                     Err(e) => {
                         warn!(worker = %worker_id, article = %item.message_id, "Pipeline error: {e}");
-                        handle_article_not_available(
+                        let kind = crate::article_failure::ArticleFailure::from_nntp(
+                            &e,
+                            &primary_server.id,
+                        )
+                        .kind;
+                        if handle_article_not_available(
                             &mut item,
                             primary_server,
                             &pool.servers,
                             &pool.server_health,
                             &ctx,
                             &pool.work_queue,
+                            kind,
                             &format!("Pipeline error: {e}"),
-                        );
+                        ) {
+                            last_progress.store(pool.elapsed_ms(), Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -1677,8 +2064,14 @@ async fn connect_with_retry(
 // Helpers: re-queue, not-available routing, par2 sort key
 // ---------------------------------------------------------------------------
 
-/// Handle an article that's not available on this server (not found or decode
-/// error): mark the server as tried and either requeue or mark failed.
+/// Handle an article that's not available on this server (not found, decode
+/// error, etc.): mark the server as tried and either requeue or mark failed.
+///
+/// `kind` lets the failure be classified — if every server has been tried
+/// and the failure was per-server (NotFound, ServerDown, …), we promote it
+/// to a definitive `NotFound` for the hopeless tracker. DecodeError stays
+/// classified as DecodeError because it's typically not server-specific.
+#[allow(clippy::too_many_arguments)]
 fn handle_article_not_available(
     item: &mut WorkItem,
     primary_server: &ServerConfig,
@@ -1686,8 +2079,9 @@ fn handle_article_not_available(
     server_health: &ServerHealthMap,
     ctx: &Arc<JobContext>,
     work_queue: &Arc<SharedWorkQueue>,
+    kind: crate::article_failure::ArticleFailureKind,
     error_msg: &str,
-) {
+) -> bool {
     item.tried_servers.push(primary_server.id.clone());
     item.tries_on_current = 0;
 
@@ -1701,18 +2095,33 @@ fn handle_article_not_available(
     };
 
     if all_tried {
-        warn!(article = %item.message_id, "{error_msg}");
-        let _ = ctx.progress_tx.send(ProgressUpdate::ArticleFailed {
-            job_id: item.job_id.clone(),
-            file_id: item.file_id.clone(),
-            segment_number: item.segment_number,
-            error: error_msg.to_string(),
-            server_id: Some(primary_server.id.clone()),
-        });
+        warn!(article = %item.message_id, kind = kind.as_str(), "{error_msg}");
+        // Promote a per-server NotFound to a definitive NotFound now that
+        // every server has been exhausted. DecodeError keeps its kind.
+        let final_failure = if kind == crate::article_failure::ArticleFailureKind::DecodeError {
+            crate::article_failure::ArticleFailure::decode_error(
+                &primary_server.id,
+                error_msg.to_string(),
+            )
+        } else {
+            crate::article_failure::ArticleFailure::not_found_anywhere(&primary_server.id)
+        };
+        try_send_progress(
+            &ctx.progress_tx,
+            &item.job_id,
+            ProgressUpdate::ArticleFailed {
+                job_id: item.job_id.clone(),
+                file_id: item.file_id.clone(),
+                segment_number: item.segment_number,
+                failure: final_failure,
+            },
+        );
         ctx.articles_failed.fetch_add(1, Ordering::Relaxed);
         ctx.resolve_one();
+        true
     } else {
         work_queue.push_back(item.clone());
+        false
     }
 }
 
@@ -1801,7 +2210,7 @@ fn has_known_extension(name: &str) -> bool {
 /// JobContext. Called by QueueManager before [`WorkerPool::submit_job`].
 pub(crate) fn build_job_submission(
     job: &NzbJob,
-    progress_tx: mpsc::UnboundedSender<ProgressUpdate>,
+    progress_tx: mpsc::Sender<ProgressUpdate>,
 ) -> (Arc<JobContext>, Vec<WorkItem>) {
     let assembler = Arc::new(FileAssembler::new());
     for file in &job.files {
@@ -2150,5 +2559,113 @@ mod tests {
         assert_eq!(q.len(), 1);
         let remaining = q.pop_workable("srv1").unwrap();
         assert_eq!(remaining.job_id, "j2");
+    }
+
+    // -----------------------------------------------------------------------
+    // ConnectionTracker (Phase 4 — semaphore-backed slots)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn connection_tracker_acquire_releases_slot_on_drop() {
+        let t = ConnectionTracker::new();
+        t.set_limit("srv1", "Server 1", 2);
+        let s1 = t.acquire("srv1").await.unwrap();
+        let s2 = t.acquire("srv1").await.unwrap();
+        assert_eq!(t.total(), 2);
+        // Synchronous release on drop.
+        drop(s1);
+        assert_eq!(t.total(), 1);
+        drop(s2);
+        assert_eq!(t.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_tracker_blocks_at_limit() {
+        let t = Arc::new(ConnectionTracker::new());
+        t.set_limit("srv1", "Server 1", 1);
+        let _held = t.acquire("srv1").await.unwrap();
+
+        // Third acquire on a 1-slot pool must block. Wrap with a short
+        // timeout — if it does NOT time out, the cap was breached.
+        let t2 = Arc::clone(&t);
+        let res = tokio::time::timeout(Duration::from_millis(150), async move {
+            t2.acquire("srv1").await
+        })
+        .await;
+        assert!(
+            res.is_err(),
+            "second acquire should block while limit is reached"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_tracker_grow_in_place_lets_more_acquire() {
+        let t = ConnectionTracker::new();
+        t.set_limit("srv1", "Server 1", 2);
+        let _a = t.acquire("srv1").await.unwrap();
+        let _b = t.acquire("srv1").await.unwrap();
+        // No more capacity — but grow to 4 and we should be able to take 2
+        // more without releasing the existing slots.
+        t.set_limit("srv1", "Server 1", 4);
+        let _c = t.acquire("srv1").await.unwrap();
+        let _d = t.acquire("srv1").await.unwrap();
+        assert_eq!(t.total(), 4);
+    }
+
+    #[tokio::test]
+    async fn connection_tracker_shrink_marks_old_slots_stale() {
+        let t = ConnectionTracker::new();
+        t.set_limit("srv1", "Server 1", 4);
+        let s = t.acquire("srv1").await.unwrap();
+        assert!(t.slot_is_current(&s));
+
+        // Shrink to 1 — old semaphore is replaced.
+        t.set_limit("srv1", "Server 1", 1);
+        assert!(
+            !t.slot_is_current(&s),
+            "after shrink, the previously-acquired slot must be marked stale"
+        );
+
+        // The new pool starts empty (1 permit available, 0 in use). Old
+        // permit holder is no longer counted in `total()` because its
+        // semaphore is orphaned.
+        assert_eq!(t.total(), 0);
+
+        // We can still acquire from the new pool.
+        let new_slot = t.acquire("srv1").await.unwrap();
+        assert!(t.slot_is_current(&new_slot));
+        assert_eq!(t.total(), 1);
+    }
+
+    #[tokio::test]
+    async fn connection_tracker_remove_server_marks_slot_stale() {
+        let t = ConnectionTracker::new();
+        t.set_limit("srv1", "Server 1", 2);
+        let s = t.acquire("srv1").await.unwrap();
+        assert!(t.slot_is_current(&s));
+
+        t.remove_server("srv1");
+        assert!(
+            !t.slot_is_current(&s),
+            "after remove_server, the slot must be marked stale"
+        );
+        assert_eq!(t.total(), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_tracker_snapshot_reflects_active_count() {
+        let t = ConnectionTracker::new();
+        t.set_limit("srv1", "Server 1", 3);
+        t.set_limit("srv2", "Server 2", 5);
+
+        let _a1 = t.acquire("srv1").await.unwrap();
+        let _a2 = t.acquire("srv1").await.unwrap();
+        let _b1 = t.acquire("srv2").await.unwrap();
+
+        let mut snap = t.snapshot();
+        snap.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0], ("srv1".into(), 2, 3));
+        assert_eq!(snap[1], ("srv2".into(), 1, 5));
     }
 }
