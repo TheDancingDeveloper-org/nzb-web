@@ -5,11 +5,8 @@
 //! When all configured providers go silent mid-download (the production
 //! symptom: provider session killed after a stall reconnect storm, sockets
 //! still alive at the TCP layer but no NNTP responses ever arriving), the
-//! worker pool detects the idle workers via the Phase 5 heartbeat watchdog
-//! and evicts them. The connection slots drop, the workers exit, and the
-//! supervisor's reconcile pass either respawns fresh workers (which also
-//! get stuck and evicted in turn) or — if the queue can't be served by any
-//! healthy server — the job ultimately resolves out of `Downloading`.
+//! pool must eventually detect there's no real progress and abort the job
+//! — workers do not hold slots indefinitely.
 //!
 //! ## History
 //!
@@ -20,6 +17,18 @@
 //! timeout` that triggered a same-server reconnect rather than eviction.
 //! Phase 5 added an explicit `last_progress` heartbeat per worker plus a
 //! 1-second supervisor tick that evicts workers idle for too long.
+//!
+//! ## Update (byte-level liveness heartbeat)
+//!
+//! The idle watchdog's liveness signal is now socket-byte-level, not
+//! article-completion-level. This fixes false eviction of slow-but-working
+//! workers (provider throttling can make recv_ms approach the idle
+//! threshold per article). With byte-level ticks, the ARTICLE-hang case
+//! gets caught by per-article stall timeout → reconnect → welcome banner
+//! ticks heartbeat → ... so the worker-level watchdog correctly doesn't
+//! fire. Zombie detection is now delegated to the JOB-LEVEL
+//! `no_progress_timeout`, which observes that no articles ever complete
+//! or definitively fail. This test now verifies the job abort path.
 
 mod harness;
 
@@ -64,16 +73,19 @@ async fn hang_on_article_does_not_strand_workers() {
     )
     .await;
 
-    // Short article_timeout so the stall trips quickly. Short idle eviction
-    // threshold so the heartbeat watchdog converges in seconds rather than
-    // the production default of 60s.
+    // Short article_timeout so the per-article stall trips quickly, and a
+    // short no_progress_timeout so the job-level watchdog converges in
+    // seconds rather than the production default of 300s. With byte-level
+    // liveness ticks, worker-level eviction doesn't fire here (reconnect
+    // welcome reads keep the heartbeat fresh) — this is intentional, and
+    // the no-progress path is what actually catches the zombie.
     let engine = HarnessBuilder::new()
         .with_server(server)
         .article_timeout(2)
         .build();
     engine
         .queue_manager
-        .set_max_worker_idle(Duration::from_secs(8));
+        .set_no_progress_timeout(Duration::from_secs(6));
 
     let job_id = engine
         .submit_nzb_xml("zombie", fixture.xml)
@@ -93,22 +105,22 @@ async fn hang_on_article_does_not_strand_workers() {
         .await;
     assert!(workers_started, "workers never connected");
 
-    // Now the load-bearing assertion: the heartbeat watchdog must fire and
-    // evict at least one worker. With idle threshold = 8s and supervisor
-    // tick = 1s, an eviction should be observable within ~15s of the
-    // workers connecting and immediately stalling on ARTICLE.
-    let observed_eviction = engine
-        .wait_for(Duration::from_secs(20), |_| {
-            engine.queue_manager.worker_eviction_count() > 0
-        })
+    // Load-bearing assertion: the job must exit Downloading via the
+    // no-progress watchdog within a reasonable window. If it stays in
+    // Downloading forever, workers are stranded.
+    let resolved = engine
+        .wait_for_status(
+            &job_id,
+            Duration::from_secs(25),
+            &[JobStatus::Failed, JobStatus::Completed],
+        )
         .await;
 
     let final_view = engine.job(&job_id).expect("job present");
-    let evictions = engine.queue_manager.worker_eviction_count();
     assert!(
-        observed_eviction,
-        "ZOMBIE: heartbeat watchdog never fired — workers held slots indefinitely. \
-         status={}, downloaded={}, failed={}, evictions={}",
-        final_view.status, final_view.articles_downloaded, final_view.articles_failed, evictions
+        resolved,
+        "ZOMBIE: job never left Downloading — no-progress watchdog didn't fire. \
+         status={}, downloaded={}, failed={}",
+        final_view.status, final_view.articles_downloaded, final_view.articles_failed
     );
 }

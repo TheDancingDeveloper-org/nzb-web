@@ -895,6 +895,14 @@ impl WorkerPool {
         self.created_at.elapsed().as_millis() as u64
     }
 
+    /// Reference `Instant` used as the epoch for `last_progress` / heartbeat
+    /// timestamps. Exposed so the NNTP layer can share the same clock when
+    /// ticking its socket-liveness heartbeat — values then compare directly
+    /// against `self.elapsed_ms()` in the supervisor's idle-worker check.
+    fn created_at(&self) -> Instant {
+        self.created_at
+    }
+
     /// Collect server IDs with strictly higher priority (lower priority number)
     /// than `my_priority`, restricted to enabled + healthy (non-circuit-broken)
     /// servers. `my_server_id` is excluded (a server never blocks itself).
@@ -1381,6 +1389,14 @@ async fn pool_worker(
         );
 
         let mut conn = NntpConnection::new(worker_id.clone());
+        // Attach socket-liveness heartbeat BEFORE connect so every byte
+        // received — from the welcome banner onward — counts as progress.
+        // This is the fix for false-eviction of slow-but-working workers:
+        // previously `last_progress` only advanced on full article decode,
+        // so a worker receiving a 50-second article looked idle for the
+        // entire fetch. Now any line read from the socket keeps it alive.
+        // Matches SABnzbd's `nw.timeout` model (newswrapper.py:315).
+        conn.set_io_heartbeat(last_progress.clone(), pool.created_at());
         if let Err(e) = connect_with_retry(
             &mut conn,
             &primary_server,
