@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::nzb_core::config::ServerConfig;
 use crate::nzb_core::models::NzbJob;
@@ -1871,6 +1871,12 @@ async fn run_worker_pipelined(
 
         // Read one response.
         let recv_t = Instant::now();
+        trace!(
+            worker = %worker_id,
+            in_flight = in_flight_items.len(),
+            stall_timeout_secs = pool.stall_timeout.map(|d| d.as_secs()).unwrap_or(0),
+            "Pipeline: awaiting response"
+        );
         let result = if let Some(timeout) = pool.stall_timeout {
             match tokio::time::timeout(timeout, pipeline.receive_one(conn)).await {
                 Ok(r) => r,
@@ -2243,6 +2249,16 @@ fn handle_article_not_available(
         })
     };
 
+    debug!(
+        article = %item.message_id,
+        server = %primary_server.id,
+        kind = kind.as_str(),
+        tried_count = item.tried_servers.len(),
+        all_tried,
+        "Article returned error on this server"
+    );
+
+    // (debug log immediately below was added for observability)
     if all_tried {
         warn!(article = %item.message_id, kind = kind.as_str(), "{error_msg}");
         // Promote a per-server NotFound to a definitive NotFound now that
@@ -2269,7 +2285,14 @@ fn handle_article_not_available(
         ctx.resolve_one();
         true
     } else {
-        work_queue.push_back(item.clone());
+        // push_FRONT (not push_back): put the failed item at the front of the
+        // queue so the next eligible server picks it up IMMEDIATELY instead
+        // of queueing behind thousands of fresh items. Same-server workers
+        // rotate the item back via pop_workable's existing skip-and-push_back
+        // logic. This transforms a retention-dead NZB from "11+ minutes per
+        // article's full-server cascade" into "fractions of a second per
+        // cascade" — the dominant failure mode for hung downloads.
+        work_queue.push_front(item.clone());
         false
     }
 }
