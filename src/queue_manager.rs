@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{CategoryConfig, ServerConfig};
 use crate::nzb_core::db::Database;
@@ -1045,6 +1045,38 @@ impl QueueManager {
                                     })
                                     .unwrap_or(0);
                                 tracker.record_failure(file_is_par2, estimated_bytes, failure.kind);
+                                // Observability: dump tracker state on every
+                                // failure so operators can see the ratio
+                                // evolving towards hopeless-abort thresholds.
+                                // Helps diagnose "why does this job take 4
+                                // minutes to fail" — exposes grace period,
+                                // early_failure, and ongoing_availability
+                                // check progress in real time.
+                                let avail_bytes_pct = if tracker.content_bytes > 0 {
+                                    let avail: u64 = tracker
+                                        .content_bytes
+                                        .saturating_sub(tracker.content_bytes_missing);
+                                    100.0 * (avail as f64 / tracker.content_bytes as f64)
+                                } else {
+                                    100.0
+                                };
+                                let fail_rate = if tracker.content_articles_checked > 0 {
+                                    tracker.content_articles_failed as f64
+                                        / tracker.content_articles_checked as f64
+                                } else {
+                                    0.0
+                                };
+                                debug!(
+                                    job_id = %job_id,
+                                    checked = tracker.content_articles_checked,
+                                    failed = tracker.content_articles_failed,
+                                    total = tracker.content_articles_total,
+                                    failure_rate = format!("{fail_rate:.3}"),
+                                    availability_pct = format!("{avail_bytes_pct:.2}"),
+                                    required_pct = format!("{:.1}", self.required_completion_pct),
+                                    kind = failure.kind.as_str(),
+                                    "Hopeless tracker updated after article failure"
+                                );
                                 tracker.check(
                                     self.abort_hopeless,
                                     self.early_failure_check,
@@ -2378,6 +2410,117 @@ impl QueueManager {
                 // workers cycle silently and never emit ArticleComplete
                 // or ArticleFailed).
                 qm.scan_for_no_progress_jobs();
+
+                // Observability: every 10s, dump the state of every
+                // active download so operators can see at a glance what
+                // each job is doing — progress, failure ratio, hopeless
+                // tracker state, time since job start. This is the line
+                // to grep when users report "stuck at 0 KB/s" — it shows
+                // whether the engine is genuinely stuck, making slow
+                // progress, or burning through failed articles.
+                if tick_count.is_multiple_of(10) {
+                    let snapshots: Vec<_> = {
+                        let jobs = qm.jobs.lock();
+                        jobs.iter()
+                            .filter(|(_, s)| {
+                                matches!(
+                                    s.job.status,
+                                    JobStatus::Downloading
+                                        | JobStatus::Queued
+                                        | JobStatus::PostProcessing
+                                )
+                            })
+                            .map(|(id, s)| {
+                                let (
+                                    tracker_checked,
+                                    tracker_failed,
+                                    tracker_content_total,
+                                    tracker_elapsed_secs,
+                                    tracker_content_bytes,
+                                    tracker_content_missing,
+                                ) = s
+                                    .hopeless_tracker
+                                    .as_ref()
+                                    .map(|t| {
+                                        (
+                                            t.content_articles_checked,
+                                            t.content_articles_failed,
+                                            t.content_articles_total,
+                                            t.created_at.elapsed().as_secs(),
+                                            t.content_bytes,
+                                            t.content_bytes_missing,
+                                        )
+                                    })
+                                    .unwrap_or((0, 0, 0, 0, 0, 0));
+                                (
+                                    id.clone(),
+                                    s.job.name.clone(),
+                                    s.job.status,
+                                    s.job.articles_downloaded,
+                                    s.job.articles_failed,
+                                    s.job.article_count,
+                                    s.job.downloaded_bytes,
+                                    s.job.total_bytes,
+                                    s.speed.bps(),
+                                    tracker_checked,
+                                    tracker_failed,
+                                    tracker_content_total,
+                                    tracker_elapsed_secs,
+                                    tracker_content_bytes,
+                                    tracker_content_missing,
+                                )
+                            })
+                            .collect()
+                    };
+                    for (
+                        job_id,
+                        name,
+                        status,
+                        dl,
+                        failed,
+                        total_art,
+                        dl_bytes,
+                        total_bytes,
+                        bps,
+                        t_checked,
+                        t_failed,
+                        t_total,
+                        t_elapsed,
+                        t_bytes_total,
+                        t_bytes_missing,
+                    ) in snapshots
+                    {
+                        let pct_bytes = if total_bytes > 0 {
+                            (dl_bytes as f64 / total_bytes as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        let avail_pct = if t_bytes_total > 0 {
+                            let avail: u64 = t_bytes_total.saturating_sub(t_bytes_missing);
+                            100.0 * (avail as f64 / t_bytes_total as f64)
+                        } else {
+                            100.0
+                        };
+                        info!(
+                            job_id = %job_id,
+                            name = %name,
+                            status = %status,
+                            pct = format!("{pct_bytes:.1}"),
+                            dl_articles = dl,
+                            failed_articles = failed,
+                            total_articles = total_art,
+                            dl_bytes,
+                            total_bytes,
+                            kbps = bps / 1024,
+                            elapsed_secs = t_elapsed,
+                            tracker_checked = t_checked,
+                            tracker_failed = t_failed,
+                            tracker_total = t_total,
+                            availability_pct = format!("{avail_pct:.1}"),
+                            "Job status snapshot"
+                        );
+                    }
+                }
 
                 // Periodic connection count + disk space checks (every 30 seconds)
                 tick_count += 1;
