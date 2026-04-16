@@ -703,16 +703,34 @@ impl SharedWorkQueue {
     }
 
     /// `(workable, total)` for `server_id`. `workable` is the number of
-    /// items in the queue that have NOT yet been tried on `server_id`;
+    /// items in the queue that are eligible for a worker on `server_id`;
     /// `total` is the queue length. Used by the supervisor's starvation
     /// diagnostic — if `workable == 0` while `total > 0`, the server has
-    /// items it can't service and the operator should know.
-    pub(crate) fn workable_count_for(&self, server_id: &str) -> (usize, usize) {
+    /// items it can't service yet (either already tried, or waiting on a
+    /// higher-priority server).
+    ///
+    /// An item is "workable" for this server when:
+    /// - `server_id` is NOT in `item.tried_servers`, AND
+    /// - no healthy higher-priority server still needs to try it (i.e. every
+    ///   server in `higher_priority_servers` is already in `item.tried_servers`).
+    ///
+    /// Pass an empty slice when the caller has no strictly-higher-priority
+    /// peers (priority 0, single-server setups, or all peers circuit-broken).
+    pub(crate) fn workable_count_for(
+        &self,
+        server_id: &str,
+        higher_priority_servers: &[String],
+    ) -> (usize, usize) {
         let q = self.inner.lock();
         let total = q.len();
         let workable = q
             .iter()
             .filter(|i| !i.tried_servers.iter().any(|s| s == server_id))
+            .filter(|i| {
+                higher_priority_servers
+                    .iter()
+                    .all(|hp| i.tried_servers.contains(hp))
+            })
             .count();
         (workable, total)
     }
@@ -720,14 +738,39 @@ impl SharedWorkQueue {
     /// Pop the next item that can be processed by a worker on `server_id`.
     ///
     /// Skips items that have already tried `server_id`, rotating them to the
-    /// back of the queue. Returns `None` if the queue is empty or if every
-    /// item has already tried this server (the caller should sleep briefly).
-    fn pop_workable(&self, server_id: &str) -> Option<WorkItem> {
+    /// back of the queue. Also enforces server priority: items where any
+    /// healthy higher-priority server has not yet tried the article are
+    /// rotated to the back so the primary server sees them first.
+    ///
+    /// `higher_priority_servers` is a caller-prepared list of server IDs with
+    /// strictly higher priority (lower priority number) than the caller, filtered
+    /// to only enabled + healthy servers. See `run_worker_pipelined` and
+    /// `run_worker_serial` for the canonical computation. Empty slice disables
+    /// the priority gate (priority-0 servers, single-server setups, or all
+    /// higher-priority peers circuit-broken → backup can take over).
+    ///
+    /// Returns `None` if the queue is empty or if every item is either already
+    /// tried here or pending a higher-priority server.
+    fn pop_workable(
+        &self,
+        server_id: &str,
+        higher_priority_servers: &[String],
+    ) -> Option<WorkItem> {
         let mut q = self.inner.lock();
         let len = q.len();
         for _ in 0..len {
             let item = q.pop_front()?;
             if item.tried_servers.iter().any(|s| s == server_id) {
+                q.push_back(item);
+                continue;
+            }
+            // Priority gate: rotate back if any higher-priority server still
+            // needs to try this item. Matches SABnzbd's get_article() behaviour
+            // (sabnzbd/nzb/article.py:149-170).
+            if higher_priority_servers
+                .iter()
+                .any(|hp| !item.tried_servers.contains(hp))
+            {
                 q.push_back(item);
                 continue;
             }
@@ -850,6 +893,24 @@ impl WorkerPool {
     /// monotonic clock for `ActiveWorker::last_progress`.
     fn elapsed_ms(&self) -> u64 {
         self.created_at.elapsed().as_millis() as u64
+    }
+
+    /// Collect server IDs with strictly higher priority (lower priority number)
+    /// than `my_priority`, restricted to enabled + healthy (non-circuit-broken)
+    /// servers. `my_server_id` is excluded (a server never blocks itself).
+    ///
+    /// Used by worker loops and the supervisor to drive the priority gate in
+    /// [`SharedWorkQueue::pop_workable`] and [`SharedWorkQueue::workable_count_for`].
+    /// See `sabnzbd/nzb/article.py::get_article` for the reference behaviour.
+    fn higher_priority_servers(&self, my_priority: u8, my_server_id: &str) -> Vec<String> {
+        let servers = self.servers.lock();
+        let health = self.server_health.lock();
+        servers
+            .iter()
+            .filter(|s| s.enabled && s.priority < my_priority && s.id != my_server_id)
+            .filter(|s| health.get(&s.id).is_none_or(|h| h.is_available()))
+            .map(|s| s.id.clone())
+            .collect()
     }
 
     /// Lifetime count of worker evictions performed by the heartbeat
@@ -1043,6 +1104,28 @@ impl WorkerPool {
             let now_ms = self.elapsed_ms();
             let max_idle_ms = self.max_worker_idle().as_millis() as u64;
 
+            // Pre-compute per-server "has workable items now" so idle backup
+            // workers aren't evicted when there's legitimately nothing for
+            // them to do (waiting on higher-priority servers to fail first).
+            // Computed once per tick, outside the workers lock, to avoid
+            // lock-ordering hazards. Matches SABnzbd's idle-thread model
+            // (sabnzbd/downloader.py — idle threads stay connected).
+            let server_priorities: Vec<(String, u8)> = {
+                let srv = self.servers.lock();
+                srv.iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| (s.id.clone(), s.priority))
+                    .collect()
+            };
+            let has_workable: HashMap<String, bool> = server_priorities
+                .iter()
+                .map(|(sid, prio)| {
+                    let hp = self.higher_priority_servers(*prio, sid);
+                    let (workable, _) = self.work_queue.workable_count_for(sid, &hp);
+                    (sid.clone(), workable > 0)
+                })
+                .collect();
+
             {
                 let workers = self.workers.lock();
                 for (server_id, list) in workers.iter() {
@@ -1053,6 +1136,15 @@ impl WorkerPool {
                         let last = w.last_progress.load(Ordering::Relaxed);
                         let idle = now_ms.saturating_sub(last);
                         if idle > max_idle_ms {
+                            // Bug 2 fix: don't evict a worker whose server
+                            // has no workable items. It's idle because it's
+                            // waiting for its primary/higher-priority peers
+                            // to fail articles — not because it's zombied.
+                            // If the server isn't in the map at all (e.g.
+                            // disabled mid-tick), default to true (evict).
+                            if !has_workable.get(server_id).copied().unwrap_or(true) {
+                                continue;
+                            }
                             warn!(
                                 server = %server_id,
                                 worker_idx = idx,
@@ -1079,17 +1171,16 @@ impl WorkerPool {
 
             // ---------- 3. Starvation diagnostic ----------
             // For each enabled server: if the queue has items but none are
-            // workable for this server, log once per minute.
-            let enabled_servers: Vec<String> = {
-                let srv = self.servers.lock();
-                srv.iter()
-                    .filter(|s| s.enabled)
-                    .map(|s| s.id.clone())
-                    .collect()
-            };
+            // workable for this server, log once per minute. "Not workable"
+            // can mean either (a) every item has already been tried here, or
+            // (b) every item is still waiting on a higher-priority server
+            // (backup server legitimately idle — not a bug).
+            let enabled_servers: Vec<String> =
+                server_priorities.iter().map(|(id, _)| id.clone()).collect();
             let now_instant = Instant::now();
-            for sid in &enabled_servers {
-                let (workable, total) = self.work_queue.workable_count_for(sid);
+            for (sid, prio) in &server_priorities {
+                let hp = self.higher_priority_servers(*prio, sid);
+                let (workable, total) = self.work_queue.workable_count_for(sid, &hp);
                 if workable == 0 && total > 0 {
                     let mut log = self.starvation_log.lock();
                     let should_log = log
@@ -1098,10 +1189,16 @@ impl WorkerPool {
                         .unwrap_or(true);
                     if should_log {
                         log.insert(sid.clone(), now_instant);
+                        let reason = if hp.is_empty() {
+                            "every item has been tried here already"
+                        } else {
+                            "every item has been tried here, or is waiting for a higher-priority server"
+                        };
                         info!(
                             server = %sid,
                             total_items = total,
-                            "Queue has items but none are workable for this server (every item has been tried here already)"
+                            higher_priority_servers = hp.len(),
+                            "Queue has items but none are workable for this server ({reason})"
                         );
                     }
                 }
@@ -1372,9 +1469,13 @@ enum WorkerExit {
 /// Wait for work, with early exit on shutdown / server retirement.
 /// Returns `Some(item, ctx)` when a processable item is available, or `None`
 /// if the worker should exit.
+///
+/// `higher_priority_servers` gates which items this server is allowed to take
+/// — see `pop_workable` for the priority model.
 async fn next_work_item(
     pool: &Arc<WorkerPool>,
     server_id: &str,
+    higher_priority_servers: &[String],
     worker_shutdown: &Arc<AtomicBool>,
 ) -> Option<(WorkItem, Arc<JobContext>)> {
     loop {
@@ -1382,7 +1483,10 @@ async fn next_work_item(
             return None;
         }
 
-        if let Some(item) = pool.work_queue.pop_workable(server_id) {
+        if let Some(item) = pool
+            .work_queue
+            .pop_workable(server_id, higher_priority_servers)
+        {
             // Look up the job context. If the job is gone or cancelled, drop
             // the item and keep going.
             let ctx = pool.job_contexts.lock().get(&item.job_id).cloned();
@@ -1453,7 +1557,22 @@ async fn run_worker_serial(
             }
         }
 
-        let Some((mut item, ctx)) = next_work_item(pool, &primary_server.id, worker_shutdown).await
+        // Snapshot of healthy servers with strictly higher priority (lower
+        // priority number). Used as the priority gate in pop_workable:
+        // items waiting for a higher-priority server won't be dispatched
+        // to this worker. Recomputed each loop iteration so runtime
+        // priority / health changes are picked up. See SABnzbd
+        // `Article.get_article` for the reference behaviour.
+        let higher_priority_servers =
+            pool.higher_priority_servers(primary_server.priority, &primary_server.id);
+
+        let Some((mut item, ctx)) = next_work_item(
+            pool,
+            &primary_server.id,
+            &higher_priority_servers,
+            worker_shutdown,
+        )
+        .await
         else {
             return WorkerExit::Exit;
         };
@@ -1654,10 +1773,19 @@ async fn run_worker_pipelined(
             }
         }
 
+        // Snapshot of healthy servers with strictly higher priority. Gates
+        // which items the pipeline-fill and wait-for-work paths are allowed
+        // to take (see `pop_workable`). Recomputed each loop iteration so
+        // runtime priority / health changes are picked up.
+        let higher_priority_servers =
+            pool.higher_priority_servers(primary_server.priority, &primary_server.id);
+
         // Fill the pipeline.
         while pipeline.pending_count() + pipeline.in_flight_count() < pipe_depth as usize {
             let lock_t = Instant::now();
-            let item = pool.work_queue.pop_workable(&primary_server.id);
+            let item = pool
+                .work_queue
+                .pop_workable(&primary_server.id, &higher_priority_servers);
             perf_queue_lock_us += lock_t.elapsed().as_micros() as u64;
             let Some(item) = item else {
                 break;
@@ -1682,8 +1810,13 @@ async fn run_worker_pipelined(
 
         // If nothing is queued and nothing in flight, wait for work.
         if pipeline.is_empty() && in_flight_items.is_empty() {
-            let Some((first_item, ctx)) =
-                next_work_item(pool, &primary_server.id, worker_shutdown).await
+            let Some((first_item, ctx)) = next_work_item(
+                pool,
+                &primary_server.id,
+                &higher_priority_servers,
+                worker_shutdown,
+            )
+            .await
             else {
                 return WorkerExit::Exit;
             };
@@ -2528,9 +2661,9 @@ mod tests {
             make_item("j1", "c", "movie.vol00+01.par2"),
             make_item("j1", "d", "movie.r00"),
         ]);
-        let first = q.pop_workable("srv1").unwrap();
+        let first = q.pop_workable("srv1", &[]).unwrap();
         assert_eq!(first.filename, "movie.par2", "index file first");
-        let second = q.pop_workable("srv1").unwrap();
+        let second = q.pop_workable("srv1", &[]).unwrap();
         assert_eq!(second.filename, "movie.vol00+01.par2", "vol file second");
     }
 
@@ -2542,8 +2675,71 @@ mod tests {
         q.submit_items(vec![item, make_item("j1", "b", "other.rar")]);
 
         // srv1 should skip the first item and return the second.
-        let picked = q.pop_workable("srv1").unwrap();
+        let picked = q.pop_workable("srv1", &[]).unwrap();
         assert_eq!(picked.message_id, "b");
+    }
+
+    #[test]
+    fn pop_workable_respects_priority() {
+        // Fresh item (tried_servers empty). A backup-priority caller whose
+        // higher_priority_servers list is non-empty must NOT get the item —
+        // the primary server still needs a chance first.
+        let q = SharedWorkQueue::new();
+        q.submit_items(vec![make_item("j1", "a", "file.rar")]);
+
+        let higher = vec!["srv_primary".to_string()];
+        assert!(q.pop_workable("srv_backup", &higher).is_none());
+
+        // Primary server (empty higher list) should still get it.
+        let item = q.pop_workable("srv_primary", &[]).unwrap();
+        assert_eq!(item.message_id, "a");
+    }
+
+    #[test]
+    fn pop_workable_allows_backup_after_primary_tried() {
+        // Once the primary has been added to tried_servers (because it
+        // failed), the backup is allowed to take the item.
+        let q = SharedWorkQueue::new();
+        let mut item = make_item("j1", "a", "file.rar");
+        item.tried_servers.push("srv_primary".to_string());
+        q.submit_items(vec![item]);
+
+        let higher = vec!["srv_primary".to_string()];
+        let picked = q.pop_workable("srv_backup", &higher).unwrap();
+        assert_eq!(picked.message_id, "a");
+    }
+
+    #[test]
+    fn pop_workable_ignores_circuit_broken_higher_server() {
+        // When the caller's `higher_priority_servers` list is empty because
+        // the primary was filtered out as circuit-broken/disabled, the backup
+        // gets items immediately — no waiting for the dead primary.
+        let q = SharedWorkQueue::new();
+        q.submit_items(vec![make_item("j1", "a", "file.rar")]);
+
+        let higher: Vec<String> = vec![]; // primary filtered out by caller
+        let item = q.pop_workable("srv_backup", &higher).unwrap();
+        assert_eq!(item.message_id, "a");
+    }
+
+    #[test]
+    fn workable_count_for_respects_priority() {
+        let q = SharedWorkQueue::new();
+        q.submit_items(vec![
+            make_item("j1", "a", "a.rar"),
+            make_item("j1", "b", "b.rar"),
+        ]);
+
+        // Backup: both items need primary first → workable=0.
+        let higher = vec!["srv_primary".to_string()];
+        let (workable, total) = q.workable_count_for("srv_backup", &higher);
+        assert_eq!(workable, 0);
+        assert_eq!(total, 2);
+
+        // Primary: both items are workable.
+        let (workable, total) = q.workable_count_for("srv_primary", &[]);
+        assert_eq!(workable, 2);
+        assert_eq!(total, 2);
     }
 
     #[test]
@@ -2557,7 +2753,7 @@ mod tests {
         let drained = q.drain_job("j1");
         assert_eq!(drained.len(), 2);
         assert_eq!(q.len(), 1);
-        let remaining = q.pop_workable("srv1").unwrap();
+        let remaining = q.pop_workable("srv1", &[]).unwrap();
         assert_eq!(remaining.job_id, "j2");
     }
 

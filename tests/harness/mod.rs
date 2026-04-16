@@ -73,6 +73,13 @@ impl ServerProfile {
         config.connections = max_connections;
         Self { server, config }
     }
+
+    /// Set the server's dispatch priority (0 = highest). Used by priority
+    /// integration tests to build primary + backup server topologies.
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.config.priority = priority;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
