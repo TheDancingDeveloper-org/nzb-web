@@ -78,21 +78,12 @@ steps:
       - event: push
         branch: main
 
-  - name: trigger-renovate
-    image: alpine/curl
-    environment:
-      WOODPECKER_TOKEN:
-        from_secret: woodpecker_token
-    commands:
-      - |
-        curl -sf -X POST \
-          "https://ci.indexarr.net/api/repos/indexarr/renovate/pipelines" \
-          -H "Authorization: Bearer $WOODPECKER_TOKEN" \
-          -H "Content-Type: application/json" \
-          -d '{"branch":"main"}'
-    when:
-      - event: push
-        branch: main
+  # trigger-renovate step removed — the `woodpecker_token` org secret
+  # isn't configured on this Woodpecker instance, which put the whole
+  # pipeline into ERROR state at validation time (secret resolves BEFORE
+  # any step runs). Publish to Forgejo still happens; renovate runs on
+  # its own schedule. Re-add this step once a machine token is
+  # provisioned under that name.
 
   - name: discord-success
     image: alpine/curl
@@ -103,7 +94,7 @@ steps:
       - |
         curl -s -X POST "$DISCORD_WEBHOOK_URL" \
           -H "Content-Type: application/json" \
-          -d "{\"embeds\":[{\"title\":\"nzb-web published\",\"description\":\"Published to Forgejo registry. Renovate scan triggered.\",\"color\":3066993}]}"
+          -d "{\"embeds\":[{\"title\":\"nzb-web published\",\"description\":\"Published to Forgejo registry.\",\"color\":3066993}]}"
     when:
       - event: push
         branch: main
