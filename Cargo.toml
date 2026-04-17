@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -14,6 +14,7 @@ groups-db = ["nzb-postproc/groups-db"]
 nzb-nntp = { version = "0.2.14", registry = "forgejo" }
 nzb-decode = { version = "0.1.2", registry = "forgejo" }
 nzb-postproc = { version = "0.2.5", registry = "forgejo" }
+nzb-dispatch = { version = "0.1.0", registry = "forgejo" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -26,11 +27,13 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
 anyhow = "1"
+async-trait = "0.1"
 thiserror = "2"
 parking_lot = "0.12"
 rand = "0.9"
 hex = "0.4"
 base64 = "0.22"
+sha2 = "0.10"
 governor = "0.10"
 arc-swap = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -52,3 +55,10 @@ unused = "warn"
 tempfile = "3.27.0"
 nzb-nntp = { version = "0.2.9", registry = "forgejo", features = ["test-support"] }
 yenc-simd = { version = "0.1", registry = "forgejo" }
+
+# Local dev override: iterate against sibling lib checkouts without
+# re-publishing. CI strips [patch] sections and resolves from the registry.
+[patch.'sparse+https://repo.indexarr.net/api/packages/indexarr/cargo/']
+nzb-dispatch = { path = "../nzb-dispatch" }
+nzb-nntp     = { path = "../nzb-nntp" }
+nzb-news     = { path = "../nzb-news" }

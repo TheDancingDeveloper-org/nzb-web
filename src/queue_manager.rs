@@ -24,8 +24,9 @@ use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
 use nzb_dispatch::bandwidth::BandwidthLimiter;
-use nzb_dispatch::dispatch_engine::{DispatchEngine, DispatchHandle};
-use nzb_dispatch::download_engine::{ConnectionTracker, ProgressUpdate, WorkerPool};
+use nzb_dispatch::dispatch_engine::DispatchEngine;
+use nzb_dispatch::download_engine::{ConnectionTracker, ProgressUpdate};
+use nzb_dispatch::news_engine::{NewsDispatchEngine, NewsEngineConfig};
 
 /// Get free disk space for a path (returns 0 on error).
 fn get_disk_free(path: &std::path::Path) -> u64 {
@@ -494,14 +495,17 @@ impl QueueManager {
             conn_tracker.set_limit(&server.id, &server.name, server.connections as usize);
         }
 
-        let servers_arc = Arc::new(Mutex::new(servers));
-        let worker_pool = WorkerPool::new(
-            Arc::clone(&servers_arc),
-            Arc::clone(&bandwidth),
-            Arc::clone(&conn_tracker),
-            article_timeout_secs,
+        // Build the layered news engine. `bandwidth` and `conn_tracker` are
+        // retained as observability/config shells but are not wired into the
+        // new fetch path yet — the old WorkerPool consumed them directly;
+        // nzb-news manages its own connection pool and does not rate-limit
+        // yet. Wiring these two back in is a follow-up.
+        let news_cfg = NewsEngineConfig::new(
+            servers.clone(),
+            std::time::Duration::from_secs(article_timeout_secs),
         );
-        let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::new(worker_pool));
+        let servers_arc = Arc::new(Mutex::new(servers));
+        let dispatch: Arc<dyn DispatchEngine> = Arc::new(NewsDispatchEngine::new(news_cfg));
         dispatch.start();
 
         Arc::new(Self {
@@ -766,9 +770,7 @@ impl QueueManager {
 
         // Reserve the hash now that the job is committed.
         if let Some(hash) = content_hash {
-            self.content_hashes
-                .lock()
-                .insert(hash, job.id.clone());
+            self.content_hashes.lock().insert(hash, job.id.clone());
         }
 
         let job_id = job.id.clone();
@@ -2424,9 +2426,7 @@ impl QueueManager {
             // jobs without parsed NZB data skip this; they'll be checked
             // lazily at launch if necessary.
             if let Some(hash) = compute_content_hash(&job) {
-                self.content_hashes
-                    .lock()
-                    .insert(hash, job_id.clone());
+                self.content_hashes.lock().insert(hash, job_id.clone());
             }
 
             let state = JobState {
