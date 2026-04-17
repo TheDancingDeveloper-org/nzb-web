@@ -23,6 +23,7 @@ use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
 
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
+use nzb_dispatch::ServerProbePolicy;
 use nzb_dispatch::bandwidth::BandwidthLimiter;
 use nzb_dispatch::dispatch_engine::DispatchEngine;
 use nzb_dispatch::download_engine::{ConnectionTracker, ProgressUpdate};
@@ -478,6 +479,7 @@ impl QueueManager {
         early_failure_check: bool,
         required_completion_pct: f64,
         article_timeout_secs: u64,
+        probe_policy: Option<ServerProbePolicy>,
     ) -> Arc<Self> {
         use crate::bandwidth::BandwidthConfig;
         use std::num::NonZeroU32;
@@ -500,10 +502,11 @@ impl QueueManager {
         // new fetch path yet — the old WorkerPool consumed them directly;
         // nzb-news manages its own connection pool and does not rate-limit
         // yet. Wiring these two back in is a follow-up.
-        let news_cfg = NewsEngineConfig::new(
+        let mut news_cfg = NewsEngineConfig::new(
             servers.clone(),
             std::time::Duration::from_secs(article_timeout_secs),
         );
+        news_cfg.probe_policy = probe_policy;
         let servers_arc = Arc::new(Mutex::new(servers));
         let dispatch: Arc<dyn DispatchEngine> = Arc::new(NewsDispatchEngine::new(news_cfg));
         dispatch.start();

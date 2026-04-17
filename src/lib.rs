@@ -16,6 +16,7 @@ pub mod state;
 pub mod util;
 
 // Back-compat re-exports — dispatcher types live in `nzb-dispatch` now.
+pub use nzb_dispatch::ServerProbePolicy;
 pub use nzb_dispatch::article_failure::{self, ArticleFailure, ArticleFailureKind};
 pub use nzb_dispatch::bandwidth;
 pub use nzb_dispatch::dispatch_engine;

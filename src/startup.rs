@@ -103,6 +103,7 @@ pub async fn initialize(
         config.general.early_failure_check,
         config.general.required_completion_pct,
         config.general.article_timeout_secs,
+        Some(crate::ServerProbePolicy::default()),
     );
 
     // Set history retention

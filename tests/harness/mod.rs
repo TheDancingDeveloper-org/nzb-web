@@ -160,6 +160,7 @@ impl HarnessBuilder {
             self.early_failure_check,
             self.required_completion_pct,
             self.article_timeout_secs,
+            None, // probe_policy: tests run with cascade-everything (no probing)
         );
 
         queue_manager.spawn_speed_tracker();
