@@ -277,11 +277,16 @@ impl HopelessTracker {
             if failure_rate >= EARLY_CHECK_FAILURE_RATE {
                 return Some(HopelessAbort {
                     tier: "early_failure",
+                    // Each "confirmed missing" article exhausted every
+                    // configured server before being counted here, so the
+                    // per-server primary-tier fail rate is much higher
+                    // than this sample suggests. The `server_stats` log
+                    // line emitted alongside this abort breaks down the
+                    // per-server attempt / not-found counts.
                     reason: format!(
-                        "Aborted: {:.0}% of {} checked articles missing ({} of {} failed)",
-                        failure_rate * 100.0,
-                        self.content_articles_checked,
+                        "Aborted: {} article(s) confirmed missing across all configured servers ({:.0}% failure rate over {} fully-cascaded samples)",
                         self.content_articles_failed,
+                        failure_rate * 100.0,
                         self.content_articles_checked,
                     ),
                 });
@@ -1205,6 +1210,23 @@ impl QueueManager {
                             reason = %abort.reason,
                             "Job is hopeless — aborting"
                         );
+                        // Emit a per-server breakdown so the reason above
+                        // can be read in context — the primary tier's raw
+                        // fail rate is invisible from the post-cascade
+                        // tracker alone (see HopelessTracker::check comment
+                        // about "fully-cascaded samples").
+                        let stats = self.dispatch.server_stats_snapshot();
+                        for (sid, s) in &stats {
+                            info!(
+                                job_id = %job_id,
+                                server_id = %sid,
+                                attempted = s.attempted,
+                                succeeded = s.succeeded,
+                                not_found = s.not_found,
+                                transient_failed = s.transient_failed,
+                                "server_stats at abort"
+                            );
+                        }
                         {
                             let mut jobs = self.jobs.lock();
                             if let Some(state) = jobs.get_mut(&job_id) {
