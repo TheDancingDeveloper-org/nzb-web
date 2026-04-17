@@ -625,6 +625,9 @@ impl QueueManager {
                 let mut jobs = self.jobs.lock();
                 if let Some(state) = jobs.get_mut(&job_id) {
                     state.job.error_message = Some(abort.reason.clone());
+                    // Drop tracker so any in-flight ArticleFailed events
+                    // can't re-enter the hopeless path.
+                    state.hopeless_tracker = None;
                 }
             }
             self.dispatch.abort_job(&job_id, abort.reason);
@@ -1206,6 +1209,13 @@ impl QueueManager {
                             let mut jobs = self.jobs.lock();
                             if let Some(state) = jobs.get_mut(&job_id) {
                                 state.job.error_message = Some(abort.reason.clone());
+                                // Drop the tracker so subsequent ArticleFailed
+                                // events from in-flight articles don't re-fire
+                                // the hopeless check (and re-emit abort_job).
+                                // Without this, the next ~30 failures each
+                                // log a duplicate "Job is hopeless — aborting"
+                                // warning and spam dispatch.abort_job().
+                                state.hopeless_tracker = None;
                             }
                         }
                         // Tell the worker pool to drain the job and emit
