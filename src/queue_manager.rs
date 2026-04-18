@@ -1308,16 +1308,24 @@ impl QueueManager {
                         reason = %reason,
                         "Job aborted by download engine"
                     );
-                    {
+                    // Read the real article-failed count BEFORE mutating —
+                    // on_job_finished logs it and the post-proc pipeline
+                    // uses it to decide whether par2 might help.
+                    let articles_failed = {
                         let mut jobs = self.jobs.lock();
+                        let articles_failed = jobs
+                            .get(&job_id)
+                            .map(|s| s.job.articles_failed)
+                            .unwrap_or(0);
                         if let Some(state) = jobs.get_mut(&job_id) {
                             state.job.status = JobStatus::Failed;
                             state.job.error_message = Some(reason);
                             state.job.completed_at = Some(chrono::Utc::now());
                         }
-                    }
+                        articles_failed
+                    };
                     self.start_next_queued();
-                    self.on_job_finished(&job_id, false, 0).await;
+                    self.on_job_finished(&job_id, false, articles_failed).await;
                     break;
                 }
             }
@@ -1336,6 +1344,30 @@ impl QueueManager {
         articles_failed: usize,
     ) {
         let pipeline_start = Instant::now();
+
+        // Short-circuit when the job never downloaded anything — e.g. a
+        // hopeless-abort or no-progress timeout fired before a single
+        // article landed. Running par2 / extract on an empty work_dir
+        // spams the logs with misleading "Cannot open the file as
+        // archive" errors and can't possibly recover; just move the job
+        // to history as Failed and return.
+        let articles_downloaded = {
+            let jobs = self.jobs.lock();
+            jobs.get(job_id).map(|s| s.job.articles_downloaded).unwrap_or(0)
+        };
+        if articles_downloaded == 0 && !success {
+            info!(
+                job_id = %job_id,
+                articles_failed,
+                "Job finished with no articles downloaded — skipping post-processing"
+            );
+            self.release_content_hash(job_id);
+            let mut jobs = self.jobs.lock();
+            if let Some(state) = jobs.get_mut(job_id) {
+                self.move_to_history(state, Vec::new());
+            }
+            return;
+        }
 
         // Extract info needed for post-processing and take the direct unpacker.
         let (work_dir, output_dir, category, pp_level, direct_unpacker, password) = {
