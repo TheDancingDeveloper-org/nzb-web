@@ -1353,7 +1353,9 @@ impl QueueManager {
         // to history as Failed and return.
         let articles_downloaded = {
             let jobs = self.jobs.lock();
-            jobs.get(job_id).map(|s| s.job.articles_downloaded).unwrap_or(0)
+            jobs.get(job_id)
+                .map(|s| s.job.articles_downloaded)
+                .unwrap_or(0)
         };
         if articles_downloaded == 0 && !success {
             info!(
