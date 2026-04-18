@@ -507,12 +507,15 @@ impl QueueManager {
         // new fetch path yet — the old WorkerPool consumed them directly;
         // nzb-news manages its own connection pool and does not rate-limit
         // yet. Wiring these two back in is a follow-up.
-        let mut news_cfg = NewsEngineConfig::new(
-            servers.clone(),
+        // Share the server list Arc between QueueManager and the news
+        // engine so `update_servers` → `reconcile_servers` is observable
+        // inside the engine without an extra plumbing step.
+        let servers_arc = Arc::new(Mutex::new(servers));
+        let mut news_cfg = NewsEngineConfig::with_shared_servers(
+            servers_arc.clone(),
             std::time::Duration::from_secs(article_timeout_secs),
         );
         news_cfg.probe_policy = probe_policy;
-        let servers_arc = Arc::new(Mutex::new(servers));
         let dispatch: Arc<dyn DispatchEngine> = Arc::new(NewsDispatchEngine::new(news_cfg));
         dispatch.start();
 
