@@ -23,6 +23,6 @@ pub use nzb_dispatch::dispatch_engine;
 pub use nzb_dispatch::download_engine;
 
 pub use log_buffer::{LogBuffer, LogBufferLayer};
-pub use queue_manager::QueueManager;
+pub use queue_manager::{QueueManager, ServerStatsData};
 pub use startup::{StartupConfig, StartupResult};
 pub use state::AppState;

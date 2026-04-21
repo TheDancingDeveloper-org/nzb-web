@@ -77,6 +77,76 @@ struct JobCheckpoint {
 }
 
 // ---------------------------------------------------------------------------
+// Server statistics — daily accumulation in the settings table
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct DayStats {
+    bytes: u64,
+    ok: u64,
+    fail: u64,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct ServerStatsStore {
+    name: String,
+    #[serde(default)]
+    days: HashMap<String, DayStats>,
+}
+
+/// Aggregated per-server download statistics.
+#[derive(Serialize, Clone, Debug, Default)]
+pub struct ServerStatsData {
+    pub server_id: String,
+    pub server_name: String,
+    pub total_bytes: u64,
+    pub today_bytes: u64,
+    pub week_bytes: u64,
+    pub month_bytes: u64,
+    pub total_ok: u64,
+    pub today_ok: u64,
+    pub week_ok: u64,
+    pub month_ok: u64,
+    pub total_fail: u64,
+    pub today_fail: u64,
+    pub week_fail: u64,
+    pub month_fail: u64,
+    pub last_active: Option<String>,
+}
+
+/// Accumulate per-server stats into daily buckets stored in the settings table.
+/// Using settings avoids a schema migration and survives history clearing.
+fn accumulate_server_stats(db: &Database, stats: &[ServerArticleStats]) {
+    use chrono::Local;
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let cutoff = (Local::now() - chrono::Duration::days(730))
+        .format("%Y-%m-%d")
+        .to_string();
+    for stat in stats {
+        if stat.bytes_downloaded == 0
+            && stat.articles_downloaded == 0
+            && stat.articles_failed == 0
+        {
+            continue;
+        }
+        let key = format!("srv_stats:{}", stat.server_id);
+        let mut store: ServerStatsStore = db
+            .get_setting(&key)
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        store.name = stat.server_name.clone();
+        let day = store.days.entry(today.clone()).or_default();
+        day.bytes += stat.bytes_downloaded;
+        day.ok += stat.articles_downloaded as u64;
+        day.fail += stat.articles_failed as u64;
+        store.days.retain(|date, _| date.as_str() >= cutoff.as_str());
+        if let Ok(json) = serde_json::to_string(&store) {
+            db.set_setting(&key, &json);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Speed tracker — rolling N-second window average
 // ---------------------------------------------------------------------------
 
@@ -1595,6 +1665,7 @@ impl QueueManager {
         if let Err(e) = db.history_insert(&history_entry) {
             error!(job_id = %state.job.id, "Failed to insert history: {e}");
         }
+        accumulate_server_stats(&db, &history_entry.server_stats);
 
         // Capture and persist per-job logs from the ring buffer
         if let Some(ref log_buffer) = self.log_buffer {
@@ -2373,6 +2444,72 @@ impl QueueManager {
     pub fn rss_rule_delete(&self, id: &str) -> crate::nzb_core::Result<()> {
         let db = self.db.lock();
         db.rss_rule_delete(id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Server statistics
+    // -----------------------------------------------------------------------
+
+    /// Return aggregated per-server download statistics for all configured servers.
+    pub fn server_stats_get_all(&self, servers: &[ServerConfig]) -> Vec<ServerStatsData> {
+        use chrono::{Datelike, Local};
+        let today = Local::now().date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+        let week_str = (today
+            - chrono::Duration::days(today.weekday().num_days_from_monday() as i64))
+        .format("%Y-%m-%d")
+        .to_string();
+        let month_str = today
+            .with_day(1)
+            .unwrap_or(today)
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let db = self.db.lock();
+        servers
+            .iter()
+            .map(|server| {
+                let key = format!("srv_stats:{}", server.id);
+                let store: ServerStatsStore = db
+                    .get_setting(&key)
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
+
+                let mut data = ServerStatsData {
+                    server_id: server.id.clone(),
+                    server_name: server.name.clone(),
+                    ..Default::default()
+                };
+
+                for (date, day) in &store.days {
+                    data.total_bytes += day.bytes;
+                    data.total_ok += day.ok;
+                    data.total_fail += day.fail;
+                    if date.as_str() >= today_str.as_str() {
+                        data.today_bytes += day.bytes;
+                        data.today_ok += day.ok;
+                        data.today_fail += day.fail;
+                    }
+                    if date.as_str() >= week_str.as_str() {
+                        data.week_bytes += day.bytes;
+                        data.week_ok += day.ok;
+                        data.week_fail += day.fail;
+                    }
+                    if date.as_str() >= month_str.as_str() {
+                        data.month_bytes += day.bytes;
+                        data.month_ok += day.ok;
+                        data.month_fail += day.fail;
+                    }
+                    match &data.last_active {
+                        None => data.last_active = Some(date.clone()),
+                        Some(prev) if date > prev => data.last_active = Some(date.clone()),
+                        _ => {}
+                    }
+                }
+
+                data
+            })
+            .collect()
     }
 
     // -----------------------------------------------------------------------
