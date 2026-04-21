@@ -123,9 +123,7 @@ fn accumulate_server_stats(db: &Database, stats: &[ServerArticleStats]) {
         .format("%Y-%m-%d")
         .to_string();
     for stat in stats {
-        if stat.bytes_downloaded == 0
-            && stat.articles_downloaded == 0
-            && stat.articles_failed == 0
+        if stat.bytes_downloaded == 0 && stat.articles_downloaded == 0 && stat.articles_failed == 0
         {
             continue;
         }
@@ -139,7 +137,9 @@ fn accumulate_server_stats(db: &Database, stats: &[ServerArticleStats]) {
         day.bytes += stat.bytes_downloaded;
         day.ok += stat.articles_downloaded as u64;
         day.fail += stat.articles_failed as u64;
-        store.days.retain(|date, _| date.as_str() >= cutoff.as_str());
+        store
+            .days
+            .retain(|date, _| date.as_str() >= cutoff.as_str());
         if let Ok(json) = serde_json::to_string(&store) {
             db.set_setting(&key, &json);
         }
