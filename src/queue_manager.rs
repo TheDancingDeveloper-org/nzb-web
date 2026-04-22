@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{CategoryConfig, ServerConfig};
@@ -452,6 +452,16 @@ struct JobState {
 // QueueManager
 // ---------------------------------------------------------------------------
 
+/// Notification fired when a job moves into a terminal state (Completed or Failed).
+/// Subscribe via [`QueueManager::subscribe_completions`].
+#[derive(Debug, Clone)]
+pub struct CompletedJobEvent {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub status: JobStatus,
+}
+
 /// Thread-safe queue manager that coordinates all downloads.
 ///
 /// Wrapped in `Arc` for sharing between the background task and HTTP handlers.
@@ -509,6 +519,8 @@ pub struct QueueManager {
     /// be computed). Jobs restored from DB without a parsed NZB are not
     /// hashed until launch; see `launch_download`.
     content_hashes: Mutex<HashMap<[u8; 32], String>>,
+    /// Broadcast channel: fires when a job enters a terminal state.
+    completion_tx: broadcast::Sender<CompletedJobEvent>,
 }
 
 /// Compute a content-identity hash for an NZB job based on its article
@@ -589,6 +601,8 @@ impl QueueManager {
         let dispatch: Arc<dyn DispatchEngine> = Arc::new(NewsDispatchEngine::new(news_cfg));
         dispatch.start();
 
+        let (completion_tx, _) = broadcast::channel(128);
+
         Arc::new(Self {
             jobs: Mutex::new(HashMap::new()),
             job_order: Mutex::new(Vec::new()),
@@ -616,12 +630,19 @@ impl QueueManager {
             // enough that an obvious zombie is killed within minutes.
             no_progress_timeout: Mutex::new(Duration::from_secs(300)),
             content_hashes: Mutex::new(HashMap::new()),
+            completion_tx,
         })
     }
 
     /// Update category configs (e.g. after config reload).
     pub fn set_categories(&self, categories: Vec<CategoryConfig>) {
         *self.categories.lock() = categories;
+    }
+
+    /// Subscribe to job completion events. The receiver fires once per job
+    /// that transitions to `Completed` or `Failed`.
+    pub fn subscribe_completions(&self) -> broadcast::Receiver<CompletedJobEvent> {
+        self.completion_tx.subscribe()
     }
 
     /// Get history retention limit (None = keep all).
@@ -1666,6 +1687,14 @@ impl QueueManager {
             error!(job_id = %state.job.id, "Failed to insert history: {e}");
         }
         accumulate_server_stats(&db, &history_entry.server_stats);
+
+        // Notify any subscribers (e.g. DAV auto-send). Ignore if no listeners.
+        let _ = self.completion_tx.send(CompletedJobEvent {
+            id: history_entry.id.clone(),
+            name: history_entry.name.clone(),
+            category: history_entry.category.clone(),
+            status: final_status,
+        });
 
         // Capture and persist per-job logs from the ring buffer
         if let Some(ref log_buffer) = self.log_buffer {

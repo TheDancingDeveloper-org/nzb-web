@@ -373,10 +373,7 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
             Json(serde_json::json!({ "status": true }))
         }
 
-        "priority" => {
-            // TODO: implement priority changes for queued jobs
-            Json(serde_json::json!({ "status": true }))
-        }
+        "priority" => handle_priority(state, req),
 
         "fullstatus" | "server_stats" => {
             let qm = &state.queue_manager;
@@ -718,6 +715,30 @@ fn handle_change_cat(state: &AppState, req: &SabApiRequest) -> Json<serde_json::
 
     let qm = &state.queue_manager;
     match qm.change_job_category(search_id, new_cat) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(e) => Json(serde_json::json!({
+            "status": false,
+            "error": format!("{e}")
+        })),
+    }
+}
+
+fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let job_id = req.value.as_deref().unwrap_or("");
+    let priority_str = req.value2.as_deref().unwrap_or("");
+
+    if job_id.is_empty() || priority_str.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing value (job id) or value2 (priority)"
+        }));
+    }
+
+    let search_id = job_id.strip_prefix("SABnzbd_nzo_").unwrap_or(job_id);
+    let priority = sab_priority_to_priority(priority_str);
+
+    let qm = &state.queue_manager;
+    match qm.set_job_priority(search_id, priority) {
         Ok(()) => Json(serde_json::json!({ "status": true })),
         Err(e) => Json(serde_json::json!({
             "status": false,
