@@ -166,8 +166,14 @@ impl std::fmt::Display for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let status = self.status();
+        if status.is_server_error() {
+            tracing::error!(error = %self.kind, status = status.as_u16(), "Internal server error");
+        } else if status.is_client_error() && status != StatusCode::UNAUTHORIZED {
+            tracing::warn!(error = %self.kind, status = status.as_u16(), "Client error");
+        }
         let mut response = axum::Json(&self).into_response();
-        *response.status_mut() = self.status();
+        *response.status_mut() = status;
         response
     }
 }

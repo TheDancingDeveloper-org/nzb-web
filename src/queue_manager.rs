@@ -207,6 +207,15 @@ impl SpeedTracker {
     pub fn bps(&self) -> u64 {
         self.current_bps.load(Ordering::Relaxed)
     }
+
+    /// Clear the rolling window and current bps. Called on pause so the UI
+    /// reflects the stopped state immediately instead of decaying over
+    /// SPEED_WINDOW_SECS.
+    pub fn reset(&self) {
+        self.pending_bytes.store(0, Ordering::Relaxed);
+        self.window.lock().clear();
+        self.current_bps.store(0, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2105,6 +2114,7 @@ impl QueueManager {
         for id in to_pause {
             self.dispatch.pause_job(&id);
         }
+        self.speed.reset();
         info!("All downloads paused");
     }
 
@@ -3369,6 +3379,24 @@ mod speed_tracker_tests {
             t.tick(1.0);
         }
         assert_eq!(t.bps(), 0, "after window expires, bps should be 0");
+    }
+
+    #[test]
+    fn reset_zeroes_bps_and_window_immediately() {
+        // Pause path: after a steady flow, reset() must make bps report 0
+        // on the very next sample, without waiting SPEED_WINDOW_SECS for
+        // the rolling window to decay.
+        let t = SpeedTracker::new();
+        for _ in 0..10 {
+            t.record(1_000_000);
+            t.tick(1.0);
+        }
+        assert_eq!(t.bps(), 1_000_000);
+        t.reset();
+        assert_eq!(t.bps(), 0);
+        // And a subsequent tick with no activity stays at 0.
+        t.tick(1.0);
+        assert_eq!(t.bps(), 0);
     }
 
     #[test]

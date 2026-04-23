@@ -75,9 +75,24 @@ pub async fn initialize(
     }
 
     // Ensure directories exist
-    std::fs::create_dir_all(&config.general.data_dir)?;
-    std::fs::create_dir_all(&config.general.incomplete_dir)?;
-    std::fs::create_dir_all(&config.general.complete_dir)?;
+    std::fs::create_dir_all(&config.general.data_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot create data dir '{}': {} — check PUID/PGID settings and volume mount permissions",
+            config.general.data_dir.display(), e
+        )
+    })?;
+    std::fs::create_dir_all(&config.general.incomplete_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot create incomplete dir '{}': {} — check PUID/PGID settings and volume mount permissions",
+            config.general.incomplete_dir.display(), e
+        )
+    })?;
+    std::fs::create_dir_all(&config.general.complete_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "Cannot create complete dir '{}': {} — check PUID/PGID settings and volume mount permissions",
+            config.general.complete_dir.display(), e
+        )
+    })?;
 
     // Open database
     let db_path = config.general.data_dir.join("rustnzb.db");
