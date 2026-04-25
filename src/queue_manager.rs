@@ -471,6 +471,17 @@ pub struct CompletedJobEvent {
     pub status: JobStatus,
 }
 
+/// Notification fired immediately when a job is accepted into the queue.
+/// Subscribe via [`QueueManager::subscribe_additions`].
+#[derive(Debug, Clone)]
+pub struct JobAddedEvent {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    /// Raw NZB bytes, if available at add time. Wrapped in Arc to keep clones cheap.
+    pub nzb_data: Option<Arc<Vec<u8>>>,
+}
+
 /// Thread-safe queue manager that coordinates all downloads.
 ///
 /// Wrapped in `Arc` for sharing between the background task and HTTP handlers.
@@ -530,6 +541,8 @@ pub struct QueueManager {
     content_hashes: Mutex<HashMap<[u8; 32], String>>,
     /// Broadcast channel: fires when a job enters a terminal state.
     completion_tx: broadcast::Sender<CompletedJobEvent>,
+    /// Broadcast channel: fires immediately when a job is accepted into the queue.
+    add_tx: broadcast::Sender<JobAddedEvent>,
 }
 
 /// Compute a content-identity hash for an NZB job based on its article
@@ -611,6 +624,7 @@ impl QueueManager {
         dispatch.start();
 
         let (completion_tx, _) = broadcast::channel(128);
+        let (add_tx, _) = broadcast::channel(64);
 
         Arc::new(Self {
             jobs: Mutex::new(HashMap::new()),
@@ -640,6 +654,7 @@ impl QueueManager {
             no_progress_timeout: Mutex::new(Duration::from_secs(300)),
             content_hashes: Mutex::new(HashMap::new()),
             completion_tx,
+            add_tx,
         })
     }
 
@@ -652,6 +667,12 @@ impl QueueManager {
     /// that transitions to `Completed` or `Failed`.
     pub fn subscribe_completions(&self) -> broadcast::Receiver<CompletedJobEvent> {
         self.completion_tx.subscribe()
+    }
+
+    /// Subscribe to job addition events. The receiver fires immediately when
+    /// a job is accepted into the queue (before download begins).
+    pub fn subscribe_additions(&self) -> broadcast::Receiver<JobAddedEvent> {
+        self.add_tx.subscribe()
     }
 
     /// Get history retention limit (None = keep all).
@@ -895,6 +916,13 @@ impl QueueManager {
             articles = job.article_count,
             "Job added to queue"
         );
+
+        let _ = self.add_tx.send(JobAddedEvent {
+            id: job_id.clone(),
+            name: job.name.clone(),
+            category: job.category.clone(),
+            nzb_data: nzb_data.as_deref().map(|d| Arc::new(d.to_vec())),
+        });
 
         // If globally paused, add as paused
         if self.globally_paused.load(Ordering::Relaxed) {
