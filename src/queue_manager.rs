@@ -848,10 +848,7 @@ impl QueueManager {
     /// Start queued jobs up to the concurrency limit.
     fn start_next_queued(self: &Arc<Self>) {
         let max = self.max_active_downloads.load(Ordering::Relaxed);
-        loop {
-            let Some(job_id) = self.claim_next_download_slot(max) else {
-                break;
-            };
+        while let Some(job_id) = self.claim_next_download_slot(max) {
             self.launch_download(&job_id);
         }
     }
