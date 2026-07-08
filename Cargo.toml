@@ -1,6 +1,6 @@
 [package]
 name = "nzb-web"
-version = "0.4.15"
+version = "0.4.16"
 edition = "2024"
 description = "Usenet download engine: queue management, download orchestration, and background services"
 license = "MIT"
@@ -14,7 +14,7 @@ groups-db = ["nzb-postproc/groups-db"]
 [dependencies]
 nzb-nntp = { version = "0.2.17" }
 nzb-decode = { version = "0.1.2" }
-nzb-postproc = { version = "0.2.5" }
+nzb-postproc = { version = "0.2.6" }
 nzb-dispatch = { version = "0.2.4" }
 axum = { version = "0.8", features = ["multipart"] }
 tower = "0.5"
@@ -56,4 +56,3 @@ unused = "warn"
 tempfile = "3.27.0"
 nzb-nntp = { version = "0.2.9", features = ["test-support"] }
 yenc-simd = { version = "0.1" }
-

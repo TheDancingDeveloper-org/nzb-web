@@ -6,7 +6,7 @@
 //! normal PAR2 repair + extract pipeline.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -323,10 +323,8 @@ fn drive_unrar(
     let mut reader = BufReader::new(stdout);
     let mut next_volume: u32 = 1; // Volume 0 is already being processed.
     let mut extracted_files: Vec<String> = Vec::new();
-
-    // Read stdout byte-by-byte to detect interactive prompts that don't end
-    // with newline. We accumulate into a line buffer and check after each byte.
     let mut line_buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
 
     loop {
         if killed.load(Ordering::Acquire) {
@@ -337,32 +335,28 @@ fn drive_unrar(
             };
         }
 
-        // Try to read a full line first (more efficient for normal output).
-        line_buf.clear();
-        match reader.read_until(b'\n', &mut line_buf) {
+        match reader.read(&mut byte) {
             Ok(0) => {
                 // EOF — unrar exited.
                 break;
             }
             Ok(_) => {
-                let line = String::from_utf8_lossy(&line_buf);
+                line_buf.push(byte[0]);
+                let line = String::from_utf8_lossy(&line_buf).to_string();
                 let line_trimmed = line.trim();
 
-                // Track extracted files for cleanup on abort.
                 if let Some(filename) = line_trimmed.strip_prefix("Extracting  ") {
                     let filename = filename.trim();
                     if !filename.is_empty() {
                         extracted_files.push(filename.to_string());
                     }
                 } else if let Some(filename) = line_trimmed.strip_prefix("...         ") {
-                    // Continuation of extraction (long filenames).
                     let filename = filename.trim();
                     if !filename.is_empty() {
                         extracted_files.push(filename.to_string());
                     }
                 }
 
-                // Check for success.
                 if line_trimmed == "All OK" {
                     info!(set = %set_name, "Direct unpack complete — All OK");
                     return DirectUnpackResult {
@@ -372,31 +366,23 @@ fn drive_unrar(
                     };
                 }
 
-                // Check for errors.
-                for pattern in UNRAR_ERROR_PATTERNS {
-                    if line_trimmed.contains(pattern) {
-                        error!(
-                            set = %set_name,
-                            error = %line_trimmed,
-                            "Direct unpack error detected"
-                        );
-                        return DirectUnpackResult {
-                            set_name: set_name.to_string(),
-                            success: false,
-                            error: Some(line_trimmed.to_string()),
-                        };
-                    }
+                if UNRAR_ERROR_PATTERNS
+                    .iter()
+                    .any(|pattern| line_trimmed.contains(pattern))
+                {
+                    error!(
+                        set = %set_name,
+                        error = %line_trimmed,
+                        "Direct unpack error detected"
+                    );
+                    return DirectUnpackResult {
+                        set_name: set_name.to_string(),
+                        success: false,
+                        error: Some(line_trimmed.to_string()),
+                    };
                 }
 
-                // Check for volume prompt. unrar -vp outputs a line like:
-                //   "Insert disk with <filename> [C]ontinue, [Q]uit "
-                // This may or may not end with a newline depending on the
-                // unrar version, but read_until will return when it hits \n
-                // or when the child exits. For the no-newline case, we also
-                // check in the partial-read path below.
-                if line_trimmed.contains("[C]ontinue, [Q]uit")
-                    || line_trimmed.contains("[C]ontinue, [Q]uit")
-                {
+                if line_trimmed.contains("[C]ontinue, [Q]uit") {
                     debug!(
                         set = %set_name,
                         next_volume,
@@ -416,6 +402,7 @@ fn drive_unrar(
                             }
                             let _ = sin.flush();
                             next_volume += 1;
+                            line_buf.clear();
                         }
                         Err(e) => {
                             // Volume not available — abort.
@@ -431,7 +418,6 @@ fn drive_unrar(
                     }
                 }
 
-                // Check for retry prompt.
                 if line_trimmed.contains("[R]etry, [A]bort") {
                     warn!(set = %set_name, "Unrar retry prompt — aborting");
                     let mut sin = stdin.lock();
@@ -442,6 +428,10 @@ fn drive_unrar(
                         success: false,
                         error: Some("Unrar requested retry — aborted".to_string()),
                     };
+                }
+
+                if byte[0] == b'\n' {
+                    line_buf.clear();
                 }
             }
             Err(e) => {
@@ -589,5 +579,64 @@ mod tests {
                 assert!(!r.success);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_unrar_prompt_without_newline_is_detected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let script_path = tempdir.path().join("fake-unrar.sh");
+        std::fs::write(
+            &script_path,
+            "#!/bin/sh\nprintf 'Insert disk with next.rar [C]ontinue, [Q]uit '\nread answer\nif [ \"$answer\" = \"C\" ]; then\n  printf 'All OK\\n'\n  exit 0\nfi\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+
+        let first_volume = tempdir.path().join("movie.part001.rar");
+        let next_volume = tempdir.path().join("movie.part002.rar");
+        std::fs::write(&first_volume, b"vol1").unwrap();
+        std::fs::write(&next_volume, b"vol2").unwrap();
+
+        let state = Arc::new(Mutex::new(DirectUnpackState {
+            sets: BTreeMap::from([(
+                "movie".to_string(),
+                RarSetState {
+                    set_name: "movie".to_string(),
+                    volumes: BTreeMap::from([(0, first_volume.clone()), (1, next_volume)]),
+                },
+            )]),
+            download_finished: false,
+        }));
+        let volume_ready = Arc::new(Notify::new());
+        let killed = Arc::new(AtomicBool::new(false));
+        let output_dir = tempdir.path().join("out");
+        let rt = tokio::runtime::Handle::current();
+        let script = script_path.to_string_lossy().to_string();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            tokio::task::spawn_blocking(move || {
+                unpack_set(
+                    &script,
+                    "movie",
+                    &first_volume,
+                    &output_dir,
+                    None,
+                    state.as_ref(),
+                    volume_ready.as_ref(),
+                    killed.as_ref(),
+                    &rt,
+                )
+            })
+            .await
+            .unwrap()
+        })
+        .await
+        .expect("fake unrar prompt should not hang");
+
+        assert!(result.success, "expected fake unrar script to complete");
     }
 }

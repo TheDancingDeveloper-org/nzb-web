@@ -455,6 +455,9 @@ struct JobState {
     direct_unpacker: Option<DirectUnpacker>,
     /// Hopeless job tracker (None until download starts).
     hopeless_tracker: Option<HopelessTracker>,
+    /// True when the scheduler auto-paused the job to make room for a
+    /// higher-priority download.
+    preempted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -848,11 +851,49 @@ impl QueueManager {
     /// Start queued jobs up to the concurrency limit.
     fn start_next_queued(self: &Arc<Self>) {
         let max = self.max_active_downloads.load(Ordering::Relaxed);
-        loop {
-            let Some(job_id) = self.claim_next_download_slot(max) else {
-                break;
-            };
+        while let Some(job_id) = self.claim_next_download_slot(max) {
             self.launch_download(&job_id);
+        }
+        self.resume_preempted_jobs(max);
+    }
+
+    fn resume_preempted_jobs(self: &Arc<Self>, max: usize) {
+        loop {
+            let active = {
+                let jobs = self.jobs.lock();
+                jobs.values()
+                    .filter(|state| state.job.status == JobStatus::Downloading)
+                    .count()
+            };
+            if max > 0 && active >= max {
+                return;
+            }
+
+            let next_id = {
+                let jobs = self.jobs.lock();
+                let order = self.job_order.lock();
+                order.iter().find_map(|id| {
+                    jobs.get(id).and_then(|state| {
+                        if state.job.status == JobStatus::Paused && state.preempted {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+            };
+
+            let Some(job_id) = next_id else {
+                return;
+            };
+
+            if let Err(error) = self.resume_job(&job_id) {
+                warn!(job_id = %job_id, %error, "Failed to auto-resume preempted job");
+                if let Some(state) = self.jobs.lock().get_mut(&job_id) {
+                    state.preempted = false;
+                }
+                return;
+            }
         }
     }
 
@@ -934,6 +975,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                preempted: false,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -950,6 +992,7 @@ impl QueueManager {
             nzb_data,
             direct_unpacker: None,
             hopeless_tracker: None,
+            preempted: false,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -1041,6 +1084,7 @@ impl QueueManager {
             if let Some(state) = jobs.get_mut(job_id) {
                 state.job.status = JobStatus::Paused;
                 state.job.error_message = Some("Paused: low disk space".to_string());
+                state.preempted = false;
             }
             return;
         }
@@ -1423,6 +1467,7 @@ impl QueueManager {
                         if let Some(state) = jobs.get_mut(&job_id) {
                             state.job.status = JobStatus::Paused;
                             state.job.error_message = Some(reason);
+                            state.preempted = false;
                         }
                     }
                     self.persist_job_progress(&job_id);
@@ -1923,6 +1968,7 @@ impl QueueManager {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(d_id.as_str()) {
                             state.job.status = JobStatus::Paused;
+                            state.preempted = true;
                             // Persist to DB
                             let db = self.db.lock();
                             let _ = db.queue_update_progress(
@@ -1962,6 +2008,7 @@ impl QueueManager {
                 .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
 
             state.job.status = JobStatus::Paused;
+            state.preempted = false;
 
             let db = self.db.lock();
             db.queue_update_progress(
@@ -1997,6 +2044,7 @@ impl QueueManager {
                 .count();
 
             let state = jobs.get_mut(id).unwrap();
+            state.preempted = false;
 
             if ctx_alive {
                 // Job context still lives in the pool — just unpause it.
@@ -2130,9 +2178,11 @@ impl QueueManager {
                     JobStatus::Downloading => {
                         ids.push(id.clone());
                         state.job.status = JobStatus::Paused;
+                        state.preempted = false;
                     }
                     JobStatus::Queued => {
                         state.job.status = JobStatus::Paused;
+                        state.preempted = false;
                     }
                     _ => {}
                 }
@@ -2193,6 +2243,7 @@ impl QueueManager {
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused {
                     state.job.error_message = None;
+                    state.preempted = false;
                     if self.dispatch.has_job(id) {
                         state.job.status = JobStatus::Downloading;
                         to_unpause.push(id.clone());
@@ -2271,6 +2322,7 @@ impl QueueManager {
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
                     state.job.error_message = None;
+                    state.preempted = false;
                     if self.dispatch.has_job(id) {
                         state.job.status = JobStatus::Downloading;
                         to_unpause.push(id.clone());
@@ -2712,6 +2764,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                preempted: false,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
