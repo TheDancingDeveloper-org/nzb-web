@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::nzb_core::config::{CategoryConfig, ServerConfig};
@@ -357,6 +357,16 @@ struct JobState {
     hopeless_tracker: Option<HopelessTracker>,
 }
 
+/// Notification fired immediately when a job is accepted into the queue.
+#[derive(Debug, Clone)]
+pub struct JobAddedEvent {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    /// Raw NZB bytes, if available at add time. Wrapped in Arc to keep clones cheap.
+    pub nzb_data: Option<Arc<Vec<u8>>>,
+}
+
 // ---------------------------------------------------------------------------
 // QueueManager
 // ---------------------------------------------------------------------------
@@ -386,6 +396,8 @@ pub struct QueueManager {
     history_retention: Mutex<Option<usize>>,
     /// Log buffer for capturing per-job logs into history.
     log_buffer: Option<LogBuffer>,
+    /// Broadcast channel: fires immediately when a job is accepted into the queue.
+    add_tx: broadcast::Sender<JobAddedEvent>,
     /// Max concurrent active downloads (0 = unlimited).
     max_active_downloads: AtomicUsize,
     /// Category configs for post-processing decisions.
@@ -456,6 +468,8 @@ impl QueueManager {
         );
         worker_pool.start();
 
+        let (add_tx, _) = broadcast::channel(64);
+
         Arc::new(Self {
             jobs: Mutex::new(HashMap::new()),
             job_order: Mutex::new(Vec::new()),
@@ -468,6 +482,7 @@ impl QueueManager {
             pause_until: Mutex::new(None),
             history_retention: Mutex::new(None),
             log_buffer: Some(log_buffer),
+            add_tx,
             max_active_downloads: AtomicUsize::new(max_active_downloads),
             categories: Mutex::new(categories),
             min_free_space,
@@ -498,6 +513,12 @@ impl QueueManager {
     /// Set history retention limit.
     pub fn set_history_retention(&self, limit: Option<usize>) {
         *self.history_retention.lock() = limit;
+    }
+
+    /// Subscribe to job addition events. The receiver fires immediately when
+    /// a job is accepted into the queue, before download begins.
+    pub fn subscribe_additions(&self) -> broadcast::Receiver<JobAddedEvent> {
+        self.add_tx.subscribe()
     }
 
     /// Per-server `(server_id, active, limit)` triples for the live NNTP
@@ -699,6 +720,13 @@ impl QueueManager {
             articles = job.article_count,
             "Job added to queue"
         );
+
+        let _ = self.add_tx.send(JobAddedEvent {
+            id: job_id.clone(),
+            name: job.name.clone(),
+            category: job.category.clone(),
+            nzb_data: nzb_data.as_ref().map(|data| Arc::new(data.clone())),
+        });
 
         // If globally paused, add as paused
         if self.globally_paused.load(Ordering::Relaxed) {
