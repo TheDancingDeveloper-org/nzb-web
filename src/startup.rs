@@ -12,6 +12,38 @@ use crate::log_buffer::LogBuffer;
 use crate::queue_manager::QueueManager;
 use crate::state::AppState;
 
+fn sanitize_loaded_config(config: &mut AppConfig) {
+    for server in &mut config.servers {
+        let trim = |value: &mut String| {
+            let trimmed = value.trim();
+            if trimmed.len() != value.len() {
+                *value = trimmed.to_string();
+            }
+        };
+        let trim_opt = |value: &mut Option<String>| {
+            if let Some(inner) = value.as_mut() {
+                trim(inner);
+            }
+        };
+
+        trim(&mut server.host);
+        trim(&mut server.name);
+        trim_opt(&mut server.username);
+        trim_opt(&mut server.password);
+        trim_opt(&mut server.proxy_url);
+        trim_opt(&mut server.trusted_fingerprint);
+    }
+}
+
+fn env_flag_enabled(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Configuration for engine initialization.
 ///
 /// All fields except `config_path` are optional overrides —
@@ -51,6 +83,7 @@ pub async fn initialize(
 ) -> anyhow::Result<StartupResult> {
     let config_path = startup.config_path;
     let mut config = AppConfig::load(&config_path)?;
+    sanitize_loaded_config(&mut config);
 
     // Apply overrides
     if let Some(addr) = startup.listen_addr {
@@ -64,11 +97,23 @@ pub async fn initialize(
     }
 
     // Apply env var overrides for OpenTelemetry
-    if let Ok(val) = std::env::var("OTEL_ENABLED") {
-        config.otel.enabled = val == "true" || val == "1";
+    if let Some(val) = env_flag_enabled("OTEL_ENABLED") {
+        config.otel.enabled = val;
     }
     if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
         config.otel.endpoint = val;
+    }
+    if let Some(val) = env_flag_enabled("OTEL_LOGS_ENABLED") {
+        config.otel.logs_enabled = Some(val);
+    }
+    if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT") {
+        config.otel.logs_endpoint = Some(val);
+    }
+    if let Some(val) = env_flag_enabled("OTEL_METRICS_ENABLED") {
+        config.otel.metrics_enabled = Some(val);
+    }
+    if let Ok(val) = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
+        config.otel.metrics_endpoint = Some(val);
     }
     if let Ok(val) = std::env::var("OTEL_SERVICE_NAME") {
         config.otel.service_name = val;
@@ -167,4 +212,33 @@ pub async fn initialize(
         queue_manager,
         log_buffer,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_loaded_config;
+    use crate::nzb_core::config::AppConfig;
+    use crate::nzb_core::config::ServerConfig;
+
+    #[test]
+    fn sanitize_loaded_config_trims_server_fields() {
+        let mut config = AppConfig::default();
+        let mut server = ServerConfig::new("srv-1", " news.example.com \n");
+        server.name = " Primary ".into();
+        server.username = Some(" user ".into());
+        server.password = Some(" pass ".into());
+        server.proxy_url = Some(" socks5://proxy ".into());
+        server.trusted_fingerprint = Some(" abc123 ".into());
+        config.servers.push(server);
+
+        sanitize_loaded_config(&mut config);
+
+        let server = &config.servers[0];
+        assert_eq!(server.host, "news.example.com");
+        assert_eq!(server.name, "Primary");
+        assert_eq!(server.username.as_deref(), Some("user"));
+        assert_eq!(server.password.as_deref(), Some("pass"));
+        assert_eq!(server.proxy_url.as_deref(), Some("socks5://proxy"));
+        assert_eq!(server.trusted_fingerprint.as_deref(), Some("abc123"));
+    }
 }

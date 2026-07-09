@@ -123,15 +123,15 @@ impl SpeedTracker {
 ///    no longer capped to the first 25% of articles; the check runs
 ///    continuously while the job is downloading)
 /// 3. **Ongoing availability** — track bytes missing vs total (excluding par2)
-/// 4. **No-progress timeout** — Phase 6 addition. Fires when the tracker
-///    has been alive for longer than `no_progress_timeout` without ever
-///    seeing an article complete. Catches the zombie scenario where
-///    workers cycle silently (Phase 5 evicts them) but no failure is ever
-///    recorded against the job.
+/// 4. **No-progress timeout** — abort when the job stops emitting article
+///    progress for longer than `no_progress_timeout`, even after partial
+///    success. This catches both startup zombies and late-stage stalls.
 struct HopelessTracker {
     /// When the tracker (and therefore the download attempt) was instantiated.
-    /// Used by `time_based_check` to detect long-running zombie jobs.
+    /// Used for operator-facing elapsed-time snapshots.
     created_at: Instant,
+    /// Timestamp of the last success/failure event observed for this job.
+    last_progress_at: Instant,
     /// Total content bytes (excluding par2 files).
     content_bytes: u64,
     /// Total par2 bytes (tracked for diagnostics, not used in ratio calculation).
@@ -171,6 +171,7 @@ impl HopelessTracker {
 
         Self {
             created_at: Instant::now(),
+            last_progress_at: Instant::now(),
             content_bytes,
             par2_bytes,
             content_bytes_missing: 0,
@@ -182,6 +183,7 @@ impl HopelessTracker {
 
     /// Record a successful content article download.
     fn record_success(&mut self, is_par2: bool) {
+        self.last_progress_at = Instant::now();
         if !is_par2 {
             self.content_articles_checked += 1;
         }
@@ -200,6 +202,7 @@ impl HopelessTracker {
         estimated_bytes: u64,
         kind: crate::article_failure::ArticleFailureKind,
     ) {
+        self.last_progress_at = Instant::now();
         if is_par2 {
             return;
         }
@@ -295,18 +298,20 @@ impl HopelessTracker {
     /// the engine has stopped emitting progress events entirely (the
     /// zombie scenario).
     ///
-    /// Aborts if the tracker has been alive longer than `timeout` AND
-    /// no successful article has ever been recorded against it. The
-    /// caller is the queue manager's periodic tick — see
+    /// Aborts if the tracker has gone longer than `timeout` without
+    /// a success or failure event. The caller is the queue manager's
+    /// periodic tick — see
     /// [`QueueManager::scan_for_no_progress_jobs`].
     fn time_based_check(&self, timeout: Duration) -> Option<HopelessAbort> {
-        let elapsed = self.created_at.elapsed();
-        if elapsed >= timeout && self.content_articles_checked == 0 {
+        let idle = self.last_progress_at.elapsed();
+        if idle >= timeout {
             return Some(HopelessAbort {
                 tier: "no_progress_timeout",
                 reason: format!(
-                    "Aborted: no article completed or failed within {}s of starting download",
-                    elapsed.as_secs()
+                    "Aborted: no article completed or failed for {}s ({} checked, {} confirmed missing)",
+                    idle.as_secs(),
+                    self.content_articles_checked,
+                    self.content_articles_failed
                 ),
             });
         }
@@ -2405,10 +2410,8 @@ impl QueueManager {
                 }
 
                 // Phase 6: time-based hopeless scan. Catches downloads
-                // that have been alive long enough without any progress
-                // event reaching the tracker (the zombie scenario, where
-                // workers cycle silently and never emit ArticleComplete
-                // or ArticleFailed).
+                // that have stopped emitting article progress for too
+                // long, including late-stage stalls after partial success.
                 qm.scan_for_no_progress_jobs();
 
                 // Observability: every 10s, dump the state of every
@@ -2436,6 +2439,7 @@ impl QueueManager {
                                     tracker_failed,
                                     tracker_content_total,
                                     tracker_elapsed_secs,
+                                    tracker_idle_secs,
                                     tracker_content_bytes,
                                     tracker_content_missing,
                                 ) = s
@@ -2447,11 +2451,12 @@ impl QueueManager {
                                             t.content_articles_failed,
                                             t.content_articles_total,
                                             t.created_at.elapsed().as_secs(),
+                                            t.last_progress_at.elapsed().as_secs(),
                                             t.content_bytes,
                                             t.content_bytes_missing,
                                         )
                                     })
-                                    .unwrap_or((0, 0, 0, 0, 0, 0));
+                                    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
                                 (
                                     id.clone(),
                                     s.job.name.clone(),
@@ -2466,6 +2471,7 @@ impl QueueManager {
                                     tracker_failed,
                                     tracker_content_total,
                                     tracker_elapsed_secs,
+                                    tracker_idle_secs,
                                     tracker_content_bytes,
                                     tracker_content_missing,
                                 )
@@ -2486,6 +2492,7 @@ impl QueueManager {
                         t_failed,
                         t_total,
                         t_elapsed,
+                        t_idle,
                         t_bytes_total,
                         t_bytes_missing,
                     ) in snapshots
@@ -2513,6 +2520,7 @@ impl QueueManager {
                             total_bytes,
                             kbps = bps / 1024,
                             elapsed_secs = t_elapsed,
+                            idle_secs = t_idle,
                             tracker_checked = t_checked,
                             tracker_failed = t_failed,
                             tracker_total = t_total,
@@ -2597,6 +2605,7 @@ mod hopeless_tests {
         let article_bytes: u64 = 750_000; // ~750KB per article
         HopelessTracker {
             created_at: Instant::now(),
+            last_progress_at: Instant::now(),
             content_bytes: content_articles as u64 * article_bytes,
             par2_bytes: par2_articles as u64 * article_bytes,
             content_bytes_missing: 0,
@@ -2795,5 +2804,16 @@ mod hopeless_tests {
             result.is_some(),
             "100% failure on first 10 should abort immediately"
         );
+    }
+
+    #[test]
+    fn no_progress_timeout_fires_after_partial_success() {
+        let mut t = make_tracker(100, 10);
+        t.record_success(false);
+        t.last_progress_at = Instant::now() - Duration::from_secs(301);
+
+        let result = t.time_based_check(Duration::from_secs(300));
+        assert!(result.is_some(), "late-stage stalls should abort");
+        assert_eq!(result.unwrap().tier, "no_progress_timeout");
     }
 }
