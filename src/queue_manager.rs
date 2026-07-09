@@ -26,6 +26,25 @@ use crate::direct_unpack::DirectUnpacker;
 use crate::download_engine::{ConnectionTracker, ProgressUpdate, WorkerPool, build_job_submission};
 use crate::log_buffer::LogBuffer;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStatsData {
+    pub server_id: String,
+    pub server_name: String,
+    pub total_bytes: u64,
+    pub today_bytes: u64,
+    pub week_bytes: u64,
+    pub month_bytes: u64,
+    pub total_ok: usize,
+    pub today_ok: usize,
+    pub week_ok: usize,
+    pub month_ok: usize,
+    pub total_fail: usize,
+    pub today_fail: usize,
+    pub week_fail: usize,
+    pub month_fail: usize,
+    pub last_active: Option<DateTime<Utc>>,
+}
+
 /// Get free disk space for a path (returns 0 on error).
 fn get_disk_free(path: &std::path::Path) -> u64 {
     #[cfg(unix)]
@@ -2064,6 +2083,120 @@ impl QueueManager {
     pub fn history_list(&self, limit: usize) -> crate::nzb_core::Result<Vec<HistoryEntry>> {
         let db = self.db.lock();
         db.history_list(limit)
+    }
+
+    /// Aggregate per-server article and byte statistics from active jobs and
+    /// persisted history for display in the settings UI.
+    pub fn server_stats_get_all(&self, servers: &[ServerConfig]) -> Vec<ServerStatsData> {
+        let now = Utc::now();
+        let day_cutoff = now - chrono::Duration::days(1);
+        let week_cutoff = now - chrono::Duration::days(7);
+        let month_cutoff = now - chrono::Duration::days(30);
+
+        let mut stats_by_server: HashMap<String, ServerStatsData> = servers
+            .iter()
+            .map(|server| {
+                (
+                    server.id.clone(),
+                    ServerStatsData {
+                        server_id: server.id.clone(),
+                        server_name: server.name.clone(),
+                        total_bytes: 0,
+                        today_bytes: 0,
+                        week_bytes: 0,
+                        month_bytes: 0,
+                        total_ok: 0,
+                        today_ok: 0,
+                        week_ok: 0,
+                        month_ok: 0,
+                        total_fail: 0,
+                        today_fail: 0,
+                        week_fail: 0,
+                        month_fail: 0,
+                        last_active: None,
+                    },
+                )
+            })
+            .collect();
+
+        let mut apply = |timestamp: DateTime<Utc>,
+                         per_server: &[ServerArticleStats],
+                         active: bool| {
+            for entry in per_server {
+                let stats = stats_by_server
+                    .entry(entry.server_id.clone())
+                    .or_insert_with(|| ServerStatsData {
+                        server_id: entry.server_id.clone(),
+                        server_name: entry.server_name.clone(),
+                        total_bytes: 0,
+                        today_bytes: 0,
+                        week_bytes: 0,
+                        month_bytes: 0,
+                        total_ok: 0,
+                        today_ok: 0,
+                        week_ok: 0,
+                        month_ok: 0,
+                        total_fail: 0,
+                        today_fail: 0,
+                        week_fail: 0,
+                        month_fail: 0,
+                        last_active: None,
+                    });
+                if stats.server_name.is_empty() {
+                    stats.server_name = entry.server_name.clone();
+                }
+
+                stats.total_bytes = stats.total_bytes.saturating_add(entry.bytes_downloaded);
+                stats.total_ok = stats.total_ok.saturating_add(entry.articles_downloaded);
+                stats.total_fail = stats.total_fail.saturating_add(entry.articles_failed);
+
+                if timestamp >= day_cutoff {
+                    stats.today_bytes = stats.today_bytes.saturating_add(entry.bytes_downloaded);
+                    stats.today_ok = stats.today_ok.saturating_add(entry.articles_downloaded);
+                    stats.today_fail = stats.today_fail.saturating_add(entry.articles_failed);
+                }
+                if timestamp >= week_cutoff {
+                    stats.week_bytes = stats.week_bytes.saturating_add(entry.bytes_downloaded);
+                    stats.week_ok = stats.week_ok.saturating_add(entry.articles_downloaded);
+                    stats.week_fail = stats.week_fail.saturating_add(entry.articles_failed);
+                }
+                if timestamp >= month_cutoff {
+                    stats.month_bytes = stats.month_bytes.saturating_add(entry.bytes_downloaded);
+                    stats.month_ok = stats.month_ok.saturating_add(entry.articles_downloaded);
+                    stats.month_fail = stats.month_fail.saturating_add(entry.articles_failed);
+                }
+
+                if (entry.articles_downloaded > 0
+                    || entry.articles_failed > 0
+                    || entry.bytes_downloaded > 0)
+                    && stats
+                        .last_active
+                        .is_none_or(|existing| timestamp > existing)
+                {
+                    stats.last_active = Some(if active { now } else { timestamp });
+                }
+            }
+        };
+
+        {
+            let jobs = self.jobs.lock();
+            for state in jobs.values() {
+                apply(state.job.added_at, &state.job.server_stats, true);
+            }
+        }
+
+        let history = self.history_list(10_000).unwrap_or_default();
+        for entry in history {
+            apply(entry.completed_at, &entry.server_stats, false);
+        }
+
+        let mut stats: Vec<_> = stats_by_server.into_values().collect();
+        stats.sort_by(|a, b| {
+            a.server_name
+                .cmp(&b.server_name)
+                .then(a.server_id.cmp(&b.server_id))
+        });
+        stats
     }
 
     /// Get a single history entry.
