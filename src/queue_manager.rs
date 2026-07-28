@@ -4,7 +4,7 @@
 //! engine instances, and exposes a thread-safe API for the HTTP handlers
 //! to interact with.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -19,12 +19,59 @@ use crate::nzb_core::config::{CategoryConfig, ServerConfig};
 use crate::nzb_core::db::Database;
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
-use nzb_postproc::{PostProcConfig, parse_rar_volume, run_pipeline};
+use nzb_postproc::{PostProcConfig, has_usable_output, parse_rar_volume, run_pipeline};
 
-use crate::bandwidth::BandwidthLimiter;
 use crate::direct_unpack::DirectUnpacker;
-use crate::download_engine::{ConnectionTracker, ProgressUpdate, WorkerPool, build_job_submission};
 use crate::log_buffer::LogBuffer;
+use nzb_dispatch::{
+    BandwidthConfig, BandwidthLimiter, DispatchEngine, DispatchHandle, ProgressUpdate,
+};
+
+fn cleanup_terminal_work_dir(job_id: &str, work_dir: &std::path::Path, final_status: JobStatus) {
+    if !work_dir.exists() {
+        return;
+    }
+
+    let cleanup_result = match final_status {
+        // Failed downloads can be retried from their retained NZB history, so
+        // retaining raw articles only leaks disk without improving recovery.
+        JobStatus::Failed => std::fs::remove_dir_all(work_dir),
+        // A successful job must not lose files if an output move failed. Only
+        // remove the directory after the move/pipeline has left it empty.
+        JobStatus::Completed => match std::fs::read_dir(work_dir) {
+            Ok(mut entries) => {
+                if entries.next().is_none() {
+                    std::fs::remove_dir(work_dir)
+                } else {
+                    warn!(
+                        job_id,
+                        work_dir = %work_dir.display(),
+                        "Retaining non-empty completed work directory after output move"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job_id,
+                    work_dir = %work_dir.display(),
+                    "Unable to inspect completed work directory for safe cleanup: {e}"
+                );
+                return;
+            }
+        },
+        _ => return,
+    };
+
+    match cleanup_result {
+        Ok(()) => info!(job_id, work_dir = %work_dir.display(), "Removed terminal work directory"),
+        Err(e) => warn!(
+            job_id,
+            work_dir = %work_dir.display(),
+            "Failed to remove terminal work directory: {e}"
+        ),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerStatsData {
@@ -43,6 +90,38 @@ pub struct ServerStatsData {
     pub week_fail: usize,
     pub month_fail: usize,
     pub last_active: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatisticsPeriodData {
+    pub downloads: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub bytes_downloaded: u64,
+    pub total_duration_secs: f64,
+    pub average_speed_bps: u64,
+    pub fastest_download_bps: u64,
+    pub news_server_hits: usize,
+    pub articles_served: usize,
+    pub articles_missing: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyStatisticsData {
+    pub date: String,
+    #[serde(flatten)]
+    pub totals: StatisticsPeriodData,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalStatisticsData {
+    pub generated_at: DateTime<Utc>,
+    pub lifetime: StatisticsPeriodData,
+    pub today: StatisticsPeriodData,
+    pub week: StatisticsPeriodData,
+    pub month: StatisticsPeriodData,
+    pub servers: Vec<ServerStatsData>,
+    pub daily: Vec<DailyStatisticsData>,
 }
 
 /// Get free disk space for a path (returns 0 on error).
@@ -141,7 +220,7 @@ impl SpeedTracker {
 /// 2. **Early failure check** — if most articles fail, abort fast (Phase 6:
 ///    no longer capped to the first 25% of articles; the check runs
 ///    continuously while the job is downloading)
-/// 3. **Ongoing availability** — track bytes missing vs total (excluding par2)
+/// 3. **Ongoing availability** — compare missing content with usable PAR2 capacity
 /// 4. **No-progress timeout** — abort when the job stops emitting article
 ///    progress for longer than `no_progress_timeout`, even after partial
 ///    success. This catches both startup zombies and late-stage stalls.
@@ -153,9 +232,23 @@ struct HopelessTracker {
     last_progress_at: Instant,
     /// Total content bytes (excluding par2 files).
     content_bytes: u64,
-    /// Total par2 bytes (tracked for diagnostics, not used in ratio calculation).
-    #[expect(dead_code)]
-    par2_bytes: u64,
+    /// Recovery capacity declared by PAR2 volume files. Index files do not
+    /// contribute capacity. The block count is retained for diagnostics and
+    /// future source-block mapping; bytes are the conservative interim unit
+    /// used before the assembled index can be parsed.
+    recovery_capacity_bytes: u64,
+    recovery_blocks_total: u64,
+    /// Declared recovery data lost to definitive volume-segment failures.
+    recovery_bytes_unavailable: u64,
+    recovery_blocks_unavailable: u64,
+    /// Per-set accounting prevents recovery blocks from one PAR2 set from
+    /// masking damage in another set.
+    recovery_capacity_by_set: HashMap<String, u64>,
+    recovery_unavailable_by_set: HashMap<String, u64>,
+    missing_content_by_set: HashMap<String, u64>,
+    unassociated_missing_bytes: u64,
+    content_file_sets: HashMap<String, Option<String>>,
+    pending_file_classifications: std::collections::HashSet<String>,
     /// Content bytes confirmed missing (failed articles in non-par2 files).
     content_bytes_missing: u64,
     /// Articles checked so far (downloaded + failed, not par2).
@@ -176,15 +269,56 @@ const EARLY_CHECK_FAILURE_RATE: f64 = 0.80;
 impl HopelessTracker {
     fn new(job: &NzbJob) -> Self {
         let mut content_bytes: u64 = 0;
-        let mut par2_bytes: u64 = 0;
+        let mut recovery_capacity_bytes: u64 = 0;
+        let mut recovery_blocks_total: u64 = 0;
         let mut content_articles_total: usize = 0;
+        let recovery_set_names = job
+            .files
+            .iter()
+            .filter(|file| file.is_par2)
+            .filter_map(|file| file.par2_setname.as_deref())
+            .map(str::to_ascii_lowercase)
+            .collect::<std::collections::HashSet<_>>();
+        let mut recovery_capacity_by_set = HashMap::new();
+        let mut content_file_sets = HashMap::new();
+        let mut pending_file_classifications = std::collections::HashSet::new();
 
         for file in &job.files {
             if file.is_par2 {
-                par2_bytes += file.bytes;
+                // A plain .par2 is the index. Only .volNN+MM.par2 or
+                // .volNN-MM.par2 recovery volumes declare usable blocks.
+                if file.par2_vol.is_some() && file.par2_blocks.is_some_and(|blocks| blocks > 0) {
+                    recovery_capacity_bytes = recovery_capacity_bytes.saturating_add(file.bytes);
+                    recovery_blocks_total = recovery_blocks_total
+                        .saturating_add(u64::from(file.par2_blocks.unwrap_or_default()));
+                    if let Some(set_name) = file.par2_setname.as_deref() {
+                        let capacity = recovery_capacity_by_set
+                            .entry(set_name.to_ascii_lowercase())
+                            .or_insert(0u64);
+                        *capacity = capacity.saturating_add(file.bytes);
+                    }
+                }
+                content_file_sets.insert(
+                    file.id.clone(),
+                    file.par2_setname.as_deref().map(str::to_ascii_lowercase),
+                );
             } else {
                 content_bytes += file.bytes;
                 content_articles_total += file.articles.len();
+                let filename = file.filename.to_ascii_lowercase();
+                let associated_set = if recovery_set_names.len() == 1 {
+                    recovery_set_names.iter().next().cloned()
+                } else {
+                    recovery_set_names
+                        .iter()
+                        .filter(|set_name| filename.starts_with(set_name.as_str()))
+                        .max_by_key(|set_name| set_name.len())
+                        .cloned()
+                };
+                content_file_sets.insert(file.id.clone(), associated_set);
+                if !nzb_dispatch::has_known_extension(&file.filename) {
+                    pending_file_classifications.insert(file.id.clone());
+                }
             }
         }
 
@@ -192,7 +326,16 @@ impl HopelessTracker {
             created_at: Instant::now(),
             last_progress_at: Instant::now(),
             content_bytes,
-            par2_bytes,
+            recovery_capacity_bytes,
+            recovery_blocks_total,
+            recovery_bytes_unavailable: 0,
+            recovery_blocks_unavailable: 0,
+            recovery_capacity_by_set,
+            recovery_unavailable_by_set: HashMap::new(),
+            missing_content_by_set: HashMap::new(),
+            unassociated_missing_bytes: 0,
+            content_file_sets,
+            pending_file_classifications,
             content_bytes_missing: 0,
             content_articles_checked: 0,
             content_articles_failed: 0,
@@ -208,6 +351,41 @@ impl HopelessTracker {
         }
     }
 
+    /// Correct an obfuscated NZB subject after a yEnc header reveals that the
+    /// file is PAR2. The file must leave the content denominator and only a
+    /// recovery volume (never the index) may add capacity.
+    fn reclassify_as_par2(
+        &mut self,
+        file_id: &str,
+        file_bytes: u64,
+        article_count: usize,
+        volume: Option<u32>,
+        blocks: Option<u32>,
+        set_name: Option<&str>,
+    ) {
+        self.content_bytes = self.content_bytes.saturating_sub(file_bytes);
+        self.content_articles_total = self.content_articles_total.saturating_sub(article_count);
+        if volume.is_some() && blocks.is_some_and(|count| count > 0) {
+            self.recovery_capacity_bytes = self.recovery_capacity_bytes.saturating_add(file_bytes);
+            self.recovery_blocks_total = self
+                .recovery_blocks_total
+                .saturating_add(u64::from(blocks.unwrap_or_default()));
+            if let Some(set_name) = set_name {
+                *self
+                    .recovery_capacity_by_set
+                    .entry(set_name.to_ascii_lowercase())
+                    .or_insert(0) += file_bytes;
+            }
+        }
+        self.content_file_sets
+            .insert(file_id.to_string(), set_name.map(str::to_ascii_lowercase));
+        self.pending_file_classifications.remove(file_id);
+    }
+
+    fn mark_file_classified(&mut self, file_id: &str) {
+        self.pending_file_classifications.remove(file_id);
+    }
+
     /// Record a failed content article. Returns the estimated byte size
     /// of the missing article.
     ///
@@ -215,14 +393,42 @@ impl HopelessTracker {
     /// ignore failures that are likely transient (server-down, auth, etc.)
     /// and only count failures that genuinely indicate the article cannot
     /// be retrieved (NotFound, DecodeError).
+    #[cfg(test)]
     fn record_failure(
         &mut self,
         is_par2: bool,
         estimated_bytes: u64,
-        kind: crate::article_failure::ArticleFailureKind,
+        kind: nzb_dispatch::ArticleFailureKind,
+    ) {
+        self.record_file_failure(None, is_par2, estimated_bytes, kind);
+    }
+
+    fn record_file_failure(
+        &mut self,
+        file_id: Option<&str>,
+        is_par2: bool,
+        estimated_bytes: u64,
+        kind: nzb_dispatch::ArticleFailureKind,
     ) {
         self.last_progress_at = Instant::now();
         if is_par2 {
+            self.recovery_bytes_unavailable = self
+                .recovery_bytes_unavailable
+                .saturating_add(estimated_bytes)
+                .min(self.recovery_capacity_bytes);
+            if self.recovery_capacity_bytes > 0 && self.recovery_blocks_total > 0 {
+                self.recovery_blocks_unavailable = ((u128::from(self.recovery_bytes_unavailable)
+                    * u128::from(self.recovery_blocks_total))
+                .div_ceil(u128::from(self.recovery_capacity_bytes)))
+                .min(u128::from(self.recovery_blocks_total))
+                    as u64;
+            }
+            if let Some(Some(set_name)) = file_id.and_then(|id| self.content_file_sets.get(id)) {
+                *self
+                    .recovery_unavailable_by_set
+                    .entry(set_name.clone())
+                    .or_insert(0) += estimated_bytes;
+            }
             return;
         }
         self.content_articles_checked += 1;
@@ -232,6 +438,19 @@ impl HopelessTracker {
         if kind.counts_toward_hopeless() {
             self.content_articles_failed += 1;
             self.content_bytes_missing += estimated_bytes;
+            match file_id.and_then(|id| self.content_file_sets.get(id)) {
+                Some(Some(set_name)) => {
+                    *self
+                        .missing_content_by_set
+                        .entry(set_name.clone())
+                        .or_insert(0) += estimated_bytes;
+                }
+                _ => {
+                    self.unassociated_missing_bytes = self
+                        .unassociated_missing_bytes
+                        .saturating_add(estimated_bytes);
+                }
+            }
         }
     }
 
@@ -255,6 +474,24 @@ impl HopelessTracker {
             return None;
         }
 
+        // Unknown/obfuscated NZB subjects may still reveal PAR2 volumes in
+        // their yEnc headers. Do not declare content damage hopeless until
+        // those files have been classified or the normal no-progress path
+        // takes over.
+        if !self.pending_file_classifications.is_empty() {
+            return None;
+        }
+
+        let usable_recovery_bytes = self
+            .recovery_capacity_bytes
+            .saturating_sub(self.recovery_bytes_unavailable);
+        let available_content_bytes = self
+            .content_bytes
+            .saturating_sub(self.content_bytes_missing);
+        let effective_bytes = available_content_bytes.saturating_add(usable_recovery_bytes);
+        let required_bytes =
+            ((self.content_bytes as f64) * required_completion_pct / 100.0).ceil() as u64;
+
         // Tier 2: early failure check — catch completely dead NZBs fast.
         // Phase 6: removed the `<= total/4` window upper bound. The check
         // now fires whenever the failure rate is above the threshold AND
@@ -265,34 +502,85 @@ impl HopelessTracker {
         if early_failure_check && self.content_articles_checked >= EARLY_CHECK_MIN_ARTICLES {
             let failure_rate =
                 self.content_articles_failed as f64 / self.content_articles_checked as f64;
-            if failure_rate >= EARLY_CHECK_FAILURE_RATE {
+            let projected_missing_bytes = (self.content_bytes as f64 * failure_rate).ceil() as u64;
+            let safety_reserve = required_bytes.saturating_sub(self.content_bytes);
+            if failure_rate >= EARLY_CHECK_FAILURE_RATE
+                && projected_missing_bytes.saturating_add(safety_reserve) > usable_recovery_bytes
+            {
                 return Some(HopelessAbort {
                     tier: "early_failure",
                     reason: format!(
-                        "Aborted: {:.0}% of {} checked articles missing ({} of {} failed)",
+                        "Aborted: {:.0}% of {} checked articles missing ({} of {} failed); \
+                         projected damage {} bytes exceeds {} usable recovery bytes plus reserve",
                         failure_rate * 100.0,
                         self.content_articles_checked,
                         self.content_articles_failed,
                         self.content_articles_checked,
+                        projected_missing_bytes,
+                        usable_recovery_bytes,
                     ),
                 });
             }
         }
 
-        // Tier 3: ongoing availability ratio (excluding par2)
+        let safety_reserve = required_bytes.saturating_sub(self.content_bytes);
+        let set_repairable = (!self.recovery_capacity_by_set.is_empty()).then(|| {
+            if self.unassociated_missing_bytes > 0 {
+                // Multiple PAR2 sets with an ambiguous content filename need
+                // the assembled index for authoritative association. Defer
+                // to post-processing instead of borrowing blocks from the
+                // wrong set or aborting prematurely.
+                return true;
+            }
+            let mut remaining_reserve = 0u64;
+            for (set_name, capacity) in &self.recovery_capacity_by_set {
+                let usable = capacity.saturating_sub(
+                    self.recovery_unavailable_by_set
+                        .get(set_name)
+                        .copied()
+                        .unwrap_or(0),
+                );
+                let missing = self
+                    .missing_content_by_set
+                    .get(set_name)
+                    .copied()
+                    .unwrap_or(0);
+                if missing > usable {
+                    return false;
+                }
+                remaining_reserve =
+                    remaining_reserve.saturating_add(usable.saturating_sub(missing));
+            }
+            self.missing_content_by_set
+                .keys()
+                .all(|set_name| self.recovery_capacity_by_set.contains_key(set_name))
+                && remaining_reserve >= safety_reserve
+        });
+
+        // Recovery capacity and the configured safety reserve are the
+        // primary ongoing completion model. Prefer per-set proof when set
+        // associations are available; otherwise retain the conservative
+        // aggregate estimate for older/ambiguous NZBs.
+        if set_repairable.unwrap_or(effective_bytes >= required_bytes) {
+            return None;
+        }
+
+        // Tier 3: effective completion, including usable PAR2 recovery.
         if self.content_bytes > 0 {
-            let available_bytes = self
-                .content_bytes
-                .saturating_sub(self.content_bytes_missing);
-            let availability_pct = 100.0 * available_bytes as f64 / self.content_bytes as f64;
-            if availability_pct < required_completion_pct {
+            let availability_pct = 100.0 * effective_bytes as f64 / self.content_bytes as f64;
+            if availability_pct < required_completion_pct || set_repairable == Some(false) {
                 return Some(HopelessAbort {
                     tier: "ongoing_availability",
                     reason: format!(
-                        "Aborted: only {availability_pct:.1}% of content available \
-                         (need {required_completion_pct:.1}%), \
-                         {} of {} content articles missing",
-                        self.content_articles_failed, self.content_articles_total,
+                        "Aborted: effective completion {availability_pct:.3}% is below \
+                         {required_completion_pct:.3}%: {} missing content bytes in {} of {} \
+                         articles, {} usable recovery bytes ({} of {} recovery blocks unavailable)",
+                        self.content_bytes_missing,
+                        self.content_articles_failed,
+                        self.content_articles_total,
+                        usable_recovery_bytes,
+                        self.recovery_blocks_unavailable,
+                        self.recovery_blocks_total,
                     ),
                 });
             }
@@ -355,6 +643,8 @@ struct JobState {
     direct_unpacker: Option<DirectUnpacker>,
     /// Hopeless job tracker (None until download starts).
     hopeless_tracker: Option<HopelessTracker>,
+    /// Active worker-pool duration captured at terminal download resolution.
+    download_time_secs: Option<f64>,
 }
 
 /// Notification fired immediately when a job is accepted into the queue.
@@ -383,6 +673,14 @@ pub struct QueueManager {
     servers: Arc<Mutex<Vec<ServerConfig>>>,
     /// Whether all downloads are globally paused.
     globally_paused: AtomicBool,
+    /// Serializes global pause/resume transitions with individual resume
+    /// attempts so the global gate cannot be bypassed by a racing request.
+    pause_transition: Mutex<()>,
+    /// Jobs whose `Paused` status was applied by the current global pause.
+    ///
+    /// Keeping this separate from ordinary per-job pause state means that
+    /// `resume_all` only resumes work stopped by `pause_all`.
+    globally_paused_jobs: Mutex<HashSet<String>>,
     /// Global speed tracker.
     speed: SpeedTracker,
     /// Database for persistence.
@@ -408,6 +706,8 @@ pub struct QueueManager {
     bandwidth: Arc<BandwidthLimiter>,
     /// Whether direct unpack (RAR extraction during download) is enabled.
     direct_unpack_enabled: AtomicBool,
+    /// Maximum number of nested archive layers to extract after the outer archive.
+    max_nested_archive_depth: u8,
     /// Abort downloads that cannot possibly complete.
     abort_hopeless: bool,
     /// Phase 6: maximum time a job may sit in `Downloading` without any
@@ -416,15 +716,15 @@ pub struct QueueManager {
     no_progress_timeout: Mutex<Duration>,
     /// Quick initial failure check on first N articles.
     early_failure_check: bool,
-    /// Global NNTP connection tracker (shared across all download jobs).
-    conn_tracker: Arc<ConnectionTracker>,
-    /// Shared worker pool that services all active download jobs.
-    worker_pool: Arc<WorkerPool>,
-    /// Minimum completion percentage required (excluding par2).
+    /// Canonical article dispatcher owned by `nzb-dispatch`.
+    dispatch: Arc<dyn DispatchEngine>,
+    /// Minimum effective completion percentage, including usable PAR2 capacity.
     required_completion_pct: f64,
 }
 
 impl QueueManager {
+    const GLOBAL_PAUSED_JOBS_SETTING: &'static str = "globally_paused_job_ids";
+
     /// Create a new queue manager.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -438,12 +738,12 @@ impl QueueManager {
         min_free_space: u64,
         speed_limit_bps: u64,
         direct_unpack: bool,
+        max_nested_archive_depth: u8,
         abort_hopeless: bool,
         early_failure_check: bool,
         required_completion_pct: f64,
         article_timeout_secs: u64,
     ) -> Arc<Self> {
-        use crate::bandwidth::BandwidthConfig;
         use std::num::NonZeroU32;
 
         let download_bps = if speed_limit_bps > 0 {
@@ -453,20 +753,13 @@ impl QueueManager {
         };
         let bandwidth = Arc::new(BandwidthLimiter::new(BandwidthConfig { download_bps }));
 
-        // Build connection tracker with per-server limits.
-        let conn_tracker = Arc::new(ConnectionTracker::new());
-        for server in &servers {
-            conn_tracker.set_limit(&server.id, &server.name, server.connections as usize);
-        }
-
         let servers_arc = Arc::new(Mutex::new(servers));
-        let worker_pool = WorkerPool::new(
+        let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::new(
             Arc::clone(&servers_arc),
             Arc::clone(&bandwidth),
-            Arc::clone(&conn_tracker),
             article_timeout_secs,
-        );
-        worker_pool.start();
+        ));
+        dispatch.start();
 
         let (add_tx, _) = broadcast::channel(64);
 
@@ -475,6 +768,8 @@ impl QueueManager {
             job_order: Mutex::new(Vec::new()),
             servers: servers_arc,
             globally_paused: AtomicBool::new(false),
+            pause_transition: Mutex::new(()),
+            globally_paused_jobs: Mutex::new(HashSet::new()),
             speed: SpeedTracker::new(),
             db: Mutex::new(db),
             incomplete_dir: Mutex::new(incomplete_dir),
@@ -488,8 +783,8 @@ impl QueueManager {
             min_free_space,
             bandwidth,
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
-            conn_tracker,
-            worker_pool,
+            max_nested_archive_depth,
+            dispatch,
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
@@ -510,6 +805,16 @@ impl QueueManager {
         *self.history_retention.lock()
     }
 
+    fn persist_globally_paused_jobs(&self) {
+        let mut ids: Vec<_> = self.globally_paused_jobs.lock().iter().cloned().collect();
+        ids.sort();
+        if let Ok(value) = serde_json::to_string(&ids) {
+            self.db
+                .lock()
+                .set_setting(Self::GLOBAL_PAUSED_JOBS_SETTING, &value);
+        }
+    }
+
     /// Set history retention limit.
     pub fn set_history_retention(&self, limit: Option<usize>) {
         *self.history_retention.lock() = limit;
@@ -525,25 +830,31 @@ impl QueueManager {
     /// connection pool. `active` is by-construction `<= limit` because the
     /// pool is semaphore-backed.
     pub fn connection_snapshot(&self) -> Vec<(String, usize, usize)> {
-        self.conn_tracker.snapshot()
+        self.dispatch.connection_snapshot()
+    }
+
+    /// Per-server sockets actively transferring articles. Connected workers
+    /// waiting for work are reported as free capacity.
+    pub fn connected_snapshot(&self) -> Vec<(String, usize, usize)> {
+        self.dispatch.active_connection_snapshot()
     }
 
     /// Total currently-held NNTP connection slots across all servers.
     pub fn connection_total(&self) -> usize {
-        self.conn_tracker.total()
+        self.dispatch.connection_total()
     }
 
     /// Override the worker idle eviction threshold (Phase 5 watchdog).
     /// Test harnesses use this to make the eviction trigger in seconds.
     pub fn set_max_worker_idle(&self, d: std::time::Duration) {
-        self.worker_pool.set_max_worker_idle(d);
+        self.dispatch.set_max_worker_idle(d);
     }
 
     /// Lifetime count of worker evictions performed by the Phase 5 idle
     /// watchdog. Each increment means the supervisor reclaimed a worker
     /// that had stalled past `max_worker_idle`.
     pub fn worker_eviction_count(&self) -> u64 {
-        self.worker_pool.eviction_count()
+        self.dispatch.eviction_count()
     }
 
     /// Phase 6: override the time-based hopeless threshold. Tests use this
@@ -592,7 +903,10 @@ impl QueueManager {
                     state.job.error_message = Some(abort.reason.clone());
                 }
             }
-            self.worker_pool.abort_job(&job_id, abort.reason);
+            if !self.dispatch.abort_job(&job_id, abort.reason) {
+                crate::increment_counter("jobs.duplicate_terminal_attempts");
+                debug!(job_id = %job_id, "Duplicate terminal abort request ignored");
+            }
         }
     }
 
@@ -738,8 +1052,11 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                download_time_secs: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
+            self.globally_paused_jobs.lock().insert(job_id.clone());
+            self.persist_globally_paused_jobs();
             self.job_order.lock().push(job_id);
             return Ok(());
         }
@@ -754,6 +1071,7 @@ impl QueueManager {
             nzb_data,
             direct_unpacker: None,
             hopeless_tracker: None,
+            download_time_secs: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -864,8 +1182,9 @@ impl QueueManager {
         // can fall behind. Unbounded was a memory hazard. With a 10K cap
         // the worst case is bounded buffering plus a `WARN` from
         // `try_send_or_warn` when the channel is full.
-        let (progress_tx, progress_rx) =
-            mpsc::channel::<ProgressUpdate>(crate::download_engine::PROGRESS_CHANNEL_CAPACITY);
+        let (progress_tx, progress_rx) = mpsc::channel::<ProgressUpdate>(
+            nzb_dispatch::download_engine::PROGRESS_CHANNEL_CAPACITY,
+        );
 
         {
             let srv = self.servers.lock();
@@ -881,9 +1200,7 @@ impl QueueManager {
             }
         }
 
-        // Build the per-job context and work items, submit to the worker pool.
-        let (ctx, items) = build_job_submission(&job, progress_tx);
-        self.worker_pool.submit_job(ctx, items);
+        self.dispatch.submit_job(&job, progress_tx);
 
         // Spawn the per-job progress handler and record its handle.
         let qm = Arc::clone(self);
@@ -899,7 +1216,16 @@ impl QueueManager {
             if let Some(state) = jobs.get_mut(job_id) {
                 state.progress_handle = Some(progress_handle);
                 state.speed = Arc::clone(&job_speed);
-                state.hopeless_tracker = Some(HopelessTracker::new(&state.job));
+                let tracker = HopelessTracker::new(&state.job);
+                info!(
+                    job_id = %job_id,
+                    par2_recovery_volumes = tracker.recovery_capacity_by_set.len(),
+                    par2_recovery_blocks = tracker.recovery_blocks_total,
+                    par2_recovery_bytes = tracker.recovery_capacity_bytes,
+                    content_bytes = tracker.content_bytes,
+                    "PAR2 recovery capacity initialized"
+                );
+                state.hopeless_tracker = Some(tracker);
             }
         }
     }
@@ -915,12 +1241,54 @@ impl QueueManager {
 
         while let Some(update) = progress_rx.recv().await {
             match update {
+                ProgressUpdate::WaitingForProviders { message, .. } => {
+                    let mut changed = false;
+                    {
+                        let mut jobs = self.jobs.lock();
+                        if let Some(state) = jobs.get_mut(&job_id)
+                            && state.job.error_message.as_deref() != Some(&message)
+                        {
+                            // Keep the job downloading: provider recovery is
+                            // automatic and this is not missing content.
+                            state.job.error_message = Some(message.clone());
+                            changed = true;
+                        }
+                    }
+                    if changed
+                        && let Err(error) = self
+                            .db
+                            .lock()
+                            .queue_update_error_message(&job_id, Some(&message))
+                    {
+                        warn!(job_id = %job_id, "Failed to persist provider waiting status: {error}");
+                    }
+                }
+                ProgressUpdate::ProvidersAvailable { .. } => {
+                    let mut cleared = false;
+                    {
+                        let mut jobs = self.jobs.lock();
+                        if let Some(state) = jobs.get_mut(&job_id)
+                            && state.job.error_message.as_deref().is_some_and(|message| {
+                                message.starts_with("Waiting for providers:")
+                            })
+                        {
+                            state.job.error_message = None;
+                            cleared = true;
+                        }
+                    }
+                    if cleared
+                        && let Err(error) = self.db.lock().queue_update_error_message(&job_id, None)
+                    {
+                        warn!(job_id = %job_id, "Failed to clear provider waiting status: {error}");
+                    }
+                }
                 ProgressUpdate::ArticleComplete {
                     file_id,
                     segment_number,
                     decoded_bytes,
                     file_complete,
                     server_id,
+                    yenc_filename,
                     ..
                 } => {
                     self.speed.record(decoded_bytes);
@@ -930,6 +1298,58 @@ impl QueueManager {
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
+                            if let Some(yenc_name) = yenc_filename.as_deref() {
+                                let clean_name = std::path::Path::new(yenc_name)
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or(yenc_name);
+                                let revealed_par2 =
+                                    clean_name.to_ascii_lowercase().ends_with(".par2");
+                                if !revealed_par2
+                                    && nzb_dispatch::has_known_extension(clean_name)
+                                    && let Some(tracker) = state.hopeless_tracker.as_mut()
+                                {
+                                    tracker.mark_file_classified(&file_id);
+                                }
+                                let file_info = state
+                                    .job
+                                    .files
+                                    .iter()
+                                    .find(|file| file.id == file_id)
+                                    .filter(|file| revealed_par2 && !file.is_par2)
+                                    .map(|file| (file.bytes, file.articles.len()));
+                                if let Some((file_bytes, article_count)) = file_info {
+                                    let (set_name, volume, blocks) =
+                                        crate::nzb_core::nzb_parser::parse_par2_filename(
+                                            clean_name,
+                                        );
+                                    if let Some(tracker) = state.hopeless_tracker.as_mut() {
+                                        tracker.reclassify_as_par2(
+                                            &file_id,
+                                            file_bytes,
+                                            article_count,
+                                            volume,
+                                            blocks,
+                                            set_name.as_deref(),
+                                        );
+                                    }
+                                    if let Some(file) =
+                                        state.job.files.iter_mut().find(|file| file.id == file_id)
+                                    {
+                                        file.is_par2 = true;
+                                        file.par2_setname = set_name;
+                                        file.par2_vol = volume;
+                                        file.par2_blocks = blocks;
+                                    }
+                                    info!(
+                                        job_id = %job_id,
+                                        file_id = %file_id,
+                                        yenc_filename = %clean_name,
+                                        recovery_blocks = blocks.unwrap_or_default(),
+                                        "Obfuscated file reclassified as PAR2 from yEnc header"
+                                    );
+                                }
+                            }
                             state.job.downloaded_bytes += decoded_bytes;
                             state.job.articles_downloaded += 1;
 
@@ -1030,7 +1450,10 @@ impl QueueManager {
                     }
                 }
                 ProgressUpdate::ArticleFailed {
-                    file_id, failure, ..
+                    file_id,
+                    segment_number,
+                    failure,
+                    ..
                 } => {
                     let _ = &failure.message; // forwarded into logs below
                     let should_abort = {
@@ -1079,21 +1502,27 @@ impl QueueManager {
                                     .iter()
                                     .find(|f| f.id == file_id)
                                     .is_some_and(|f| f.is_par2);
-                                // Estimate article size from total file bytes / article count
-                                let estimated_bytes = state
+                                // Use the NZB's declared segment size. Averaging
+                                // a file across articles distorts the last segment
+                                // and can flip decisions close to the reserve.
+                                let declared_bytes = state
                                     .job
                                     .files
                                     .iter()
                                     .find(|f| f.id == file_id)
-                                    .map(|f| {
-                                        if f.articles.is_empty() {
-                                            0
-                                        } else {
-                                            f.bytes / f.articles.len() as u64
-                                        }
+                                    .and_then(|f| {
+                                        f.articles.iter().find(|article| {
+                                            article.segment_number == segment_number
+                                        })
                                     })
+                                    .map(|article| article.bytes)
                                     .unwrap_or(0);
-                                tracker.record_failure(file_is_par2, estimated_bytes, failure.kind);
+                                tracker.record_file_failure(
+                                    Some(&file_id),
+                                    file_is_par2,
+                                    declared_bytes,
+                                    failure.kind,
+                                );
                                 // Observability: dump tracker state on every
                                 // failure so operators can see the ratio
                                 // evolving towards hopeless-abort thresholds.
@@ -1101,10 +1530,15 @@ impl QueueManager {
                                 // minutes to fail" — exposes grace period,
                                 // early_failure, and ongoing_availability
                                 // check progress in real time.
-                                let avail_bytes_pct = if tracker.content_bytes > 0 {
+                                let effective_pct = if tracker.content_bytes > 0 {
                                     let avail: u64 = tracker
                                         .content_bytes
-                                        .saturating_sub(tracker.content_bytes_missing);
+                                        .saturating_sub(tracker.content_bytes_missing)
+                                        .saturating_add(
+                                            tracker
+                                                .recovery_capacity_bytes
+                                                .saturating_sub(tracker.recovery_bytes_unavailable),
+                                        );
                                     100.0 * (avail as f64 / tracker.content_bytes as f64)
                                 } else {
                                     100.0
@@ -1121,7 +1555,11 @@ impl QueueManager {
                                     failed = tracker.content_articles_failed,
                                     total = tracker.content_articles_total,
                                     failure_rate = format!("{fail_rate:.3}"),
-                                    availability_pct = format!("{avail_bytes_pct:.2}"),
+                                    effective_completion_pct = format!("{effective_pct:.3}"),
+                                    missing_content_bytes = tracker.content_bytes_missing,
+                                    usable_recovery_bytes = tracker.recovery_capacity_bytes.saturating_sub(tracker.recovery_bytes_unavailable),
+                                    recovery_blocks_total = tracker.recovery_blocks_total,
+                                    recovery_blocks_unavailable = tracker.recovery_blocks_unavailable,
                                     required_pct = format!("{:.1}", self.required_completion_pct),
                                     kind = failure.kind.as_str(),
                                     "Hopeless tracker updated after article failure"
@@ -1155,7 +1593,10 @@ impl QueueManager {
                         // Tell the worker pool to drain the job and emit
                         // JobAborted — the JobAborted arm below handles the
                         // rest of the teardown.
-                        self.worker_pool.abort_job(&job_id, abort.reason);
+                        if !self.dispatch.abort_job(&job_id, abort.reason) {
+                            crate::increment_counter("jobs.duplicate_terminal_attempts");
+                            debug!(job_id = %job_id, "Duplicate terminal abort request ignored");
+                        }
                     } else {
                         warn!(
                             job_id = %job_id,
@@ -1168,8 +1609,21 @@ impl QueueManager {
                 ProgressUpdate::JobFinished {
                     success,
                     articles_failed,
+                    download_time_secs,
                     ..
                 } => {
+                    let repairable_damage = self.jobs.lock().get(&job_id).is_some_and(|state| {
+                        state.hopeless_tracker.as_ref().is_some_and(|tracker| {
+                            let usable = tracker
+                                .recovery_capacity_bytes
+                                .saturating_sub(tracker.recovery_bytes_unavailable);
+                            usable >= tracker.content_bytes_missing
+                                && tracker.content_articles_failed > 0
+                        })
+                    });
+                    if repairable_damage {
+                        crate::increment_counter("jobs.repairable_damage");
+                    }
                     info!(
                         job_id = %job_id,
                         success,
@@ -1177,12 +1631,19 @@ impl QueueManager {
                         "Job download finished"
                     );
 
+                    // The final article has resolved, so no worker can write
+                    // another segment for this job. Release the worker-pool
+                    // context now to close its persistent assembler handles
+                    // before PAR2/unpack opens the completed files.
+                    self.dispatch.release_completed_job(&job_id);
+
                     // Mark as PostProcessing immediately so the slot is freed
                     // for the next queued job. This lets the next download ramp
                     // up while post-processing (par2/unpack) runs concurrently.
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
+                            state.download_time_secs = Some(download_time_secs);
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
                         }
@@ -1193,40 +1654,58 @@ impl QueueManager {
                         .await;
                     break;
                 }
-                ProgressUpdate::NoServersAvailable { reason, .. } => {
+                ProgressUpdate::JobAborted {
+                    reason,
+                    articles_failed,
+                    download_time_secs,
+                    ..
+                } => {
+                    crate::increment_counter("jobs.hopeless_aborts");
                     warn!(
                         job_id = %job_id,
                         reason = %reason,
-                        "No servers available — pausing job for retry"
+                        articles_failed,
+                        "Job aborted by download engine"
                     );
+                    // The terminal update is emitted only after queued and
+                    // in-flight articles drain. Dropping this context closes
+                    // all assembler handles before history or any later stage
+                    // can inspect the work directory.
+                    self.dispatch.release_completed_job(&job_id);
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(&job_id) {
-                            state.job.status = JobStatus::Paused;
-                            state.job.error_message = Some(reason);
+                            state.download_time_secs = Some(download_time_secs);
+                            state.job.status = JobStatus::Failed;
+                            state.job.error_message = Some(reason.clone());
+                            state.job.articles_failed =
+                                state.job.articles_failed.max(articles_failed);
+                            state.job.completed_at = Some(chrono::Utc::now());
+                            let tracker = state.hopeless_tracker.as_ref();
+                            warn!(
+                                job_id = %job_id,
+                                terminal_reason = %reason,
+                                missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
+                                usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
+                                recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
+                                recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
+                                "Terminal job summary"
+                            );
+                            // Confirmed hopeless damage must not enter PAR2,
+                            // extraction, or cleanup. Persist the original
+                            // reason directly as a failed history row.
+                            self.move_to_history(state, Vec::new());
                         }
                     }
                     self.persist_job_progress(&job_id);
-                    // Release the download slot so queued jobs can start
                     self.start_next_queued();
-                    break;
-                }
-                ProgressUpdate::JobAborted { reason, .. } => {
-                    warn!(
-                        job_id = %job_id,
-                        reason = %reason,
-                        "Job aborted by download engine"
-                    );
-                    {
-                        let mut jobs = self.jobs.lock();
-                        if let Some(state) = jobs.get_mut(&job_id) {
-                            state.job.status = JobStatus::Failed;
-                            state.job.error_message = Some(reason);
-                            state.job.completed_at = Some(chrono::Utc::now());
-                        }
-                    }
-                    self.start_next_queued();
-                    self.on_job_finished(&job_id, false, 0).await;
+                    let jid = job_id.clone();
+                    let qm = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(8)).await;
+                        qm.jobs.lock().remove(&jid);
+                        qm.job_order.lock().retain(|id| id != &jid);
+                    });
                     break;
                 }
             }
@@ -1247,7 +1726,15 @@ impl QueueManager {
         let pipeline_start = Instant::now();
 
         // Extract info needed for post-processing and take the direct unpacker.
-        let (work_dir, output_dir, category, pp_level, direct_unpacker, password) = {
+        let (
+            work_dir,
+            output_dir,
+            category,
+            pp_level,
+            direct_unpacker,
+            password,
+            content_articles_failed,
+        ) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
                 return;
@@ -1273,6 +1760,10 @@ impl QueueManager {
                 .unwrap_or(3); // default: repair+unpack
             let du = state.direct_unpacker.take();
             let pw = state.job.password.clone();
+            let content_failed = state
+                .hopeless_tracker
+                .as_ref()
+                .map_or(articles_failed, |tracker| tracker.content_articles_failed);
             (
                 state.job.work_dir.clone(),
                 state.job.output_dir.clone(),
@@ -1280,6 +1771,7 @@ impl QueueManager {
                 pp,
                 du,
                 pw,
+                content_failed,
             )
         };
 
@@ -1292,7 +1784,7 @@ impl QueueManager {
                 info!(
                     job_id = %job_id,
                     sets = results.len(),
-                    "Direct unpack completed successfully — skipping extract stage"
+                    "Direct unpack completed successfully — checking output for nested archives"
                 );
             } else {
                 for r in &results {
@@ -1324,8 +1816,10 @@ impl QueueManager {
                 cleanup_after_extract: true,
                 output_dir: Some(output_dir.clone()),
                 articles_failed,
+                content_articles_failed,
                 skip_extract: direct_unpack_success,
                 password: password.clone(),
+                max_nested_archive_depth: self.max_nested_archive_depth,
             };
 
             let result = run_pipeline(&work_dir, &config).await;
@@ -1389,10 +1883,10 @@ impl QueueManager {
     }
 
     /// Move a job's files to output and insert a history entry.
-    fn move_to_history(&self, state: &mut JobState, stages: Vec<StageResult>) {
+    fn move_to_history(&self, state: &mut JobState, mut stages: Vec<StageResult>) {
         let move_start = Instant::now();
 
-        let final_status = if state.job.status == JobStatus::Failed {
+        let mut final_status = if state.job.status == JobStatus::Failed {
             // Already marked failed (by pipeline or download with pp disabled)
             JobStatus::Failed
         } else {
@@ -1401,7 +1895,27 @@ impl QueueManager {
             JobStatus::Completed
         };
 
-        // Move files from work_dir to output_dir (if not already done by pipeline extract)
+        // A post-processing job that contains only raw archive/PAR2 artifacts
+        // is not a usable completion. Check before moving residual work files
+        // so a bad job cannot pollute the completed directory.
+        if final_status == JobStatus::Completed && !stages.is_empty() {
+            let output_has_payload = has_usable_output(&state.job.output_dir).unwrap_or(false);
+            let work_has_payload = has_usable_output(&state.job.work_dir).unwrap_or(false);
+            if !output_has_payload && !work_has_payload {
+                let message = "No usable output produced; only archive or PAR2 artifacts remain";
+                warn!(job_id = %state.job.id, output_dir = %state.job.output_dir.display(), "{message}");
+                final_status = JobStatus::Failed;
+                state.job.error_message = Some(message.to_string());
+                stages.push(StageResult {
+                    name: "Output".to_string(),
+                    status: StageStatus::Failed,
+                    message: Some(message.to_string()),
+                    duration_secs: 0.0,
+                });
+            }
+        }
+
+        // Move files from work_dir to output_dir (if not already done by pipeline extract).
         if final_status == JobStatus::Completed {
             if let Err(e) = std::fs::create_dir_all(&state.job.output_dir) {
                 warn!(job_id = %state.job.id, "Failed to create output dir: {e}");
@@ -1448,6 +1962,7 @@ impl QueueManager {
             downloaded_bytes: state.job.downloaded_bytes,
             added_at: state.job.added_at,
             completed_at: state.job.completed_at.unwrap_or_else(chrono::Utc::now),
+            download_time_secs: state.download_time_secs,
             output_dir: state.job.output_dir.clone(),
             stages,
             error_message: state.job.error_message.clone(),
@@ -1456,9 +1971,29 @@ impl QueueManager {
         };
 
         let db = self.db.lock();
-        if let Err(e) = db.history_insert(&history_entry) {
-            error!(job_id = %state.job.id, "Failed to insert history: {e}");
-        }
+        let history_persisted = match db.history_get(&state.job.id) {
+            Ok(Some(existing)) => {
+                warn!(
+                    job_id = %state.job.id,
+                    existing_status = %existing.status,
+                    attempted_status = %final_status,
+                    "History row already exists; terminal persistence is idempotent"
+                );
+                true
+            }
+            Ok(None) => {
+                if let Err(e) = db.history_insert(&history_entry) {
+                    error!(job_id = %state.job.id, "Failed to insert history: {e}");
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(e) => {
+                error!(job_id = %state.job.id, "Failed to check existing history row: {e}");
+                false
+            }
+        };
 
         // Capture and persist per-job logs from the ring buffer
         if let Some(ref log_buffer) = self.log_buffer {
@@ -1480,6 +2015,17 @@ impl QueueManager {
             && let Err(e) = db.history_enforce_retention(max)
         {
             warn!("Failed to enforce history retention: {e}");
+        }
+        drop(db);
+
+        if history_persisted {
+            cleanup_terminal_work_dir(&state.job.id, &state.job.work_dir, final_status);
+        } else {
+            warn!(
+                job_id = %state.job.id,
+                work_dir = %state.job.work_dir.display(),
+                "Retaining terminal work directory because history persistence failed"
+            );
         }
     }
 
@@ -1586,6 +2132,16 @@ impl QueueManager {
         Ok(())
     }
 
+    fn queued_job_outranks_active(
+        queued_priority: u8,
+        queued_index: usize,
+        active_priority: u8,
+        active_index: usize,
+    ) -> bool {
+        queued_priority > active_priority
+            || (queued_priority == active_priority && queued_index < active_index)
+    }
+
     /// Check whether a queued job has higher priority than a running download,
     /// and if so, pause the lower-priority download to make room.
     fn preempt_if_needed(self: &Arc<Self>) {
@@ -1602,21 +2158,26 @@ impl QueueManager {
                     .filter(|s| s.job.status == JobStatus::Downloading)
                     .count();
 
-                let mut best_q: Option<(String, u8, String)> = None;
-                let mut worst_d: Option<(String, u8, String)> = None;
+                let mut best_q: Option<(String, u8, usize, String)> = None;
+                let mut worst_d: Option<(String, u8, usize, String)> = None;
 
-                for id in order.iter() {
+                for (idx, id) in order.iter().enumerate() {
                     if let Some(s) = jobs.get(id) {
                         let p = s.job.priority as u8;
                         let name = s.job.name.clone();
-                        if s.job.status == JobStatus::Queued
-                            && best_q.as_ref().is_none_or(|(_, bp, _)| p > *bp)
-                        {
-                            best_q = Some((id.clone(), p, name));
+                        if s.job.status == JobStatus::Queued {
+                            if best_q
+                                .as_ref()
+                                .is_none_or(|(_, bp, bidx, _)| p > *bp || (p == *bp && idx < *bidx))
+                            {
+                                best_q = Some((id.clone(), p, idx, name));
+                            }
                         } else if s.job.status == JobStatus::Downloading
-                            && worst_d.as_ref().is_none_or(|(_, wp, _)| p < *wp)
+                            && worst_d
+                                .as_ref()
+                                .is_none_or(|(_, wp, widx, _)| p < *wp || (p == *wp && idx > *widx))
                         {
-                            worst_d = Some((id.clone(), p, name));
+                            worst_d = Some((id.clone(), p, idx, name));
                         }
                     }
                 }
@@ -1631,21 +2192,25 @@ impl QueueManager {
 
             // All slots full — check if preemption is warranted
             match (&best_queued, &worst_downloading) {
-                (Some((q_id, q_pri, q_name)), Some((d_id, d_pri, d_name))) if q_pri > d_pri => {
+                (Some((q_id, q_pri, q_idx, q_name)), Some((d_id, d_pri, d_idx, d_name)))
+                    if Self::queued_job_outranks_active(*q_pri, *q_idx, *d_pri, *d_idx) =>
+                {
                     info!(
                         preempted_id = %d_id,
                         preempted_name = %d_name,
                         preempted_priority = d_pri,
+                        preempted_order = d_idx,
                         starting_id = %q_id,
                         starting_name = %q_name,
                         starting_priority = q_pri,
+                        starting_order = q_idx,
                         active_downloads = active,
                         max_downloads = max,
-                        "Preempting lower-priority download for higher-priority job"
+                        "Preempting active download for queued job with higher effective priority"
                     );
 
                     // Pause the lower-priority download via the worker pool.
-                    self.worker_pool.pause_job(d_id);
+                    self.dispatch.pause_job(d_id);
                     {
                         let mut jobs = self.jobs.lock();
                         if let Some(state) = jobs.get_mut(d_id.as_str()) {
@@ -1669,7 +2234,9 @@ impl QueueManager {
                         active_downloads = active,
                         max_downloads = max,
                         best_queued_pri = best_queued.as_ref().map(|q| q.1),
+                        best_queued_order = best_queued.as_ref().map(|q| q.2),
                         worst_dl_pri = worst_downloading.as_ref().map(|d| d.1),
+                        worst_dl_order = worst_downloading.as_ref().map(|d| d.2),
                         "No preemption needed"
                     );
                     return;
@@ -1681,7 +2248,7 @@ impl QueueManager {
     /// Pause a specific job.
     pub fn pause_job(self: &Arc<Self>, id: &str) -> crate::nzb_core::Result<()> {
         // Tell the pool first — workers stop pulling this job's items.
-        self.worker_pool.pause_job(id);
+        self.dispatch.pause_job(id);
         {
             let mut jobs = self.jobs.lock();
             let state = jobs
@@ -1703,6 +2270,11 @@ impl QueueManager {
             info!(job_id = %id, "Job paused");
         }
 
+        // If the job was paused by the global control, this explicit action
+        // changes it into an individual pause that must survive Resume All.
+        self.globally_paused_jobs.lock().remove(id);
+        self.persist_globally_paused_jobs();
+
         // Release the download slot so queued jobs can start
         self.start_next_queued();
         Ok(())
@@ -1710,7 +2282,14 @@ impl QueueManager {
 
     /// Resume a specific job.
     pub fn resume_job(self: &Arc<Self>, id: &str) -> crate::nzb_core::Result<()> {
-        let ctx_alive = self.worker_pool.has_job(id);
+        let _transition = self.pause_transition.lock();
+        if self.globally_paused.load(Ordering::SeqCst) {
+            return Err(crate::nzb_core::NzbError::Other(
+                "Cannot resume an individual job while downloads are globally paused".to_string(),
+            ));
+        }
+
+        let ctx_alive = self.dispatch.has_job(id);
 
         let needs_launch = {
             let mut jobs = self.jobs.lock();
@@ -1755,7 +2334,7 @@ impl QueueManager {
         };
 
         if ctx_alive {
-            self.worker_pool.resume_job(id);
+            self.dispatch.resume_job(id);
         } else if needs_launch {
             self.launch_download(id);
         }
@@ -1765,18 +2344,75 @@ impl QueueManager {
     }
 
     /// Remove a specific job from the queue.
+    ///
+    /// If the job was sitting in an error state (e.g. paused because no
+    /// server was reachable, or stalled) when removed, it's preserved as a
+    /// `Failed` history entry first — otherwise the only record of the
+    /// failure (the error message) is lost the moment the user clears it.
+    /// A job removed with no error (the user simply doesn't want it) is
+    /// just deleted, matching prior behavior.
     pub fn remove_job(&self, id: &str) -> crate::nzb_core::Result<()> {
+        // Post-processing owns the work directory and JobState until its
+        // terminal history transaction completes. Treat an external queue
+        // cleanup request during this window as deferred view cleanup; do
+        // not cancel the task or delete files beneath PAR2/extraction.
+        if self.jobs.lock().get(id).is_some_and(|state| {
+            matches!(
+                state.job.status,
+                JobStatus::PostProcessing
+                    | JobStatus::Verifying
+                    | JobStatus::Repairing
+                    | JobStatus::Extracting
+            )
+        }) {
+            info!(job_id = %id, "Queue removal deferred while post-processing is active");
+            return Ok(());
+        }
+
         // Silently cancel in the pool — drains queued items and unregisters.
-        self.worker_pool.cancel_job(id);
+        self.dispatch.cancel_job(id);
         let removed = self.jobs.lock().remove(id);
         if let Some(state) = removed {
+            self.globally_paused_jobs.lock().remove(id);
+            self.persist_globally_paused_jobs();
             if let Some(handle) = state.progress_handle {
                 handle.abort();
             }
 
-            // Remove from DB
             let db = self.db.lock();
+            let history_already_persisted = db.history_get(id)?.is_some();
+
+            if state.job.error_message.is_some() && !history_already_persisted {
+                let history_entry = HistoryEntry {
+                    id: state.job.id.clone(),
+                    name: state.job.name.clone(),
+                    category: state.job.category.clone(),
+                    status: JobStatus::Failed,
+                    total_bytes: state.job.total_bytes,
+                    downloaded_bytes: state.job.downloaded_bytes,
+                    added_at: state.job.added_at,
+                    completed_at: state.job.completed_at.unwrap_or_else(chrono::Utc::now),
+                    download_time_secs: state.download_time_secs,
+                    output_dir: state.job.output_dir.clone(),
+                    stages: Vec::new(),
+                    error_message: state.job.error_message.clone(),
+                    server_stats: state.job.server_stats.clone(),
+                    nzb_data: state.nzb_data.clone(),
+                };
+                if let Err(e) = db.history_insert(&history_entry) {
+                    error!(job_id = %id, "Failed to insert history for removed failed job: {e}");
+                } else if let Some(max) = *self.history_retention.lock()
+                    && let Err(e) = db.history_enforce_retention(max)
+                {
+                    warn!("Failed to enforce history retention: {e}");
+                }
+            } else if history_already_persisted {
+                debug!(job_id = %id, "Removing terminal queue view; history already persisted");
+            }
+
+            // Remove from DB
             let _ = db.queue_remove(id);
+            drop(db);
 
             // Remove from order
             self.job_order.lock().retain(|jid| jid != id);
@@ -1827,21 +2463,28 @@ impl QueueManager {
     }
 
     /// Move a job to a new position in the queue order.
-    pub fn move_job(&self, id: &str, position: usize) -> crate::nzb_core::Result<()> {
-        let mut order = self.job_order.lock();
-        let current_pos = order
-            .iter()
-            .position(|x| x == id)
-            .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
-        let id_str = order.remove(current_pos);
-        let new_pos = position.min(order.len());
-        order.insert(new_pos, id_str);
+    pub fn move_job(self: &Arc<Self>, id: &str, position: usize) -> crate::nzb_core::Result<()> {
+        {
+            let mut order = self.job_order.lock();
+            let current_pos = order
+                .iter()
+                .position(|x| x == id)
+                .ok_or_else(|| crate::nzb_core::NzbError::JobNotFound(id.to_string()))?;
+            let id_str = order.remove(current_pos);
+            let new_pos = position.min(order.len());
+            order.insert(new_pos, id_str);
+        }
+        self.preempt_if_needed();
         Ok(())
     }
 
     /// Pause all downloads globally.
     pub fn pause_all(&self) {
-        self.globally_paused.store(true, Ordering::Relaxed);
+        let _transition = self.pause_transition.lock();
+        // Publish the global gate before touching individual jobs. This
+        // prevents every scheduling and per-job resume path from starting
+        // more work while the active contexts are being paused.
+        self.globally_paused.store(true, Ordering::SeqCst);
         self.db.lock().set_setting("globally_paused", "true");
 
         // Collect ids to pause in the pool, to avoid holding the jobs lock
@@ -1856,6 +2499,7 @@ impl QueueManager {
                         state.job.status = JobStatus::Paused;
                     }
                     JobStatus::Queued => {
+                        ids.push(id.clone());
                         state.job.status = JobStatus::Paused;
                     }
                     _ => {}
@@ -1863,8 +2507,12 @@ impl QueueManager {
             }
             ids
         };
+        self.globally_paused_jobs
+            .lock()
+            .extend(to_pause.iter().cloned());
+        self.persist_globally_paused_jobs();
         for id in to_pause {
-            self.worker_pool.pause_job(&id);
+            self.dispatch.pause_job(&id);
         }
         info!("All downloads paused");
     }
@@ -1872,16 +2520,19 @@ impl QueueManager {
     /// Pause all downloads for a specified duration.
     pub fn pause_for(self: &Arc<Self>, duration_secs: u64) {
         self.pause_all();
-        let until = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
-        *self.pause_until.lock() = Some(until);
+        let until_value = Utc::now() + chrono::Duration::seconds(duration_secs as i64);
+        *self.pause_until.lock() = Some(until_value);
 
         let qm = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(duration_secs)).await;
-            // Only auto-resume if the pause_until hasn't been cleared
+            // Only this exact timer may resume the queue. A newer timed pause
+            // must not be cancelled when an older timer wakes up.
             let should_resume = {
                 let until = qm.pause_until.lock();
-                until.is_some()
+                until
+                    .as_ref()
+                    .is_some_and(|current| *current == until_value)
             };
             if should_resume {
                 *qm.pause_until.lock() = None;
@@ -1904,21 +2555,28 @@ impl QueueManager {
 
     /// Resume all downloads globally.
     pub fn resume_all(self: &Arc<Self>) {
-        self.globally_paused.store(false, Ordering::Relaxed);
+        let _transition = self.pause_transition.lock();
+        self.globally_paused.store(false, Ordering::SeqCst);
         self.db.lock().set_setting("globally_paused", "false");
         *self.pause_until.lock() = None;
+
+        let paused_by_global = std::mem::take(&mut *self.globally_paused_jobs.lock());
+        self.persist_globally_paused_jobs();
 
         // Decide per job whether to just unpause (ctx still in pool) or
         // mark it as Queued so start_next_queued re-submits it.
         let mut to_unpause: Vec<String> = Vec::new();
         {
             let mut jobs = self.jobs.lock();
-            for (id, state) in jobs.iter_mut() {
+            for id in paused_by_global {
+                let Some(state) = jobs.get_mut(&id) else {
+                    continue;
+                };
                 if state.job.status == JobStatus::Paused {
                     state.job.error_message = None;
-                    if self.worker_pool.has_job(id) {
+                    if self.dispatch.has_job(&id) {
                         state.job.status = JobStatus::Downloading;
-                        to_unpause.push(id.clone());
+                        to_unpause.push(id);
                     } else {
                         state.job.status = JobStatus::Queued;
                     }
@@ -1926,7 +2584,7 @@ impl QueueManager {
             }
         }
         for id in to_unpause {
-            self.worker_pool.resume_job(&id);
+            self.dispatch.resume_job(&id);
         }
 
         // Start queued jobs up to the concurrency limit
@@ -1948,33 +2606,7 @@ impl QueueManager {
         let enabled = servers.iter().filter(|s| s.enabled).count();
         info!(total = servers.len(), enabled, "Updating server list");
 
-        // Reconcile the connection tracker:
-        //  - Updated/added servers: set_limit (grows in place or replaces).
-        //  - Removed servers: remove_server (orphans the slot, workers detect
-        //    via slot_is_current and exit on next iteration).
-        let new_ids: std::collections::HashSet<String> =
-            servers.iter().map(|s| s.id.clone()).collect();
-        let old_ids: Vec<String> = self
-            .conn_tracker
-            .snapshot()
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect();
-        for old_id in &old_ids {
-            if !new_ids.contains(old_id) {
-                self.conn_tracker.remove_server(old_id);
-            }
-        }
-        for server in &servers {
-            self.conn_tracker
-                .set_limit(&server.id, &server.name, server.connections as usize);
-        }
-        *self.servers.lock() = servers;
-
-        // Reconcile the worker pool to match the new server list (spawns or
-        // retires workers so per-server connection counts stay exactly in
-        // line with server.connections).
-        self.worker_pool.reconcile_servers();
+        self.dispatch.update_servers(servers);
 
         // Auto-resume jobs paused by server errors now that config changed
         if enabled > 0 {
@@ -1984,9 +2616,15 @@ impl QueueManager {
 
     /// Resume jobs that were paused due to server unavailability.
     ///
-    /// Only targets jobs where `error_message` is set (i.e. paused by the
-    /// circuit breaker / `NoServersAvailable`), not user-paused jobs.
+    /// Only targets legacy/restored jobs where `error_message` is set, not
+    /// user-paused jobs. New transient provider failures remain downloading.
     fn resume_server_paused_jobs(self: &Arc<Self>) {
+        let _transition = self.pause_transition.lock();
+        if self.globally_paused.load(Ordering::SeqCst) {
+            debug!("Global pause active; deferring automatic server-error resumes");
+            return;
+        }
+
         let mut resumed = 0u32;
         let mut to_unpause: Vec<String> = Vec::new();
         {
@@ -1994,7 +2632,7 @@ impl QueueManager {
             for (id, state) in jobs.iter_mut() {
                 if state.job.status == JobStatus::Paused && state.job.error_message.is_some() {
                     state.job.error_message = None;
-                    if self.worker_pool.has_job(id) {
+                    if self.dispatch.has_job(id) {
                         state.job.status = JobStatus::Downloading;
                         to_unpause.push(id.clone());
                     } else {
@@ -2005,7 +2643,7 @@ impl QueueManager {
             }
         }
         for id in to_unpause {
-            self.worker_pool.resume_job(&id);
+            self.dispatch.resume_job(&id);
         }
         if resumed > 0 {
             info!(
@@ -2040,6 +2678,18 @@ impl QueueManager {
         result
     }
 
+    /// Get jobs that are still actionable in the active download queue.
+    ///
+    /// Completed and failed jobs remain in the in-memory snapshot briefly so
+    /// internal consumers can observe the terminal transition, but they have
+    /// already been persisted to history and must not keep queue views busy.
+    pub fn get_active_jobs(&self) -> Vec<NzbJob> {
+        self.get_jobs()
+            .into_iter()
+            .filter(|job| !matches!(job.status, JobStatus::Completed | JobStatus::Failed))
+            .collect()
+    }
+
     /// Get a single job by ID (with files included).
     pub fn get_job(&self, job_id: &str) -> Option<NzbJob> {
         let jobs = self.jobs.lock();
@@ -2057,12 +2707,16 @@ impl QueueManager {
 
     /// Check if downloads are globally paused.
     pub fn is_paused(&self) -> bool {
-        self.globally_paused.load(Ordering::Relaxed)
+        self.globally_paused.load(Ordering::SeqCst)
     }
 
     /// Get the number of jobs in the queue.
     pub fn queue_size(&self) -> usize {
-        self.jobs.lock().len()
+        self.jobs
+            .lock()
+            .values()
+            .filter(|state| !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed))
+            .count()
     }
 
     /// Get the current incomplete directory.
@@ -2213,8 +2867,11 @@ impl QueueManager {
             }
         }
 
-        let history = self.history_list(10_000).unwrap_or_default();
-        for entry in history {
+        let ledger = {
+            let db = self.db.lock();
+            db.download_statistics_list().unwrap_or_default()
+        };
+        for entry in ledger {
             apply(entry.completed_at, &entry.server_stats, false);
         }
 
@@ -2225,6 +2882,96 @@ impl QueueManager {
                 .then(a.server_id.cmp(&b.server_id))
         });
         stats
+    }
+
+    /// Return permanent global download, speed and NNTP article statistics.
+    /// Completed jobs come from the compact statistics ledger, which is not
+    /// affected by history retention or user-initiated history deletion.
+    pub fn global_statistics(&self, servers: &[ServerConfig]) -> GlobalStatisticsData {
+        let generated_at = Utc::now();
+        let today_cutoff = generated_at - chrono::Duration::days(1);
+        let week_cutoff = generated_at - chrono::Duration::days(7);
+        let month_cutoff = generated_at - chrono::Duration::days(30);
+        let records = {
+            let db = self.db.lock();
+            db.download_statistics_list().unwrap_or_default()
+        };
+
+        let aggregate = |items: &[&DownloadStatistic]| {
+            let mut totals = StatisticsPeriodData::default();
+            for item in items {
+                totals.downloads += 1;
+                match item.status {
+                    JobStatus::Completed => totals.completed += 1,
+                    JobStatus::Failed => totals.failed += 1,
+                    _ => {}
+                }
+                totals.bytes_downloaded = totals
+                    .bytes_downloaded
+                    .saturating_add(item.downloaded_bytes);
+                totals.total_duration_secs += item.duration_secs;
+                totals.fastest_download_bps =
+                    totals.fastest_download_bps.max(item.average_speed_bps);
+                for server in &item.server_stats {
+                    totals.articles_served = totals
+                        .articles_served
+                        .saturating_add(server.articles_downloaded);
+                    totals.articles_missing = totals
+                        .articles_missing
+                        .saturating_add(server.articles_failed);
+                }
+            }
+            totals.news_server_hits = totals
+                .articles_served
+                .saturating_add(totals.articles_missing);
+            if totals.total_duration_secs > 0.0 {
+                totals.average_speed_bps =
+                    (totals.bytes_downloaded as f64 / totals.total_duration_secs) as u64;
+            }
+            totals
+        };
+
+        let all: Vec<_> = records.iter().collect();
+        let today: Vec<_> = records
+            .iter()
+            .filter(|item| item.completed_at >= today_cutoff)
+            .collect();
+        let week: Vec<_> = records
+            .iter()
+            .filter(|item| item.completed_at >= week_cutoff)
+            .collect();
+        let month: Vec<_> = records
+            .iter()
+            .filter(|item| item.completed_at >= month_cutoff)
+            .collect();
+
+        let mut by_day: HashMap<String, Vec<&DownloadStatistic>> = HashMap::new();
+        for item in &records {
+            if item.completed_at >= month_cutoff {
+                by_day
+                    .entry(item.completed_at.format("%Y-%m-%d").to_string())
+                    .or_default()
+                    .push(item);
+            }
+        }
+        let mut daily: Vec<_> = by_day
+            .into_iter()
+            .map(|(date, items)| DailyStatisticsData {
+                date,
+                totals: aggregate(&items),
+            })
+            .collect();
+        daily.sort_by(|a, b| a.date.cmp(&b.date));
+
+        GlobalStatisticsData {
+            generated_at,
+            lifetime: aggregate(&all),
+            today: aggregate(&today),
+            week: aggregate(&week),
+            month: aggregate(&month),
+            servers: self.server_stats_get_all(servers),
+            daily,
+        }
     }
 
     /// Get a single history entry.
@@ -2360,13 +3107,18 @@ impl QueueManager {
     /// mark already-downloaded articles, so downloads resume where they left off.
     pub fn restore_from_db(self: &Arc<Self>) -> crate::nzb_core::Result<()> {
         // Restore globally_paused from persisted state
-        let was_paused = {
+        let (was_paused, persisted_global_ids) = {
             let db = self.db.lock();
-            db.get_setting("globally_paused")
-                .is_some_and(|v| v == "true")
+            let paused = db
+                .get_setting("globally_paused")
+                .is_some_and(|v| v == "true");
+            let ids = db
+                .get_setting(Self::GLOBAL_PAUSED_JOBS_SETTING)
+                .and_then(|value| serde_json::from_str::<HashSet<String>>(&value).ok());
+            (paused, ids)
         };
         if was_paused {
-            self.globally_paused.store(true, Ordering::Relaxed);
+            self.globally_paused.store(true, Ordering::SeqCst);
             info!("Restored global pause state from database");
         }
 
@@ -2462,10 +3214,14 @@ impl QueueManager {
                 }
             }
 
-            if job.status == JobStatus::Paused && was_paused {
-                // Keep as Paused — it's globally paused; resume_all will
-                // re-submit it to the pool.
-            } else if job.status == JobStatus::Paused || job.status == JobStatus::Downloading {
+            let paused_by_global = was_paused
+                && persisted_global_ids
+                    .as_ref()
+                    .map_or(job.status == JobStatus::Paused, |ids| ids.contains(&job_id));
+            if paused_by_global {
+                job.status = JobStatus::Paused;
+                self.globally_paused_jobs.lock().insert(job_id.clone());
+            } else if job.status == JobStatus::Downloading {
                 job.status = JobStatus::Queued;
             }
 
@@ -2476,6 +3232,7 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                download_time_secs: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -2521,7 +3278,7 @@ impl QueueManager {
 
         // 3. Shut down the worker pool gracefully. In-flight articles finish
         //    first (finish-in-flight), then workers exit.
-        self.worker_pool.shutdown().await;
+        self.dispatch.shutdown().await;
 
         // 4. Abort the per-job progress listeners (their sender sides are
         //    dropped, so the loops would exit anyway; we just don't want to
@@ -2562,7 +3319,7 @@ impl QueueManager {
                 // Tick per-job speed trackers
                 {
                     let jobs = qm.jobs.lock();
-                    for state in jobs.values() {
+                    for (_id, state) in jobs.iter() {
                         state.speed.tick(1.0);
                     }
                 }
@@ -2600,6 +3357,7 @@ impl QueueManager {
                                     tracker_idle_secs,
                                     tracker_content_bytes,
                                     tracker_content_missing,
+                                    tracker_usable_recovery,
                                 ) = s
                                     .hopeless_tracker
                                     .as_ref()
@@ -2612,9 +3370,11 @@ impl QueueManager {
                                             t.last_progress_at.elapsed().as_secs(),
                                             t.content_bytes,
                                             t.content_bytes_missing,
+                                            t.recovery_capacity_bytes
+                                                .saturating_sub(t.recovery_bytes_unavailable),
                                         )
                                     })
-                                    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+                                    .unwrap_or((0, 0, 0, 0, 0, 0, 0, 0));
                                 (
                                     id.clone(),
                                     s.job.name.clone(),
@@ -2632,6 +3392,7 @@ impl QueueManager {
                                     tracker_idle_secs,
                                     tracker_content_bytes,
                                     tracker_content_missing,
+                                    tracker_usable_recovery,
                                 )
                             })
                             .collect()
@@ -2653,6 +3414,7 @@ impl QueueManager {
                         t_idle,
                         t_bytes_total,
                         t_bytes_missing,
+                        t_usable_recovery,
                     ) in snapshots
                     {
                         let pct_bytes = if total_bytes > 0 {
@@ -2661,7 +3423,9 @@ impl QueueManager {
                             0.0
                         };
                         let avail_pct = if t_bytes_total > 0 {
-                            let avail: u64 = t_bytes_total.saturating_sub(t_bytes_missing);
+                            let avail: u64 = t_bytes_total
+                                .saturating_sub(t_bytes_missing)
+                                .saturating_add(t_usable_recovery);
                             100.0 * (avail as f64 / t_bytes_total as f64)
                         } else {
                             100.0
@@ -2682,7 +3446,9 @@ impl QueueManager {
                             tracker_checked = t_checked,
                             tracker_failed = t_failed,
                             tracker_total = t_total,
-                            availability_pct = format!("{avail_pct:.1}"),
+                            effective_completion_pct = format!("{avail_pct:.3}"),
+                            missing_content_bytes = t_bytes_missing,
+                            usable_recovery_bytes = t_usable_recovery,
                             "Job status snapshot"
                         );
                     }
@@ -2692,7 +3458,7 @@ impl QueueManager {
                 tick_count += 1;
                 if tick_count.is_multiple_of(30) {
                     // Log active NNTP connections per server
-                    let snapshot = qm.conn_tracker.snapshot();
+                    let snapshot = qm.dispatch.active_connection_snapshot();
                     let total: usize = snapshot.iter().map(|(_, c, _)| *c).sum();
                     if total > 0 {
                         for (server_id, count, limit) in &snapshot {
@@ -2735,22 +3501,416 @@ impl QueueManager {
                             min_free_space = qm.min_free_space,
                             "Low disk space, auto-pausing downloads"
                         );
-                        qm.globally_paused.store(true, Ordering::Relaxed);
-                        qm.db.lock().set_setting("globally_paused", "true");
-                        let to_pause: Vec<String> = {
-                            let jobs = qm.jobs.lock();
-                            jobs.iter()
-                                .filter(|(_, s)| s.job.status == JobStatus::Downloading)
-                                .map(|(id, _)| id.clone())
-                                .collect()
-                        };
-                        for id in to_pause {
-                            qm.worker_pool.pause_job(&id);
-                        }
+                        qm.pause_all();
                     }
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod global_pause_tests {
+    use super::*;
+
+    fn job(id: &str, status: JobStatus, root: &std::path::Path) -> NzbJob {
+        NzbJob {
+            id: id.to_string(),
+            name: id.to_string(),
+            category: "Default".to_string(),
+            status,
+            priority: Priority::Normal,
+            total_bytes: 1,
+            downloaded_bytes: 0,
+            file_count: 0,
+            files_completed: 0,
+            article_count: 0,
+            articles_downloaded: 0,
+            articles_failed: 0,
+            added_at: Utc::now(),
+            completed_at: None,
+            work_dir: root.join(id),
+            output_dir: root.join("complete").join(id),
+            password: None,
+            error_message: None,
+            speed_bps: 0,
+            server_stats: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db = Database::open_memory().expect("database");
+        let manager = QueueManager::new(
+            Vec::new(),
+            db,
+            tempdir.path().join("incomplete"),
+            tempdir.path().join("complete"),
+            LogBuffer::default(),
+            1,
+            Vec::new(),
+            0,
+            0,
+            false,
+            5,
+            false,
+            false,
+            100.0,
+            30,
+        );
+        (manager, tempdir)
+    }
+
+    fn insert_job(manager: &QueueManager, job: NzbJob) {
+        let id = job.id.clone();
+        manager.jobs.lock().insert(
+            id.clone(),
+            JobState {
+                job,
+                progress_handle: None,
+                speed: Arc::new(SpeedTracker::new()),
+                nzb_data: None,
+                direct_unpacker: None,
+                hopeless_tracker: None,
+                download_time_secs: None,
+            },
+        );
+        manager.job_order.lock().push(id);
+    }
+
+    #[tokio::test]
+    async fn active_queue_view_excludes_terminal_jobs() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("downloading", JobStatus::Downloading, tempdir.path()),
+        );
+        insert_job(
+            &manager,
+            job("completed", JobStatus::Completed, tempdir.path()),
+        );
+        insert_job(&manager, job("failed", JobStatus::Failed, tempdir.path()));
+
+        assert_eq!(manager.get_jobs().len(), 3);
+        assert_eq!(manager.get_active_jobs().len(), 1);
+        assert_eq!(manager.get_active_jobs()[0].id, "downloading");
+        assert_eq!(manager.queue_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn global_pause_blocks_job_resume_and_preserves_manual_pause() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("active", JobStatus::Downloading, tempdir.path()),
+        );
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+        insert_job(&manager, job("manual", JobStatus::Paused, tempdir.path()));
+
+        manager.pause_all();
+
+        assert!(manager.is_paused());
+        assert_eq!(manager.get_job("active").unwrap().status, JobStatus::Paused);
+        assert_eq!(manager.get_job("queued").unwrap().status, JobStatus::Paused);
+        assert_eq!(manager.get_job("manual").unwrap().status, JobStatus::Paused);
+        assert!(manager.globally_paused_jobs.lock().contains("active"));
+        assert!(manager.globally_paused_jobs.lock().contains("queued"));
+        assert!(!manager.globally_paused_jobs.lock().contains("manual"));
+
+        let error = manager.resume_job("active").unwrap_err();
+        assert!(error.to_string().contains("globally paused"));
+        assert_eq!(manager.get_job("active").unwrap().status, JobStatus::Paused);
+
+        manager
+            .jobs
+            .lock()
+            .get_mut("active")
+            .unwrap()
+            .job
+            .error_message = Some("server unavailable".to_string());
+        manager.resume_server_paused_jobs();
+        assert_eq!(manager.get_job("active").unwrap().status, JobStatus::Paused);
+
+        manager.resume_all();
+
+        assert!(!manager.is_paused());
+        assert_eq!(manager.get_job("manual").unwrap().status, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn provider_waiting_status_keeps_job_active_and_clears_on_recovery() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("provider-wait", JobStatus::Downloading, tempdir.path()),
+        );
+        let (progress_tx, progress_rx) = mpsc::channel(4);
+        let handler = tokio::spawn(Arc::clone(&manager).handle_progress(
+            "provider-wait".to_string(),
+            progress_rx,
+            Arc::new(SpeedTracker::new()),
+        ));
+        let message = "Waiting for providers: every enabled server is temporarily unavailable. rustnzb will retry automatically.";
+
+        progress_tx
+            .send(ProgressUpdate::WaitingForProviders {
+                job_id: "provider-wait".to_string(),
+                message: message.to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        let waiting = manager.get_job("provider-wait").unwrap();
+        assert_eq!(waiting.status, JobStatus::Downloading);
+        assert_eq!(waiting.error_message.as_deref(), Some(message));
+
+        progress_tx
+            .send(ProgressUpdate::ProvidersAvailable {
+                job_id: "provider-wait".to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            manager
+                .get_job("provider-wait")
+                .unwrap()
+                .error_message
+                .is_none()
+        );
+
+        drop(progress_tx);
+        handler.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_added_during_global_pause_is_owned_by_global_pause() {
+        let (manager, tempdir) = manager();
+        manager.pause_all();
+
+        manager
+            .add_job(job("new", JobStatus::Queued, tempdir.path()), None)
+            .unwrap();
+
+        assert_eq!(manager.get_job("new").unwrap().status, JobStatus::Paused);
+        assert!(manager.globally_paused_jobs.lock().contains("new"));
+    }
+
+    #[tokio::test]
+    async fn removing_terminal_queue_view_does_not_insert_history_twice() {
+        let (manager, tempdir) = manager();
+        let mut terminal = job("terminal", JobStatus::Failed, tempdir.path());
+        terminal.error_message = Some("original failure".into());
+        insert_job(&manager, terminal);
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("terminal").unwrap();
+            manager.move_to_history(state, Vec::new());
+        }
+
+        manager.remove_job("terminal").unwrap();
+        let db = manager.db.lock();
+        let persisted = db.history_get("terminal").unwrap().unwrap();
+        assert_eq!(persisted.error_message.as_deref(), Some("original failure"));
+        assert_eq!(
+            db.history_list(100)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.id == "terminal")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_terminal_persistence_keeps_one_history_row() {
+        let (manager, tempdir) = manager();
+        let mut terminal = job("idempotent-terminal", JobStatus::Failed, tempdir.path());
+        terminal.error_message = Some("original failure".into());
+        insert_job(&manager, terminal);
+
+        let mut jobs = manager.jobs.lock();
+        let state = jobs.get_mut("idempotent-terminal").unwrap();
+        manager.move_to_history(state, Vec::new());
+        manager.move_to_history(state, Vec::new());
+        drop(jobs);
+
+        let db = manager.db.lock();
+        assert_eq!(
+            db.history_list(100)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.id == "idempotent-terminal")
+                .count(),
+            1
+        );
+        assert_eq!(
+            db.history_get("idempotent-terminal")
+                .unwrap()
+                .unwrap()
+                .error_message
+                .as_deref(),
+            Some("original failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_history_cleanup_removes_raw_work_directory_after_persistence() {
+        let (manager, tempdir) = manager();
+        let failed = job("failed-cleanup", JobStatus::Failed, tempdir.path());
+        std::fs::create_dir_all(&failed.work_dir).unwrap();
+        std::fs::write(failed.work_dir.join("raw-volume.rar"), b"raw articles").unwrap();
+        let work_dir = failed.work_dir.clone();
+        insert_job(&manager, failed);
+
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("failed-cleanup").unwrap(), Vec::new());
+        drop(jobs);
+
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("failed-cleanup")
+                .unwrap()
+                .is_some()
+        );
+        assert!(!work_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn completed_history_cleanup_retains_source_when_output_move_is_unsafe() {
+        let (manager, tempdir) = manager();
+        let completed = job("completed-retain", JobStatus::Completed, tempdir.path());
+        std::fs::create_dir_all(&completed.work_dir).unwrap();
+        std::fs::write(completed.work_dir.join("unmoved.bin"), b"payload").unwrap();
+        // A regular file at output_dir makes both rename and copy fail, so the
+        // work directory must be retained instead of silently losing data.
+        std::fs::create_dir_all(completed.output_dir.parent().unwrap()).unwrap();
+        std::fs::write(&completed.output_dir, b"not a directory").unwrap();
+        let work_dir = completed.work_dir.clone();
+        insert_job(&manager, completed);
+
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("completed-retain").unwrap(), Vec::new());
+        drop(jobs);
+
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("completed-retain")
+                .unwrap()
+                .is_some()
+        );
+        assert!(work_dir.join("unmoved.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn post_processing_with_only_raw_artifacts_is_failed_not_completed() {
+        let (manager, tempdir) = manager();
+        let raw = job("raw-artifacts", JobStatus::PostProcessing, tempdir.path());
+        std::fs::create_dir_all(&raw.work_dir).unwrap();
+        std::fs::write(raw.work_dir.join("release.part001.rar"), b"raw").unwrap();
+        std::fs::write(raw.work_dir.join("release.part002.rar"), b"raw").unwrap();
+        std::fs::write(raw.work_dir.join("release.par2"), b"par2").unwrap();
+        let work_dir = raw.work_dir.clone();
+        insert_job(&manager, raw);
+
+        let stages = vec![StageResult {
+            name: "Extract".to_string(),
+            status: StageStatus::Skipped,
+            message: Some("No archives found".to_string()),
+            duration_secs: 0.0,
+        }];
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("raw-artifacts").unwrap(), stages);
+        drop(jobs);
+
+        let entry = manager
+            .db
+            .lock()
+            .history_get("raw-artifacts")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, JobStatus::Failed);
+        assert_eq!(
+            entry.error_message.as_deref(),
+            Some("No usable output produced; only archive or PAR2 artifacts remain")
+        );
+        assert!(
+            entry
+                .stages
+                .iter()
+                .any(|stage| { stage.name == "Output" && stage.status == StageStatus::Failed })
+        );
+        assert!(
+            !work_dir.exists(),
+            "failed raw artifacts are cleaned after history persists"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_processing_with_payload_is_completed() {
+        let (manager, tempdir) = manager();
+        let payload = job("payload", JobStatus::PostProcessing, tempdir.path());
+        std::fs::create_dir_all(&payload.work_dir).unwrap();
+        std::fs::write(payload.work_dir.join("Movie.2024.mkv"), b"media").unwrap();
+        let output = payload.output_dir.clone();
+        insert_job(&manager, payload);
+
+        let stages = vec![StageResult {
+            name: "Extract".to_string(),
+            status: StageStatus::Skipped,
+            message: Some("No archives found".to_string()),
+            duration_secs: 0.0,
+        }];
+        let mut jobs = manager.jobs.lock();
+        manager.move_to_history(jobs.get_mut("payload").unwrap(), stages);
+        drop(jobs);
+
+        let entry = manager.db.lock().history_get("payload").unwrap().unwrap();
+        assert_eq!(entry.status, JobStatus::Completed);
+        assert!(output.join("Movie.2024.mkv").exists());
+    }
+
+    #[tokio::test]
+    async fn removing_active_failed_job_creates_one_history_row() {
+        let (manager, tempdir) = manager();
+        let mut failed = job("active-failed", JobStatus::Paused, tempdir.path());
+        failed.error_message = Some("providers unavailable".into());
+        insert_job(&manager, failed);
+
+        manager.remove_job("active-failed").unwrap();
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("active-failed")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn removal_during_post_processing_is_deferred() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("post-processing", JobStatus::PostProcessing, tempdir.path()),
+        );
+
+        manager.remove_job("post-processing").unwrap();
+        assert!(manager.get_job("post-processing").is_some());
+        assert!(
+            manager
+                .db
+                .lock()
+                .history_get("post-processing")
+                .unwrap()
+                .is_none()
+        );
     }
 }
 
@@ -2765,7 +3925,16 @@ mod hopeless_tests {
             created_at: Instant::now(),
             last_progress_at: Instant::now(),
             content_bytes: content_articles as u64 * article_bytes,
-            par2_bytes: par2_articles as u64 * article_bytes,
+            recovery_capacity_bytes: par2_articles as u64 * article_bytes,
+            recovery_blocks_total: par2_articles as u64,
+            recovery_bytes_unavailable: 0,
+            recovery_blocks_unavailable: 0,
+            recovery_capacity_by_set: HashMap::new(),
+            recovery_unavailable_by_set: HashMap::new(),
+            missing_content_by_set: HashMap::new(),
+            unassociated_missing_bytes: 0,
+            content_file_sets: HashMap::new(),
+            pending_file_classifications: std::collections::HashSet::new(),
             content_bytes_missing: 0,
             content_articles_checked: 0,
             content_articles_failed: 0,
@@ -2778,11 +3947,7 @@ mod hopeless_tests {
         let mut t = make_tracker(1000, 50);
         // Fail 5 articles (at the grace threshold)
         for _ in 0..5 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         assert!(
             t.check(true, true, 100.2).is_none(),
@@ -2794,11 +3959,7 @@ mod hopeless_tests {
     fn grace_period_disabled_when_abort_hopeless_off() {
         let mut t = make_tracker(100, 10);
         for _ in 0..100 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         assert!(
             t.check(false, true, 100.2).is_none(),
@@ -2811,11 +3972,7 @@ mod hopeless_tests {
         let mut t = make_tracker(1000, 50);
         // Simulate: 8 failures, 2 successes out of first 10
         for _ in 0..8 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         for _ in 0..2 {
             t.record_success(false);
@@ -2832,11 +3989,7 @@ mod hopeless_tests {
         let mut t = make_tracker(1000, 50);
         // 7 failures, 3 successes = 70% failure
         for _ in 0..7 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         for _ in 0..3 {
             t.record_success(false);
@@ -2865,11 +4018,7 @@ mod hopeless_tests {
         let mut t = make_tracker(100, 10);
         // Fail all 100 content articles
         for _ in 0..100 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         let result = t.check(true, false, 100.0);
         assert!(
@@ -2878,36 +4027,29 @@ mod hopeless_tests {
         );
         let abort = result.unwrap();
         assert_eq!(abort.tier, "ongoing_availability");
-        assert!(abort.reason.contains("0.0%"));
+        assert!(abort.reason.contains("effective completion 10.000%"));
     }
 
     #[test]
-    fn par2_failures_do_not_count() {
+    fn par2_failures_reduce_recovery_without_counting_as_content_damage() {
         let mut t = make_tracker(100, 50);
         // Fail 20 par2 articles — should not affect content tracking
         for _ in 0..20 {
-            t.record_failure(
-                true,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(true, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         assert_eq!(t.content_articles_failed, 0);
         assert_eq!(t.content_bytes_missing, 0);
-        assert!(t.check(true, true, 100.2).is_none());
+        assert_eq!(t.recovery_bytes_unavailable, 15_000_000);
+        assert_eq!(t.recovery_blocks_unavailable, 20);
     }
 
     #[test]
     fn ongoing_ratio_triggers_when_too_many_missing() {
         let mut t = make_tracker(100, 10);
-        // Fail 10 out of 100 articles (10% missing)
-        // availability = 90% < 100.2% → should abort
-        for _ in 0..10 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+        // Fail 11 out of 100 articles with only 10 articles worth of
+        // recovery. Effective completion is 99%, so this is hopeless.
+        for _ in 0..11 {
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         for _ in 0..40 {
             t.record_success(false);
@@ -2915,8 +4057,68 @@ mod hopeless_tests {
         let result = t.check(true, true, 100.0);
         assert!(
             result.is_some(),
-            "10% missing should fail at 100% threshold"
+            "damage beyond recovery capacity should fail"
         );
+    }
+
+    #[test]
+    fn recovery_capacity_covers_more_than_five_missing_articles() {
+        let mut t = make_tracker(100, 12);
+        for _ in 0..10 {
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert!(t.check(true, false, 100.2).is_none());
+    }
+
+    #[test]
+    fn damage_exactly_at_capacity_still_requires_safety_reserve() {
+        let mut t = make_tracker(100, 10);
+        for _ in 0..10 {
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        let abort = t
+            .check(true, false, 100.2)
+            .expect("reserve must be available");
+        assert_eq!(abort.tier, "ongoing_availability");
+        assert!(t.check(true, false, 100.0).is_none());
+    }
+
+    #[test]
+    fn recovery_from_another_par2_set_cannot_mask_damage() {
+        let mut t = make_tracker(100, 22);
+        t.recovery_capacity_by_set = HashMap::from([
+            ("set-a".to_string(), 20 * 750_000),
+            ("set-b".to_string(), 2 * 750_000),
+        ]);
+        t.content_file_sets
+            .insert("file-b".to_string(), Some("set-b".to_string()));
+        for _ in 0..6 {
+            t.record_file_failure(
+                Some("file-b"),
+                false,
+                750_000,
+                nzb_dispatch::ArticleFailureKind::NotFound,
+            );
+        }
+
+        let abort = t
+            .check(true, false, 100.0)
+            .expect("set A blocks cannot repair set B content");
+        assert_eq!(abort.tier, "ongoing_availability");
+    }
+
+    #[test]
+    fn obfuscated_par2_reclassification_excludes_index_capacity() {
+        let mut index = make_tracker(10, 0);
+        index.reclassify_as_par2("index", 750_000, 1, None, None, Some("set"));
+        assert_eq!(index.content_bytes, 9 * 750_000);
+        assert_eq!(index.recovery_capacity_bytes, 0);
+
+        let mut volume = make_tracker(10, 0);
+        volume.reclassify_as_par2("volume", 3 * 750_000, 3, Some(0), Some(3), Some("set"));
+        assert_eq!(volume.content_bytes, 7 * 750_000);
+        assert_eq!(volume.recovery_capacity_bytes, 3 * 750_000);
+        assert_eq!(volume.recovery_blocks_total, 3);
     }
 
     #[test]
@@ -2928,11 +4130,7 @@ mod hopeless_tests {
         // first.
         let mut t = make_tracker(40, 5);
         for _ in 0..9 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         for _ in 0..2 {
             t.record_success(false);
@@ -2951,11 +4149,7 @@ mod hopeless_tests {
         let mut t = make_tracker(10000, 500);
         // First 10 articles all fail — exactly the scenario from the bug report
         for _ in 0..10 {
-            t.record_failure(
-                false,
-                750_000,
-                crate::article_failure::ArticleFailureKind::NotFound,
-            );
+            t.record_failure(false, 750_000, nzb_dispatch::ArticleFailureKind::NotFound);
         }
         let result = t.check(true, true, 100.2);
         assert!(

@@ -389,6 +389,87 @@ async fn same_priority_peers_both_serve_job() {
     );
 }
 
+/// Reordering within the same numeric priority must still have immediate
+/// scheduling effect. Moving a queued job above the active one should pause
+/// the active download and start the reordered job right away.
+#[tokio::test]
+async fn moving_queued_job_to_top_preempts_active_download() {
+    let (xml_a, yenc_a, _mids_a) = make_fixture("drag-a", 12);
+    let (xml_b, yenc_b, _mids_b) = make_fixture("drag-b", 12);
+
+    let primary = ServerProfile::start(
+        "primary",
+        MockConfig {
+            articles: yenc_a.into_iter().chain(yenc_b).collect(),
+            response_delay: Some(Duration::from_millis(120)),
+            ..Default::default()
+        },
+        2,
+    )
+    .await
+    .with_priority(0);
+
+    let engine = HarnessBuilder::new()
+        .with_server(primary)
+        .max_active_downloads(1)
+        .article_timeout(10)
+        .build();
+
+    let first_id = engine
+        .submit_nzb_xml("drag-a", xml_a)
+        .expect("submit first nzb");
+    let first_started = engine
+        .wait_for(Duration::from_secs(5), |snap| {
+            snap.job(&first_id)
+                .map(|j| j.status == JobStatus::Downloading)
+                .unwrap_or(false)
+        })
+        .await;
+    assert!(first_started, "first job never entered downloading state");
+
+    let second_id = engine
+        .submit_nzb_xml("drag-b", xml_b)
+        .expect("submit second nzb");
+    let second_queued = engine
+        .wait_for(Duration::from_secs(5), |snap| {
+            let first = snap.job(&first_id);
+            let second = snap.job(&second_id);
+            matches!(
+                (first.map(|j| j.status), second.map(|j| j.status)),
+                (Some(JobStatus::Downloading), Some(JobStatus::Queued))
+            )
+        })
+        .await;
+    assert!(
+        second_queued,
+        "expected first job downloading and second queued before reorder"
+    );
+
+    engine
+        .queue_manager
+        .move_job(&second_id, 0)
+        .expect("move second job to top");
+
+    let preempted = engine
+        .wait_for(Duration::from_secs(5), |snap| {
+            let first = snap.job(&first_id);
+            let second = snap.job(&second_id);
+            matches!(
+                (first.map(|j| j.status), second.map(|j| j.status)),
+                (Some(JobStatus::Paused), Some(JobStatus::Downloading))
+            )
+        })
+        .await;
+
+    let first = engine.job(&first_id).expect("first job present");
+    let second = engine.job(&second_id).expect("second job present");
+    assert!(
+        preempted,
+        "reorder did not preempt immediately: first={} second={}",
+        first.status, second.status
+    );
+}
+
 /// Sanity: job must reach a terminal state (Completed/Failed) after
 /// submission when the only priority-0 server is unreachable. Guards against
 /// the failure mode where backup workers get starvation-logged and never
