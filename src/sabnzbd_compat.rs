@@ -368,15 +368,9 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
             Json(serde_json::json!({ "status": true }))
         }
 
-        "switch" => {
-            // TODO: implement queue reordering when priority queue is added
-            Json(serde_json::json!({ "status": true }))
-        }
+        "switch" => handle_switch(state, req),
 
-        "priority" => {
-            // TODO: implement priority changes for queued jobs
-            Json(serde_json::json!({ "status": true }))
-        }
+        "priority" => handle_priority(state, req),
 
         "fullstatus" | "server_stats" => {
             let qm = &state.queue_manager;
@@ -419,7 +413,7 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         _ => {}
     }
 
-    let jobs = qm.get_jobs();
+    let jobs = qm.get_active_jobs();
     let paused = qm.is_paused();
     let speed_bps = qm.get_speed();
 
@@ -489,20 +483,46 @@ fn handle_queue_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json
     Json(serde_json::json!({ "status": false }))
 }
 
-/// Stub for mode=queue&name=pause&value=nzo_ID
-fn handle_queue_item_pause(_state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+/// Handle mode=queue&name=pause&value=nzo_ID.
+fn handle_queue_item_pause(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    tracing::debug!(id = %search_id, "Queue item pause requested (stub)");
-    Json(serde_json::json!({ "status": true }))
+    let Some(job) = state
+        .queue_manager
+        .get_jobs()
+        .into_iter()
+        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+    else {
+        return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
+    };
+    match state.queue_manager.pause_job(&job.id) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
+    }
 }
 
-/// Stub for mode=queue&name=resume&value=nzo_ID
-fn handle_queue_item_resume(_state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+/// Handle mode=queue&name=resume&value=nzo_ID.
+fn handle_queue_item_resume(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    if state.queue_manager.is_paused() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Cannot resume an individual job while downloads are globally paused"
+        }));
+    }
     let target = req.value.as_deref().unwrap_or("");
     let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
-    tracing::debug!(id = %search_id, "Queue item resume requested (stub)");
-    Json(serde_json::json!({ "status": true }))
+    let Some(job) = state
+        .queue_manager
+        .get_jobs()
+        .into_iter()
+        .find(|job| job.id == search_id || job.id.starts_with(search_id))
+    else {
+        return Json(serde_json::json!({ "status": false, "error": "Job not found" }));
+    };
+    match state.queue_manager.resume_job(&job.id) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
+    }
 }
 
 fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
@@ -536,10 +556,13 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     let qm = &state.queue_manager;
 
     if target == "all" {
-        // Note: SABnzbd supports "all" to clear history — we don't expose this
-        // to avoid accidental data loss, but acknowledge the request.
-        tracing::warn!("History delete-all requested via arr API (not implemented)");
-        return Json(serde_json::json!({ "status": true }));
+        return match qm.history_clear() {
+            Ok(()) => Json(serde_json::json!({ "status": true })),
+            Err(error) => Json(serde_json::json!({
+                "status": false,
+                "error": error.to_string()
+            })),
+        };
     }
 
     let search_id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
@@ -622,6 +645,12 @@ fn handle_resume(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
     if let Some(nzo_id) = target_id
         && !nzo_id.is_empty()
     {
+        if qm.is_paused() {
+            return Json(serde_json::json!({
+                "status": false,
+                "error": "Cannot resume an individual job while downloads are globally paused"
+            }));
+        }
         let search_id = nzo_id.strip_prefix("SABnzbd_nzo_").unwrap_or(nzo_id);
 
         let jobs = qm.get_jobs();
@@ -685,13 +714,108 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
     Json(serde_json::json!({ "status": found }))
 }
 
-fn handle_retry(_state: &AppState, _req: &SabApiRequest) -> Json<serde_json::Value> {
-    // Retry is complex — requires re-parsing the NZB which we don't store.
-    // For now, return a stub.
-    Json(serde_json::json!({
-        "status": false,
-        "error": "Retry not yet implemented"
-    }))
+fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target_id = req.name.as_deref().or(req.value.as_deref()).unwrap_or("");
+    if target_id.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "No history job ID provided"
+        }));
+    }
+
+    let search_id = target_id.strip_prefix("SABnzbd_nzo_").unwrap_or(target_id);
+    let Some(entry) = state
+        .queue_manager
+        .history_list(1000)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|entry| entry.id == search_id || entry.id.starts_with(search_id))
+    else {
+        return Json(serde_json::json!({ "status": false, "error": "History job not found" }));
+    };
+
+    let data = match state.queue_manager.history_get_nzb_data(&entry.id) {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            return Json(serde_json::json!({
+                "status": false,
+                "error": "The original NZB data is unavailable for this history job"
+            }));
+        }
+        Err(error) => {
+            return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
+        }
+    };
+
+    let mut job = match nzb_parser::parse_nzb(&entry.name, &data) {
+        Ok(job) => job,
+        Err(error) => {
+            return Json(serde_json::json!({
+                "status": false,
+                "error": format!("Failed to parse stored NZB: {error}")
+            }));
+        }
+    };
+    job.category = entry.category;
+    job.work_dir = state.queue_manager.incomplete_dir().join(&job.id);
+    job.output_dir = state
+        .queue_manager
+        .complete_dir()
+        .join(&job.category)
+        .join(&job.name);
+
+    let nzo_id = format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]);
+    if let Err(error) = state.queue_manager.add_job(job, Some(data)) {
+        return Json(serde_json::json!({ "status": false, "error": error.to_string() }));
+    }
+
+    tracing::info!(history_id = %entry.id, retried_id = %nzo_id, "History job retried via arr API");
+    Json(serde_json::json!({ "status": true, "nzo_ids": [nzo_id] }))
+}
+
+fn handle_switch(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target = req.value.as_deref().unwrap_or("");
+    let position = req
+        .value2
+        .as_deref()
+        .or(req.name.as_deref())
+        .and_then(|value| value.parse::<usize>().ok());
+
+    let Some(position) = position else {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing or invalid target queue position"
+        }));
+    };
+    if target.is_empty() {
+        return Json(serde_json::json!({ "status": false, "error": "No job ID" }));
+    }
+
+    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    match state.queue_manager.move_job(id, position) {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
+    }
+}
+
+fn handle_priority(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    let target = req.value.as_deref().unwrap_or("");
+    let priority = req.value2.as_deref().or(req.name.as_deref()).unwrap_or("");
+    if target.is_empty() || priority.is_empty() {
+        return Json(serde_json::json!({
+            "status": false,
+            "error": "Missing job ID or priority"
+        }));
+    }
+
+    let id = target.strip_prefix("SABnzbd_nzo_").unwrap_or(target);
+    match state
+        .queue_manager
+        .set_job_priority(id, sab_priority_to_priority(priority))
+    {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error.to_string() })),
+    }
 }
 
 fn handle_get_cats(state: &AppState) -> Json<serde_json::Value> {
@@ -795,12 +919,7 @@ impl SabQueueSlot {
             nzo_id: format!("SABnzbd_nzo_{}", &job.id[..12.min(job.id.len())]),
             filename: job.name.clone(),
             cat: job.category.clone(),
-            status: match job.status {
-                JobStatus::Downloading => "Downloading".into(),
-                JobStatus::Paused => "Paused".into(),
-                JobStatus::Queued => "Queued".into(),
-                _ => job.status.to_string(),
-            },
+            status: sab_queue_status(job.status).into(),
             priority: match job.priority {
                 Priority::Force => "Force".into(),
                 Priority::High => "High".into(),
@@ -816,6 +935,23 @@ impl SabQueueSlot {
             size: format_size_human(job.total_bytes),
             sizeleft: format_size_human(job.total_bytes.saturating_sub(job.downloaded_bytes)),
         }
+    }
+}
+
+/// Map internal lifecycle states to the status vocabulary accepted by the
+/// SABnzbd clients in Sonarr and Radarr. In particular, `PostProcessing` is an
+/// internal rustnzb state; SABnzbd reports custom post-processing as `Running`.
+fn sab_queue_status(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Queued => "Queued",
+        JobStatus::Downloading => "Downloading",
+        JobStatus::Paused => "Paused",
+        JobStatus::Verifying => "Verifying",
+        JobStatus::Repairing => "Repairing",
+        JobStatus::Extracting => "Extracting",
+        JobStatus::PostProcessing => "Running",
+        JobStatus::Completed => "Completed",
+        JobStatus::Failed => "Failed",
     }
 }
 
@@ -865,7 +1001,13 @@ impl SabHistorySlot {
             storage: entry.output_dir.to_string_lossy().to_string(),
             completed: entry.completed_at.timestamp(),
             fail_message: entry.error_message.clone().unwrap_or_default(),
-            download_time: (entry.completed_at - entry.added_at).num_seconds().max(0) as u64,
+            download_time: entry
+                .download_time_secs
+                .unwrap_or_else(|| {
+                    (entry.completed_at - entry.added_at).num_seconds().max(0) as f64
+                })
+                .round()
+                .max(0.0) as u64,
             pp: "D".into(),
             nzb_name: format!("{}.nzb", entry.name),
             stage_log,
@@ -902,5 +1044,52 @@ fn format_speed(bps: u64) -> String {
         format!("{:.1} KB/s", bps as f64 / 1024.0)
     } else {
         format!("{bps} B/s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_statuses_use_sabnzbd_vocabulary() {
+        let cases = [
+            (JobStatus::Queued, "Queued"),
+            (JobStatus::Downloading, "Downloading"),
+            (JobStatus::Paused, "Paused"),
+            (JobStatus::Verifying, "Verifying"),
+            (JobStatus::Repairing, "Repairing"),
+            (JobStatus::Extracting, "Extracting"),
+            (JobStatus::PostProcessing, "Running"),
+            (JobStatus::Completed, "Completed"),
+            (JobStatus::Failed, "Failed"),
+        ];
+
+        for (status, expected) in cases {
+            assert_eq!(sab_queue_status(status), expected);
+        }
+    }
+
+    #[test]
+    fn history_reports_active_download_time_to_arr_clients() {
+        let now = chrono::Utc::now();
+        let entry = HistoryEntry {
+            id: "history-active-time".into(),
+            name: "queued item".into(),
+            category: "sonarr".into(),
+            status: JobStatus::Completed,
+            total_bytes: 10_000,
+            downloaded_bytes: 10_000,
+            added_at: now - chrono::Duration::hours(4),
+            completed_at: now,
+            download_time_secs: Some(2.4),
+            output_dir: "/downloads/complete".into(),
+            stages: Vec::new(),
+            error_message: None,
+            server_stats: Vec::new(),
+            nzb_data: None,
+        };
+
+        assert_eq!(SabHistorySlot::from_entry(&entry).download_time, 2);
     }
 }
