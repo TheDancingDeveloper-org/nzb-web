@@ -39,7 +39,7 @@ governor = "0.10"
 arc-swap = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", features = ["json", "rustls-tls"] }
 notify = "8"
 feed-rs = "2"
 regex = "1"
