@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub use nzb_decode;
 pub use nzb_postproc;
 pub use nzb_postproc::nzb_core;
@@ -6,6 +8,7 @@ pub mod auth;
 pub mod dir_watcher;
 pub mod direct_unpack;
 pub mod error;
+pub mod fetch_guard;
 pub mod log_buffer;
 pub mod queue_manager;
 pub mod rss_monitor;
