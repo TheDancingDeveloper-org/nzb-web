@@ -1088,6 +1088,7 @@ mod tests {
             error_message: None,
             server_stats: Vec::new(),
             nzb_data: None,
+            retry_data: None,
         };
 
         assert_eq!(SabHistorySlot::from_entry(&entry).download_time, 2);
