@@ -4,13 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
-    groups:
-      rust-minor:
-        update-types: [minor, patch]
+    # Alerts-only estate policy: keep Dependabot security alerts, but never
+    # open version-update pull requests.
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
+
