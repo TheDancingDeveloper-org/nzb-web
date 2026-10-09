@@ -1968,6 +1968,10 @@ impl QueueManager {
             error_message: state.job.error_message.clone(),
             server_stats: state.job.server_stats.clone(),
             nzb_data: state.nzb_data.clone(),
+            // nzb-core 0.2.18 added per-article retry outcomes. Persisting them
+            // needs the checkpoint wiring this mirror does not have yet, so
+            // history rows compile and insert without retry data.
+            retry_data: None,
         };
 
         let db = self.db.lock();
@@ -2398,6 +2402,7 @@ impl QueueManager {
                     error_message: state.job.error_message.clone(),
                     server_stats: state.job.server_stats.clone(),
                     nzb_data: state.nzb_data.clone(),
+                    retry_data: None,
                 };
                 if let Err(e) = db.history_insert(&history_entry) {
                     error!(job_id = %id, "Failed to insert history for removed failed job: {e}");
