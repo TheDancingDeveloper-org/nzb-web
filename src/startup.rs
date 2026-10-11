@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use anyhow::Context;
 use arc_swap::ArcSwap;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::nzb_core::config::AppConfig;
 use crate::nzb_core::db::Database;
@@ -11,6 +12,7 @@ use crate::auth::{CredentialStore, TokenStore};
 use crate::log_buffer::LogBuffer;
 use crate::queue_manager::QueueManager;
 use crate::state::AppState;
+use nzb_postproc::PostProcLimits;
 
 fn sanitize_loaded_config(config: &mut AppConfig) {
     for server in &mut config.servers {
@@ -44,6 +46,36 @@ fn env_flag_enabled(name: &str) -> Option<bool> {
     })
 }
 
+/// Create a data directory (e.g. `data_dir`/`incomplete_dir`/`complete_dir`), attaching
+/// the failing path and a permission hint to any error so failures are actionable
+/// instead of a bare `Permission denied (os error 13)`.
+/// A hand-edited config.toml can carry a category the API would refuse.
+/// Starting anyway keeps the rest of the service usable; the warning
+/// explains why jobs in that category fail to enqueue.
+fn warn_unsafe_categories(config: &AppConfig) {
+    for category in &config.categories {
+        if let Err(reason) = category.validate() {
+            warn!(
+                category = %category.name,
+                output_dir = ?category.output_dir,
+                reason,
+                "Unsafe category in config; jobs in it will fail to enqueue until it is fixed"
+            );
+        }
+    }
+}
+
+fn create_data_dir(path: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(path).with_context(|| {
+        format!(
+            "Failed to create directory {}. \
+             Check that the directory (and its parent) is writable by the current user. \
+             If using Docker, ensure the volume is owned by the container's user.",
+            path.display()
+        )
+    })
+}
+
 /// Configuration for engine initialization.
 ///
 /// All fields except `config_path` are optional overrides —
@@ -66,6 +98,103 @@ pub struct StartupResult {
     pub state: Arc<AppState>,
     pub queue_manager: Arc<QueueManager>,
     pub log_buffer: LogBuffer,
+    /// Held for the lifetime of the process so a second instance on the
+    /// same data_dir refuses to start.
+    pub instance_lock: InstanceLock,
+}
+
+/// Exclusive lock on `<data_dir>/rustnzb.lock` ensuring only one rustnzb
+/// instance uses a given data directory at a time. Released on drop.
+pub struct InstanceLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(windows)]
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl InstanceLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+
+        let file = open_lock_options()
+            .open(lock_path(data_dir))
+            .with_context(|| format!("failed to open {}", lock_path(data_dir).display()))?;
+        let fd = file.as_raw_fd();
+        let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!(
+                    "another rustnzb instance is using {}; stop it or choose a different data_dir",
+                    data_dir.display()
+                );
+            }
+            return Err(err).context(format!("failed to lock {}", lock_path(data_dir).display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(windows)]
+impl InstanceLock {
+    fn acquire(data_dir: &Path) -> anyhow::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // share_mode(0) denies all sharing: a second open fails outright.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .open(lock_path(data_dir))
+            .map_err(|err| {
+                if err.raw_os_error() == Some(32) {
+                    anyhow::anyhow!(
+                        "another rustnzb instance is using {}; stop it or choose a different data_dir",
+                        data_dir.display()
+                    )
+                } else {
+                    anyhow::Error::new(err).context(format!(
+                        "failed to lock {}",
+                        lock_path(data_dir).display()
+                    ))
+                }
+            })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn lock_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("rustnzb.lock")
+}
+
+fn open_lock_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    // Deliberately no truncate: the lock file's contents are irrelevant and
+    // truncating would churn the file on every start.
+    options
+}
+
+#[cfg(unix)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        // Closing the file handle releases the exclusive share.
+    }
+}
+
+/// Acquire the single-instance lock for `data_dir`.
+pub fn acquire_instance_lock(data_dir: &Path) -> anyhow::Result<InstanceLock> {
+    InstanceLock::acquire(data_dir)
 }
 
 /// Initialize the rustnzb engine: load config, open database,
@@ -119,10 +248,16 @@ pub async fn initialize(
         config.otel.service_name = val;
     }
 
-    // Ensure directories exist
-    std::fs::create_dir_all(&config.general.data_dir)?;
-    std::fs::create_dir_all(&config.general.incomplete_dir)?;
-    std::fs::create_dir_all(&config.general.complete_dir)?;
+    warn_unsafe_categories(&config);
+
+    // Ensure directories exist. The instance lock is taken before any
+    // side-effect directories are created, so a second instance on the same
+    // data_dir fails without leaving anything behind.
+    create_data_dir(&config.general.data_dir)?;
+    let instance_lock = acquire_instance_lock(&config.general.data_dir)
+        .context("failed to acquire single-instance lock")?;
+    create_data_dir(&config.general.incomplete_dir)?;
+    create_data_dir(&config.general.complete_dir)?;
 
     // Open database
     let db_path = config.general.data_dir.join("rustnzb.db");
@@ -133,13 +268,18 @@ pub async fn initialize(
     let log_buffer = log_buffer.unwrap_or_default();
 
     // Create the queue manager
-    let queue_manager = QueueManager::new(
+    let queue_manager = QueueManager::new_with_postproc_limits(
         config.servers.clone(),
         db,
         config.general.incomplete_dir.clone(),
         config.general.complete_dir.clone(),
         log_buffer.clone(),
         config.general.max_active_downloads,
+        PostProcLimits {
+            pipelines: config.general.max_post_processing_jobs,
+            repair: config.general.max_repair_workers,
+            extract: config.general.max_extract_workers,
+        },
         config.categories.clone(),
         config.general.min_free_space_bytes,
         config.general.speed_limit_bps,
@@ -151,10 +291,16 @@ pub async fn initialize(
         config.general.article_timeout_secs,
     );
 
-    // Set history retention
-    if let Some(retention) = config.general.history_retention {
-        queue_manager.set_history_retention(Some(retention));
-    }
+    // Set history retention (the setter folds 0 into "keep all").
+    queue_manager.set_history_retention(config.general.history_retention);
+    queue_manager.set_auto_sort_remaining_pct(config.general.auto_sort_remaining_pct);
+    queue_manager.set_postproc_scripts(
+        config.general.scripts_dir.clone(),
+        config.general.script_success.clone(),
+        config.general.script_failure.clone(),
+        config.general.script_timeout_secs,
+        config.general.script_max_output_bytes,
+    );
 
     // Restore any in-progress jobs from the database
     if let Err(e) = queue_manager.restore_from_db() {
@@ -189,18 +335,9 @@ pub async fn initialize(
     // without a restart.
     let shared_config = Arc::new(ArcSwap::new(Arc::new(config)));
 
-    // Always start the RSS monitor so feeds added later via the API are polled.
-    let data_dir_for_rss = shared_config.load().general.data_dir.clone();
-    let monitor = crate::rss_monitor::RssMonitor::new(
-        Arc::clone(&shared_config),
-        Arc::clone(&queue_manager),
-        data_dir_for_rss,
-    );
-    tokio::spawn(async move { monitor.run().await });
-
     // Build shared application state
     let state = Arc::new(AppState::new(
-        shared_config,
+        Arc::clone(&shared_config),
         config_path,
         Arc::clone(&queue_manager),
         log_buffer.clone(),
@@ -208,18 +345,119 @@ pub async fn initialize(
         credential_store,
     ));
 
+    // Always start the RSS monitor so feeds added later via the API are polled.
+    // Every committed config change wakes it, so a new or re-enabled feed is
+    // checked promptly instead of after the monitor's current sleep.
+    let data_dir_for_rss = shared_config.load().general.data_dir.clone();
+    let monitor = crate::rss_monitor::RssMonitor::new(
+        shared_config,
+        Arc::clone(&queue_manager),
+        data_dir_for_rss,
+    )
+    .with_wake(Arc::clone(&state.rss_monitor_wake));
+    tokio::spawn(async move { monitor.run().await });
+
     Ok(StartupResult {
         state,
         queue_manager,
         log_buffer,
+        instance_lock,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_loaded_config;
+    use super::{acquire_instance_lock, create_data_dir, sanitize_loaded_config};
     use crate::nzb_core::config::AppConfig;
     use crate::nzb_core::config::ServerConfig;
+
+    #[test]
+    fn create_data_dir_creates_nested_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+
+        create_data_dir(&nested).expect("nested directory creation should succeed");
+
+        assert!(nested.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_data_dir_wraps_permission_denied_with_context() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let locked_parent = tmp.path().join("locked");
+        std::fs::create_dir_all(&locked_parent).unwrap();
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let target = locked_parent.join("data");
+        let result = create_data_dir(&target);
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(&locked_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = match result {
+            Err(e) => e,
+            // Running as root (e.g. CI containers) bypasses the permission
+            // check entirely, so there's nothing to assert.
+            Ok(()) => return,
+        };
+        let debug_text = format!("{err:?}");
+
+        assert!(
+            debug_text.contains(&target.display().to_string()),
+            "error should mention the failing path, got: {debug_text}"
+        );
+        assert!(
+            debug_text.contains("Caused by"),
+            "error should retain the underlying io::Error in the chain, got: {debug_text}"
+        );
+    }
+
+    #[test]
+    fn second_instance_on_same_data_dir_fails_before_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        // initialize always creates the data_dir before acquiring the lock;
+        // mirror that here so the lock file has a parent to live in.
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let first = acquire_instance_lock(&data_dir).unwrap();
+
+        let second = match acquire_instance_lock(&data_dir) {
+            Err(e) => e,
+            Ok(_) => panic!("second acquire should fail while first lock is held"),
+        };
+        let debug_text = format!("{second:?}");
+        assert!(
+            debug_text.contains("another rustnzb instance"),
+            "error should mention the other instance, got: {debug_text}"
+        );
+
+        // Releasing the first lock lets a later instance acquire it again.
+        drop(first);
+        acquire_instance_lock(&data_dir).unwrap();
+    }
+
+    /// Desktop `start_engine` moves `StartupResult.instance_lock` into process
+    /// state and then drops the rest of the result. The moved lock must still
+    /// exclude a second instance until that owner drops it.
+    #[test]
+    fn moved_instance_lock_still_excludes_a_second_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let lock = acquire_instance_lock(&data_dir).unwrap();
+        let retained = lock;
+        assert!(
+            acquire_instance_lock(&data_dir).is_err(),
+            "moving the lock out of StartupResult must not release it"
+        );
+        drop(retained);
+        acquire_instance_lock(&data_dir).expect("released on drop");
+    }
 
     #[test]
     fn sanitize_loaded_config_trims_server_fields() {

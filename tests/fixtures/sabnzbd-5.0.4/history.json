@@ -1,0 +1,48 @@
+{
+  "history": {
+    "day_size": "$type:string",
+    "last_history_update": "$type:integer",
+    "month_size": "$type:string",
+    "noofslots": 1,
+    "ppslots": 0,
+    "slots": [
+      {
+        "action_line": "$type:any",
+        "archive": false,
+        "bytes": 1048576,
+        "category": "tv",
+        "completed": "$type:integer",
+        "completeness": "$type:any",
+        "download_time": 5,
+        "downloaded": 1048576,
+        "duplicate_key": "$type:any",
+        "fail_message": "",
+        "loaded": false,
+        "md5sum": "$type:string",
+        "meta": "$type:any",
+        "name": "SAB history fixture",
+        "nzb_name": "SAB history fixture.nzb",
+        "nzo_id": "$type:string",
+        "password": "",
+        "path": "$type:string",
+        "postproc_time": "$type:integer",
+        "pp": "D",
+        "report": "$type:any",
+        "retry": false,
+        "script": "$type:string",
+        "script_line": "$type:string",
+        "series": "$type:any",
+        "size": "$type:string",
+        "stage_log": [],
+        "status": "Completed",
+        "storage": "$type:string",
+        "time_added": "$type:integer",
+        "url": "",
+        "url_info": ""
+      }
+    ],
+    "total_size": "$type:string",
+    "version": "5.0.4",
+    "week_size": "$type:string"
+  }
+}
