@@ -1,7 +1,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -11,12 +19,17 @@ const REFRESH_TOKEN_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60); // 3
 
 struct TokenEntry {
     expires_at: Instant,
+    /// Login session the token belongs to. Every access and refresh token
+    /// issued from one login (including refresh rotations) shares it, so
+    /// logout can revoke the whole session.
+    session: u64,
 }
 
 #[derive(Default)]
 pub struct TokenStore {
     access_tokens: RwLock<HashMap<String, TokenEntry>>,
     refresh_tokens: RwLock<HashMap<String, TokenEntry>>,
+    next_session: AtomicU64,
 }
 
 #[derive(Serialize)]
@@ -38,9 +51,10 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct LogoutRequest {
-    pub refresh_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
 }
 
 fn generate_token() -> String {
@@ -53,10 +67,17 @@ impl TokenStore {
         Self {
             access_tokens: RwLock::new(HashMap::new()),
             refresh_tokens: RwLock::new(HashMap::new()),
+            next_session: AtomicU64::new(0),
         }
     }
 
+    /// Issue tokens for a new login session.
     pub fn create_tokens(&self) -> TokenResponse {
+        let session = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.issue_tokens(session)
+    }
+
+    fn issue_tokens(&self, session: u64) -> TokenResponse {
         let access_token = generate_token();
         let refresh_token = generate_token();
         let now = Instant::now();
@@ -65,12 +86,14 @@ impl TokenStore {
             access_token.clone(),
             TokenEntry {
                 expires_at: now + ACCESS_TOKEN_TTL,
+                session,
             },
         );
         self.refresh_tokens.write().insert(
             refresh_token.clone(),
             TokenEntry {
                 expires_at: now + REFRESH_TOKEN_TTL,
+                session,
             },
         );
 
@@ -90,25 +113,56 @@ impl TokenStore {
     }
 
     pub fn refresh(&self, refresh_token: &str) -> Option<TokenResponse> {
-        let valid = {
-            let tokens = self.refresh_tokens.read();
-            tokens
-                .get(refresh_token)
-                .is_some_and(|entry| entry.expires_at > Instant::now())
+        // Remove the old refresh token (rotation) under the same lock that
+        // checks it, so it can be redeemed only once.
+        let session = {
+            let mut tokens = self.refresh_tokens.write();
+            let entry = tokens.remove(refresh_token)?;
+            if entry.expires_at <= Instant::now() {
+                return None;
+            }
+            entry.session
         };
 
-        if !valid {
-            return None;
-        }
-
-        // Revoke the old refresh token (rotation)
-        self.refresh_tokens.write().remove(refresh_token);
-
-        Some(self.create_tokens())
+        Some(self.issue_tokens(session))
     }
 
     pub fn revoke_refresh_token(&self, refresh_token: &str) {
         self.refresh_tokens.write().remove(refresh_token);
+    }
+
+    /// End the login session that `token` (an access or refresh token)
+    /// belongs to: every access and refresh token issued for that session,
+    /// including earlier rotations, stops working.
+    pub fn revoke_session_of(&self, token: &str) {
+        let session = self
+            .access_tokens
+            .read()
+            .get(token)
+            .map(|entry| entry.session)
+            .or_else(|| {
+                self.refresh_tokens
+                    .read()
+                    .get(token)
+                    .map(|entry| entry.session)
+            });
+        // Always drop the presented token itself, even if it is unknown.
+        self.access_tokens.write().remove(token);
+        self.refresh_tokens.write().remove(token);
+        if let Some(session) = session {
+            self.access_tokens
+                .write()
+                .retain(|_, entry| entry.session != session);
+            self.refresh_tokens
+                .write()
+                .retain(|_, entry| entry.session != session);
+        }
+    }
+
+    /// Revoke every session after credentials change.
+    pub fn revoke_all(&self) {
+        self.access_tokens.write().clear();
+        self.refresh_tokens.write().clear();
     }
 
     pub fn cleanup_expired(&self) {
@@ -132,12 +186,26 @@ pub struct StoredCredentials {
 
 pub struct CredentialStore {
     credentials: RwLock<Option<StoredCredentials>>,
+    #[cfg(not(unix))]
     file_path: PathBuf,
+    #[cfg(unix)]
+    directory: File,
 }
 
 impl CredentialStore {
     pub fn new(config_dir: PathBuf) -> Self {
+        // Startup creates the configured data directory before constructing
+        // this store. Canonicalizing it here confines the credential file to
+        // that existing directory and removes traversal or symlinked-parent
+        // ambiguity from the subsequent writes.
+        let config_dir = config_dir.canonicalize().unwrap_or_else(|error| {
+            panic!("credential store data directory must exist before startup: {error}")
+        });
         let file_path = config_dir.join("credentials.json");
+        #[cfg(unix)]
+        let directory = File::open(&config_dir).unwrap_or_else(|error| {
+            panic!("credential store data directory must be readable: {error}")
+        });
         let credentials = if file_path.exists() {
             match std::fs::read_to_string(&file_path) {
                 Ok(contents) => serde_json::from_str(&contents).ok(),
@@ -148,7 +216,10 @@ impl CredentialStore {
         };
         Self {
             credentials: RwLock::new(credentials),
+            #[cfg(not(unix))]
             file_path,
+            #[cfg(unix)]
+            directory,
         }
     }
 
@@ -160,20 +231,58 @@ impl CredentialStore {
         self.credentials.read().clone()
     }
 
-    pub fn set_credentials(&self, creds: StoredCredentials) -> Result<(), std::io::Error> {
-        let json = serde_json::to_string_pretty(&creds).map_err(std::io::Error::other)?;
-        // Create parent directory if needed
-        if let Some(parent) = self.file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.file_path, &json)?;
-        // Set file permissions to owner-only on unix
+    fn persist(&self, json: &[u8]) -> Result<(), std::io::Error> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.file_path, std::fs::Permissions::from_mode(0o600))?;
+            // The directory handle is opened from the canonical data
+            // directory at startup. The fixed filename never comes from a
+            // request or configuration value, and O_NOFOLLOW prevents a
+            // pre-existing credentials symlink from redirecting the write.
+            let flags =
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+            let fd = unsafe {
+                libc::openat(
+                    self.directory.as_raw_fd(),
+                    c"credentials.json".as_ptr(),
+                    flags,
+                    0o600,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut file = unsafe { File::from_raw_fd(fd) };
+            file.write_all(json)?;
+            if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            file.sync_all()
         }
+
+        #[cfg(not(unix))]
+        std::fs::write(&self.file_path, json)
+    }
+
+    pub fn set_credentials(&self, creds: StoredCredentials) -> Result<(), std::io::Error> {
+        let json = serde_json::to_string_pretty(&creds).map_err(std::io::Error::other)?;
+        self.persist(json.as_bytes())?;
         *self.credentials.write() = Some(creds);
+        Ok(())
+    }
+
+    /// Set credentials exactly once. The check and write are serialized so
+    /// two first-boot setup requests cannot race into different accounts.
+    pub fn initialize_credentials(&self, creds: StoredCredentials) -> Result<(), std::io::Error> {
+        let mut current = self.credentials.write();
+        if current.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "credentials already configured",
+            ));
+        }
+        let json = serde_json::to_string_pretty(&creds).map_err(std::io::Error::other)?;
+        self.persist(json.as_bytes())?;
+        *current = Some(creds);
         Ok(())
     }
 
@@ -238,11 +347,6 @@ pub async fn h_auth_setup(
     State(state): State<ApiState>,
     Json(req): Json<SetupRequest>,
 ) -> impl IntoResponse {
-    // Only allow if no credentials exist yet
-    if state.credential_store.has_credentials() {
-        return (StatusCode::FORBIDDEN, "credentials already configured").into_response();
-    }
-
     if req.username.is_empty() || req.password.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -251,14 +355,19 @@ pub async fn h_auth_setup(
             .into_response();
     }
 
-    match state.credential_store.set_credentials(StoredCredentials {
-        username: req.username,
-        password: req.password,
-    }) {
+    match state
+        .credential_store
+        .initialize_credentials(StoredCredentials {
+            username: req.username,
+            password: req.password,
+        }) {
         Ok(_) => {
             // Create tokens for the new user so they're immediately logged in
             let tokens = state.token_store.create_tokens();
             (StatusCode::OK, Json(tokens)).into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            (StatusCode::FORBIDDEN, "credentials are already configured").into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -300,9 +409,19 @@ pub async fn h_auth_change_credentials(
         username: req.new_username.unwrap_or(current_creds.username),
         password: req.new_password.unwrap_or(current_creds.password),
     };
+    if new_creds.username.is_empty() || new_creds.password.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "username and password cannot be empty",
+        )
+            .into_response();
+    }
 
     match state.credential_store.set_credentials(new_creds) {
-        Ok(_) => StatusCode::OK.into_response(),
+        Ok(_) => {
+            state.token_store.revoke_all();
+            StatusCode::OK.into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to save credentials: {e}"),
@@ -347,11 +466,25 @@ pub async fn h_auth_refresh(
 
 // --- Logout ---
 
+/// Revoke the caller's session: the refresh token in the body and the
+/// access token in the `Authorization: Bearer` header (if any), together
+/// with every other token issued for the same login.
 pub async fn h_auth_logout(
     State(state): State<ApiState>,
-    Json(req): Json<LogoutRequest>,
+    headers: http::HeaderMap,
+    req: Option<Json<LogoutRequest>>,
 ) -> impl IntoResponse {
-    state.token_store.revoke_refresh_token(&req.refresh_token);
+    let req = req.map(|Json(req)| req).unwrap_or_default();
+    if let Some(refresh_token) = req.refresh_token.as_deref() {
+        state.token_store.revoke_session_of(refresh_token);
+    }
+    if let Some(access_token) = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        state.token_store.revoke_session_of(access_token);
+    }
     StatusCode::NO_CONTENT
 }
 
@@ -374,6 +507,34 @@ mod tests {
 
         store.revoke_refresh_token(&second.refresh_token);
         assert!(store.refresh(&second.refresh_token).is_none());
+    }
+
+    #[test]
+    fn revoking_a_session_revokes_its_access_tokens_and_rotations() {
+        let store = TokenStore::new();
+        let first = store.create_tokens();
+        let rotated = store.refresh(&first.refresh_token).unwrap();
+        let other = store.create_tokens();
+
+        store.revoke_session_of(&rotated.refresh_token);
+
+        assert!(!store.validate_access_token(&first.access_token));
+        assert!(!store.validate_access_token(&rotated.access_token));
+        assert!(store.refresh(&rotated.refresh_token).is_none());
+        // Another login is unaffected.
+        assert!(store.validate_access_token(&other.access_token));
+        assert!(store.refresh(&other.refresh_token).is_some());
+    }
+
+    #[test]
+    fn revoking_by_access_token_ends_the_session() {
+        let store = TokenStore::new();
+        let tokens = store.create_tokens();
+        store.revoke_session_of(&tokens.access_token);
+        assert!(!store.validate_access_token(&tokens.access_token));
+        assert!(store.refresh(&tokens.refresh_token).is_none());
+        // Unknown tokens are a no-op.
+        store.revoke_session_of("not-a-token");
     }
 
     #[test]
