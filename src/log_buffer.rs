@@ -13,12 +13,13 @@ use tracing::field::{Field, Visit};
 use tracing::span;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use utoipa::ToSchema;
 
 /// Maximum number of log entries kept in the ring buffer.
 const MAX_LOG_ENTRIES: usize = 2000;
 
 /// A single captured log entry.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize, ToSchema)]
 pub struct LogEntry {
     pub timestamp: DateTime<Utc>,
     pub level: String,
@@ -42,6 +43,9 @@ pub struct LogBuffer {
 struct LogBufferInner {
     entries: VecDeque<LogEntry>,
     next_seq: u64,
+    /// Warnings with a sequence number below this were dismissed by
+    /// `clear_warnings` and are no longer reported.
+    warnings_cleared_before: u64,
 }
 
 impl Default for LogBuffer {
@@ -56,6 +60,7 @@ impl LogBuffer {
             inner: Arc::new(RwLock::new(LogBufferInner {
                 entries: VecDeque::with_capacity(MAX_LOG_ENTRIES),
                 next_seq: 0,
+                warnings_cleared_before: 0,
             })),
             boot_id: uuid::Uuid::new_v4().simple().to_string().into(),
         }
@@ -115,6 +120,31 @@ impl LogBuffer {
             .into_iter()
             .rev()
             .collect()
+    }
+
+    /// Retained WARN and ERROR entries that have not been dismissed, newest
+    /// first, at most `limit`.
+    pub fn warnings(&self, limit: usize) -> Vec<LogEntry> {
+        let inner = self.inner.read();
+        inner
+            .entries
+            .iter()
+            .rev()
+            .filter(|e| {
+                e.seq >= inner.warnings_cleared_before
+                    && (e.level.eq_ignore_ascii_case("WARN")
+                        || e.level.eq_ignore_ascii_case("ERROR"))
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Dismiss every warning logged so far. Entries logged afterwards are
+    /// reported again; the log itself is untouched.
+    pub fn clear_warnings(&self) {
+        let mut inner = self.inner.write();
+        inner.warnings_cleared_before = inner.next_seq;
     }
 
     /// Get the latest sequence number.

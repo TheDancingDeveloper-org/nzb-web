@@ -2,7 +2,10 @@ use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 use serde::{Serialize, Serializer};
 
-/// Convenience error type for API handlers.
+/// Error body returned by every native API handler that fails.
+///
+/// Serialized as `{ "error_kind", "human_readable", "status" }`; the HTTP
+/// status carries the same code as `status`.
 #[derive(Debug)]
 pub struct ApiError {
     status: Option<StatusCode>,
@@ -60,6 +63,23 @@ impl ApiError {
         }
     }
 
+    /// 403 `error_kind: step_up_required`. Distinct from 401 so clients do
+    /// not treat a missing password confirmation as an expired session.
+    pub const fn step_up_required() -> Self {
+        Self {
+            status: Some(StatusCode::FORBIDDEN),
+            kind: ApiErrorKind::StepUpRequired,
+        }
+    }
+
+    /// 403 `error_kind: step_up_forbidden`. An API key cannot step up.
+    pub const fn step_up_forbidden() -> Self {
+        Self {
+            status: Some(StatusCode::FORBIDDEN),
+            kind: ApiErrorKind::StepUpForbidden,
+        }
+    }
+
     pub const fn bad_request(msg: &'static str) -> Self {
         Self {
             status: Some(StatusCode::BAD_REQUEST),
@@ -73,6 +93,22 @@ impl ApiError {
         Self {
             status: Some(StatusCode::CONFLICT),
             kind: ApiErrorKind::Message(msg.into()),
+        }
+    }
+
+    /// 412 `error_kind: precondition_failed`. The `If-Match` tag is stale.
+    pub fn precondition_failed(msg: impl Into<String>) -> Self {
+        Self {
+            status: Some(StatusCode::PRECONDITION_FAILED),
+            kind: ApiErrorKind::PreconditionFailed(msg.into()),
+        }
+    }
+
+    /// 428 `error_kind: precondition_required`. The request omitted `If-Match`.
+    pub const fn precondition_required() -> Self {
+        Self {
+            status: Some(StatusCode::PRECONDITION_REQUIRED),
+            kind: ApiErrorKind::PreconditionRequired,
         }
     }
 
@@ -107,6 +143,49 @@ impl ApiError {
     }
 }
 
+impl From<crate::path_policy::PathPolicyError> for ApiError {
+    fn from(error: crate::path_policy::PathPolicyError) -> Self {
+        Self {
+            status: Some(StatusCode::BAD_REQUEST),
+            kind: ApiErrorKind::Message(error.to_string()),
+        }
+    }
+}
+
+impl utoipa::PartialSchema for ApiError {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::ObjectBuilder::new()
+            .property(
+                "error_kind",
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::String)
+                    .description(Some("Stable machine-readable error code.")),
+            )
+            .required("error_kind")
+            .property(
+                "human_readable",
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::String)
+                    .description(Some("Human-readable explanation of the failure.")),
+            )
+            .required("human_readable")
+            .property(
+                "status",
+                utoipa::openapi::ObjectBuilder::new()
+                    .schema_type(utoipa::openapi::schema::Type::Integer)
+                    .description(Some("HTTP status code; matches the response status.")),
+            )
+            .required("status")
+            .into()
+    }
+}
+
+impl utoipa::ToSchema for ApiError {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("ApiError")
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ApiErrorKind {
     #[error("job not found: {0}")]
@@ -115,8 +194,20 @@ pub enum ApiErrorKind {
     ServerNotFound(String),
     #[error("unauthorized")]
     Unauthorized,
+    /// Sensitive write without a recent password confirmation. 403, not 401:
+    /// the session is still valid, so the GUI must not refresh it.
+    #[error("step-up re-authentication required")]
+    StepUpRequired,
+    /// Sensitive write attempted with an API key. The confirm header cannot
+    /// satisfy this; only an interactive session can.
+    #[error("step-up is not available to API-key clients")]
+    StepUpForbidden,
     #[error("idempotency key is already bound to another NZB payload")]
     AdmissionConflict,
+    #[error("If-Match precondition failed: {0}")]
+    PreconditionFailed(String),
+    #[error("If-Match header is required")]
+    PreconditionRequired,
     #[error("{0}")]
     Text(&'static str),
     #[error("{0}")]
@@ -162,11 +253,16 @@ impl Serialize for ApiError {
                     "server_not_found"
                 }
                 ApiErrorKind::Unauthorized => "unauthorized",
+                ApiErrorKind::StepUpRequired => "step_up_required",
+                ApiErrorKind::StepUpForbidden => "step_up_forbidden",
                 ApiErrorKind::AdmissionConflict
                 | ApiErrorKind::Core(crate::nzb_core::NzbError::AdmissionConflict) => {
                     "admission_conflict"
                 }
+                ApiErrorKind::PreconditionFailed(_) => "precondition_failed",
+                ApiErrorKind::PreconditionRequired => "precondition_required",
                 ApiErrorKind::UrlRejected(_) => "url_rejected",
+                ApiErrorKind::Core(crate::nzb_core::NzbError::DuplicateNzb(_)) => "duplicate_nzb",
                 // Otherwise classify by status so clients can tell a bad
                 // request or missing resource from a server fault.
                 _ => match self.status() {
@@ -215,7 +311,7 @@ impl From<crate::nzb_core::NzbError> for ApiError {
             | NzbError::ServerNotFound(_)
             | NzbError::CategoryNotFound(_) => StatusCode::NOT_FOUND,
             NzbError::ParseError(_) | NzbError::InvalidNzb(_) => StatusCode::BAD_REQUEST,
-            NzbError::AdmissionConflict => StatusCode::CONFLICT,
+            NzbError::AdmissionConflict | NzbError::DuplicateNzb(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         Self {
@@ -298,6 +394,12 @@ mod tests {
         let json = serde_json::to_value(ApiError::conflict("taken")).unwrap();
         assert_eq!(json["error_kind"], "conflict");
         assert_eq!(json["status"], 409);
+        let json = serde_json::to_value(ApiError::precondition_failed("stale")).unwrap();
+        assert_eq!(json["error_kind"], "precondition_failed");
+        assert_eq!(json["status"], 412);
+        let json = serde_json::to_value(ApiError::precondition_required()).unwrap();
+        assert_eq!(json["error_kind"], "precondition_required");
+        assert_eq!(json["status"], 428);
     }
 
     #[test]

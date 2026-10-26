@@ -5,17 +5,23 @@ pub use nzb_postproc;
 pub use nzb_postproc::nzb_core;
 
 pub mod auth;
+pub mod auth_class;
+mod damage_recorder;
 pub mod dir_watcher;
 pub mod direct_unpack;
 pub mod error;
 pub mod fetch_guard;
 pub mod log_buffer;
+pub mod notifications;
 pub mod nzb_archive;
+pub mod path_policy;
 pub mod queue_manager;
 pub mod rss_monitor;
 pub mod sabnzbd_compat;
+pub mod schedule_monitor;
 pub mod startup;
 pub mod state;
+pub mod step_up;
 pub mod util;
 
 pub use log_buffer::{LogBuffer, LogBufferLayer};
@@ -33,4 +39,10 @@ pub(crate) fn increment_counter(name: &'static str) {
         .u64_counter(name)
         .build()
         .add(1, &[]);
+}
+
+/// One observation of `rustnzb.stage.duration` for `stage`, in seconds. The
+/// histogram carries a `stage` attribute; see `docs/OBSERVABILITY.md`.
+pub(crate) fn record_stage(stage: &'static str, seconds: f64) {
+    nzb_dispatch::telemetry::record_stage(stage, None, seconds);
 }
