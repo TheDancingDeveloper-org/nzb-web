@@ -1,9 +1,9 @@
 //! Retained incomplete work directories must not leak forever.
 //!
-//! A failed job keeps its partial download in `incomplete/` so a history
-//! retry can reuse it. Deleting that history entry, removing the queue job,
-//! or restarting with directories nothing references must reclaim the space,
-//! without ever reaching outside the incomplete root.
+//! A failed job deletes its partial download from `incomplete/` as soon as it
+//! fails (WI-2173). Leftovers from older versions are reclaimed when the
+//! history entry is deleted or at startup, and removing a queue job reclaims
+//! its directory, without ever reaching outside the incomplete root.
 
 mod harness;
 
@@ -58,9 +58,13 @@ async fn submit_and_fail(engine: &TestEngine, xml: Vec<u8>) -> (String, PathBuf)
     );
     let work_dir = engine.incomplete_dir.join(&id);
     assert!(
-        work_dir.join("present.bin").exists(),
-        "a failed job keeps its partial download for retry"
+        !work_dir.exists(),
+        "a finally failed job must not retain its partial download"
     );
+    assert!(engine.incomplete_dir.is_dir(), "incomplete root survives");
+    // Stand-in for a partial download an older version retained.
+    std::fs::create_dir_all(&work_dir).unwrap();
+    std::fs::write(work_dir.join("present.bin"), b"partial payload").unwrap();
     (id, work_dir)
 }
 
@@ -131,6 +135,7 @@ async fn deleting_a_queued_job_removes_its_work_dir() {
 
 fn history_entry(id: &str, complete: &Path) -> HistoryEntry {
     HistoryEntry {
+        client_removal: None,
         id: id.to_string(),
         name: id.to_string(),
         category: "Default".to_string(),
@@ -149,6 +154,8 @@ fn history_entry(id: &str, complete: &Path) -> HistoryEntry {
         server_stats: Vec::new(),
         nzb_data: None,
         retry_data: None,
+        par2_volumes_fetched: None,
+        par2_volumes_available: None,
     }
 }
 
@@ -166,6 +173,7 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
     let complete = state.path().join("complete");
     // Work directories are named after job ids (UUIDs).
     let kept_history = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    let failed_history = "4d5e6f7a-8b9c-4d0e-9f1a-2b3c4d5e6f7a";
     let retried_history = "3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f";
     let reused_partial = incomplete.join("2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e");
     let orphan_one = incomplete.join("0b7c7f0e-3a51-4c4e-9a43-1f6f0c2b8d11");
@@ -185,7 +193,12 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
         let db = Database::open(&database_path).unwrap();
         db.queue_insert(&queued).unwrap();
         db.queue_store_nzb_data(&queued.id, &fixture.xml).unwrap();
-        db.history_insert(&history_entry(kept_history, &complete))
+        let mut completed = history_entry(kept_history, &complete);
+        completed.status = JobStatus::Completed;
+        completed.error_message = None;
+        completed.failure_code = None;
+        db.history_insert(&completed).unwrap();
+        db.history_insert(&history_entry(failed_history, &complete))
             .unwrap();
         // A retry reused another job's partial dir; its checkpoint names it.
         let mut retried = history_entry(retried_history, &complete);
@@ -205,6 +218,7 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
 
     dir_with_file(&queued.work_dir);
     dir_with_file(&incomplete.join(kept_history));
+    dir_with_file(&incomplete.join(failed_history));
     dir_with_file(&reused_partial);
     dir_with_file(&orphan_one);
     dir_with_file(&orphan_two.join("nested"));
@@ -229,7 +243,14 @@ async fn startup_sweeps_unreferenced_incomplete_dirs_only() {
         "queue job dir kept"
     );
     assert!(incomplete.join(kept_history).join("data.bin").exists());
-    assert!(reused_partial.join("data.bin").exists());
+    assert!(
+        !incomplete.join(failed_history).exists(),
+        "a failed row's leftover partial download is reclaimed"
+    );
+    assert!(
+        !reused_partial.exists(),
+        "so is the directory a failed retry checkpoint names"
+    );
     assert!(
         user_folder.join("data.bin").exists(),
         "only job-id named directories are swept"

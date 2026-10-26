@@ -8,10 +8,11 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Form, FromRequest, Multipart, Query, Request, State};
-use axum::http::{StatusCode, header::CONTENT_TYPE};
+use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
+use crate::nzb_core::db::{HistoryFilter, HistorySummary};
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 
@@ -27,7 +28,10 @@ const SABNZBD_COMPAT_VERSION: &str = "5.0.4";
 /// Upper bound on an `addurl`-fetched NZB body, to avoid unbounded memory use.
 const MAX_ADDURL_BODY_BYTES: usize = 100 * 1024 * 1024;
 
-/// Arr-compatible API request -- all parameters come as query strings.
+/// Arr-compatible API request -- parameters arrive as query-string fields,
+/// form fields or multipart fields, as SABnzbd's API accepts them. The API key
+/// may also arrive as an `X-Api-Key` header (see [`API_KEY_HEADER`]), which
+/// keeps it out of the URL.
 #[derive(Deserialize, Default)]
 pub struct SabApiRequest {
     pub mode: Option<String>,
@@ -60,6 +64,18 @@ pub struct SabApiRequest {
     pub sort: Option<String>,
     /// Sort direction for `mode=queue&name=sort` (`asc` or `desc`).
     pub dir: Option<String>,
+    /// The calling client's name, from its `User-Agent` (see
+    /// [`client_name_from_headers`]). Never read from the request itself.
+    #[serde(skip)]
+    pub client: Option<String>,
+}
+
+/// The client's product name from its `User-Agent`: `Sonarr/4.0.9 (...)`
+/// gives `Sonarr`. Used to label History rows an *arr removed.
+fn client_name_from_headers(headers: &HeaderMap) -> Option<String> {
+    let agent = headers.get(axum::http::header::USER_AGENT)?.to_str().ok()?;
+    let product = agent.split_whitespace().next()?.split('/').next()?.trim();
+    (!product.is_empty()).then(|| product.chars().take(64).collect())
 }
 
 /// Validate API key. Returns Err with JSON response on failure.
@@ -78,6 +94,26 @@ fn validate_api_key(
         }
     }
     Ok(())
+}
+
+/// Header a client may use instead of the `apikey` query parameter, so the
+/// key never has to appear in a request URL (and therefore in an access log).
+const API_KEY_HEADER: &str = "X-Api-Key";
+
+/// Read the API key from the `X-Api-Key` request header.
+///
+/// The SABnzbd-compatible API still accepts `apikey` in the query string,
+/// because that is what *arr clients and SABnzbd itself send. A URL is
+/// recorded by every reverse proxy in front of the server, though, so the
+/// header is the form to prefer: `X-Api-Key` is authenticated the same way
+/// and is not part of the logged request line.
+fn api_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(API_KEY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 /// Answer the modes SABnzbd serves without an API key. Clients probe
@@ -115,8 +151,13 @@ fn keyless_response(
 /// GET /sabnzbd/api -- Handle GET requests.
 pub async fn h_sabnzbd_api_get(
     State(state): State<Arc<AppState>>,
-    Query(req): Query<SabApiRequest>,
+    Query(mut req): Query<SabApiRequest>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(key) = api_key_from_headers(&headers) {
+        req.apikey = Some(key);
+    }
+    req.client = client_name_from_headers(&headers);
     if let Some(resp) = keyless_response(
         &state,
         req.mode.as_deref().unwrap_or(""),
@@ -150,7 +191,29 @@ pub async fn h_sabnzbd_api_get(
         .await;
     }
 
-    let result = dispatch_mode(&state, mode, &req);
+    // `addlocalfile` reads an NZB from the server's disk; the read is async
+    // and then reuses the `addfile` path, so it cannot run on the blocking pool.
+    if mode == "addlocalfile" {
+        return handle_addlocalfile(
+            &state,
+            req.name.clone(),
+            req.nzbname.clone(),
+            req.cat.clone(),
+            req.priority.clone(),
+            req.password.clone(),
+            req.pp.clone(),
+        )
+        .await;
+    }
+
+    // Modes read the database and the job list under their mutexes; run them
+    // on a blocking thread so a slow query never stalls an async worker.
+    let result = tokio::task::spawn_blocking(move || {
+        let mode = req.mode.as_deref().unwrap_or("");
+        dispatch_mode(&state, mode, &req)
+    })
+    .await
+    .map_err(|e| ApiError::from(anyhow::anyhow!("SABnzbd API task failed: {e}")))?;
     Ok(result)
 }
 
@@ -322,6 +385,18 @@ async fn handle_addurl(
             // enqueue succeeds (rustnzb#129).
             let nzb_bytes = data.to_vec();
             if let Err(error) = qm.add_job(job, Some(nzb_bytes)) {
+                if let crate::nzb_core::NzbError::DuplicateNzb(_) = error {
+                    // Answer a refused duplicate as addfile does (WI-2165):
+                    // `status: false` makes arrs re-grab the release on every
+                    // RSS sync; an empty `nzo_ids` makes them blocklist it.
+                    tracing::warn!(
+                        name = %job_name,
+                        id = %job_id,
+                        %error,
+                        "Duplicate NZB refused via URL (arr API)"
+                    );
+                    return Ok(Json(sab_duplicate_refusal()));
+                }
                 tracing::error!(
                     name = %job_name,
                     id = %job_id,
@@ -517,6 +592,10 @@ pub async fn h_sabnzbd_api_post(
     // Query-string parameters are the baseline; body fields override them.
     let mut mode = query_req.mode.clone().unwrap_or_default();
     let mut apikey = query_req.apikey.clone();
+    // An explicit `X-Api-Key` header outranks a key carried in the URL or the
+    // body: it is the channel that keeps the secret out of access logs.
+    let header_apikey = api_key_from_headers(request.headers());
+    query_req.client = client_name_from_headers(request.headers());
     let mut cat = query_req.cat.clone();
     let mut priority = query_req.priority.clone();
     let mut name = query_req.name.clone();
@@ -579,6 +658,10 @@ pub async fn h_sabnzbd_api_post(
             )
             .await?;
         }
+    }
+
+    if let Some(key) = header_apikey {
+        apikey = Some(key);
     }
 
     if let Some(resp) = keyless_response(&state, &mode, apikey.as_deref()) {
@@ -805,6 +888,24 @@ async fn dispatch_post(
                     // outcome -- mirroring the history-retry path.
                     let nzb_bytes = data.clone();
                     if let Err(error) = qm.add_job(job, Some(nzb_bytes)) {
+                        if let crate::nzb_core::NzbError::DuplicateNzb(_) = error {
+                            // A refused duplicate is answered the way SABnzbd
+                            // answers one: `status: true` with an empty
+                            // `nzo_ids` list, not `status: false` + `error`.
+                            // Sonarr/Radarr treat `status: false` as a
+                            // transient download-client error and re-grab the
+                            // same release on every RSS sync (WI-2165); an
+                            // empty `nzo_ids` raises their
+                            // DownloadClientRejectedReleaseException, which
+                            // marks the grab failed and blocklists the release.
+                            tracing::warn!(
+                                name = %job_name,
+                                id = %job_id,
+                                %error,
+                                "Duplicate NZB refused via arr API"
+                            );
+                            return Ok(Json(sab_duplicate_refusal()));
+                        }
                         tracing::error!(
                             name = %job_name,
                             id = %job_id,
@@ -834,6 +935,19 @@ async fn dispatch_post(
                     "error": format!("Failed to parse NZB: {e}")
                 }))),
             }
+        }
+
+        "addlocalfile" => {
+            handle_addlocalfile(
+                state,
+                name,
+                query_req.nzbname,
+                cat,
+                priority,
+                password,
+                query_req.pp,
+            )
+            .await
         }
 
         "addurl" => {
@@ -880,6 +994,7 @@ async fn dispatch_post(
                 pp: query_req.pp,
                 sort: query_req.sort,
                 dir: query_req.dir,
+                client: query_req.client,
             };
             Ok(dispatch_mode(
                 state,
@@ -888,6 +1003,98 @@ async fn dispatch_post(
             ))
         }
     }
+}
+
+fn addlocalfile_refused(error: &str) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": false, "error": error }))
+}
+
+/// `mode=addlocalfile`: enqueue an NZB already on the server's disk. `path`
+/// (SAB's `name`) must be an absolute path to a regular file. The file is
+/// read under the `addurl` size bound and then takes the `addfile` path, so
+/// category, priority, password and `nzbname` behave exactly as for uploads.
+async fn handle_addlocalfile(
+    state: &AppState,
+    path: Option<String>,
+    nzbname: Option<String>,
+    cat: Option<String>,
+    priority: Option<String>,
+    password: Option<String>,
+    pp: Option<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // Reading the server's disk is only offered to clients that present the
+    // configured API key, and only for files under the directory the operator
+    // named in `local_import_dir`.
+    let config = state.config();
+    if config.general.api_key.as_deref().is_none_or(str::is_empty) {
+        return Ok(addlocalfile_refused(
+            "addlocalfile needs an API key to be configured",
+        ));
+    }
+    let Some(import_dir) = config.general.local_import_dir.as_deref() else {
+        return Ok(addlocalfile_refused(
+            "addlocalfile is disabled: local_import_dir is not configured",
+        ));
+    };
+    let Ok(import_dir) = tokio::fs::canonicalize(import_dir).await else {
+        return Ok(addlocalfile_refused("local_import_dir is not accessible"));
+    };
+
+    let path = path.unwrap_or_default();
+    let path = std::path::Path::new(path.trim());
+    if !path.is_absolute() {
+        return Ok(addlocalfile_refused(
+            "addlocalfile needs an absolute path to an NZB file",
+        ));
+    }
+    // Canonicalising resolves `..` and symlinks first, so a path that leaves
+    // the directory by either route fails the prefix check below.
+    let Ok(path) = tokio::fs::canonicalize(path).await else {
+        return Ok(addlocalfile_refused("No NZB file at the given path"));
+    };
+    if !path.starts_with(&import_dir) {
+        return Ok(addlocalfile_refused("NZB file is outside local_import_dir"));
+    }
+    let metadata = match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return Ok(addlocalfile_refused("No NZB file at the given path")),
+    };
+    if metadata.len() > MAX_ADDURL_BODY_BYTES as u64 {
+        return Ok(Json(serde_json::json!({
+            "status": false,
+            "error": format!("NZB file exceeds the {MAX_ADDURL_BODY_BYTES} byte limit")
+        })));
+    }
+    let data = match tokio::fs::read(&path).await {
+        Ok(data) => data,
+        Err(error) => {
+            return Ok(Json(serde_json::json!({
+                "status": false,
+                "error": format!("Unable to read NZB file: {error}")
+            })));
+        }
+    };
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Boxed because `dispatch_post` dispatches `addlocalfile` back here.
+    Box::pin(dispatch_post(
+        state,
+        "addfile".into(),
+        None,
+        cat,
+        priority,
+        Some((file_name, data)),
+        None,
+        password,
+        SabApiRequest {
+            nzbname,
+            pp,
+            ..SabApiRequest::default()
+        },
+    ))
+    .await
 }
 
 /// Zip entries may sit in folders; a job is named after the file alone.
@@ -983,10 +1190,7 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "rename" => handle_rename(state, req),
 
-        "change_complete_action" => {
-            // No-op stub — Sonarr/Radarr may call this but we don't support custom actions
-            Json(serde_json::json!({ "status": true }))
-        }
+        "change_complete_action" => handle_change_complete_action(state, req),
 
         "switch" => handle_switch(state, req),
 
@@ -1006,12 +1210,14 @@ fn dispatch_mode(state: &AppState, mode: &str, req: &SabApiRequest) -> Json<serd
 
         "retry_all" => handle_retry_all(state),
 
-        // SABnzbd `_api_warnings`. RustNZB does not keep a SABnzbd-style
-        // warnings log; the only warning reported is the live disk-space
-        // hold (see `sab_warnings`). `name=clear` is accepted.
+        // SABnzbd `_api_warnings`: `name=clear` dismisses the logged
+        // warnings, anything else lists them (see `sab_warnings`).
         "warnings" => match req.name.as_deref() {
-            Some("clear") => Json(serde_json::json!({ "status": true })),
-            _ => Json(serde_json::json!({ "warnings": sab_warnings(&state.queue_manager) })),
+            Some("clear") => {
+                state.log_buffer.clear_warnings();
+                Json(serde_json::json!({ "status": true }))
+            }
+            _ => Json(serde_json::json!({ "warnings": sab_warnings(state) })),
         },
 
         _ => Json(serde_json::json!({
@@ -1060,7 +1266,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
     let pause_int = qm.pause_remaining_secs().unwrap_or(0).max(0).to_string();
     let (free1, total1, free1_norm) = sab_disk_space(&qm.incomplete_dir());
     let (free2, total2, free2_norm) = sab_disk_space(&qm.complete_dir());
-    let warnings = sab_warnings(qm);
+    let warnings = sab_warnings(state);
 
     Json(serde_json::json!({
         "status": {
@@ -1084,7 +1290,7 @@ fn handle_fullstatus(state: &AppState) -> Json<serde_json::Value> {
             "dnslookup": false,
             "downloaddir": general.incomplete_dir.to_string_lossy(),
             "downloaddirspeed": 0,
-            "finishaction": serde_json::Value::Null,
+            "finishaction": qm.queue_complete_action(),
             "folders": Vec::<String>::new(),
             "have_quota": false,
             "have_warnings": warnings.len().to_string(),
@@ -1224,7 +1430,7 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
         Some("rename") => return handle_queue_rename(state, req),
         Some("purge") => return handle_queue_purge(state),
         Some("sort") => return handle_queue_sort(state, req),
-        Some("change_complete_action") => return Json(serde_json::json!({ "status": true })),
+        Some("change_complete_action") => return handle_change_complete_action(state, req),
         _ => {}
     }
 
@@ -1249,17 +1455,37 @@ fn handle_queue(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     queue["diskspace2"] = free2.into();
     queue["diskspacetotal2"] = total2.into();
     queue["diskspace2_norm"] = free2_norm.into();
-    queue["have_warnings"] = sab_warnings(qm).len().to_string().into();
+    queue["have_warnings"] = sab_warnings(state).len().to_string().into();
     Json(response)
 }
 
+/// SABnzbd `change_complete_action`: `value` is the action run once the queue
+/// finishes. RustNZB runs `script_<name>` from its scripts directory; other
+/// actions are refused with an error rather than accepted and ignored.
+fn handle_change_complete_action(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
+    match state
+        .queue_manager
+        .set_queue_complete_action(req.value.as_deref())
+    {
+        Ok(()) => Json(serde_json::json!({ "status": true })),
+        Err(error) => Json(serde_json::json!({ "status": false, "error": error })),
+    }
+}
+
+/// Most warnings `mode=warnings` lists at once.
+const SAB_WARNINGS_LIMIT: usize = 100;
+
 /// SABnzbd-shaped warnings (`GUIHandler` entries: `type`, `text`, `time`).
 ///
-/// SABnzbd logs "Too little diskspace forcing PAUSE" when its free-space
-/// check pauses the downloader; RustNZB reports the equivalent warning for
-/// as long as its disk-space guard is holding downloads.
-fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Value> {
-    qm.disk_space_hold_since()
+/// The live disk-space hold comes first: SABnzbd logs "Too little diskspace
+/// forcing PAUSE" when its free-space check pauses the downloader, and
+/// RustNZB reports the same warning for as long as its guard holds downloads.
+/// Then follow the WARN and ERROR log entries that `clear` has not dismissed,
+/// newest first.
+fn sab_warnings(state: &AppState) -> Vec<serde_json::Value> {
+    let qm = &state.queue_manager;
+    let hold = qm
+        .disk_space_hold_since()
         .filter(|_| qm.is_paused())
         .map(|since| {
             serde_json::json!({
@@ -1267,8 +1493,26 @@ fn sab_warnings(qm: &crate::queue_manager::QueueManager) -> Vec<serde_json::Valu
                 "text": "Too little diskspace forcing PAUSE",
                 "time": since.timestamp(),
             })
-        })
+        });
+    let logged = state
+        .log_buffer
+        .warnings(SAB_WARNINGS_LIMIT)
         .into_iter()
+        .map(|entry| {
+            let kind = if entry.level.eq_ignore_ascii_case("ERROR") {
+                "ERROR"
+            } else {
+                "WARNING"
+            };
+            serde_json::json!({
+                "type": kind,
+                "text": entry.message,
+                "time": entry.timestamp.timestamp(),
+            })
+        });
+    hold.into_iter()
+        .chain(logged)
+        .take(SAB_WARNINGS_LIMIT)
         .collect()
 }
 
@@ -1415,7 +1659,7 @@ fn build_queue_response(
     let active_totals = jobs.iter().filter(|job| queue_totals_include(job));
     let total_bytes = active_totals
         .clone()
-        .map(|job| job.total_bytes)
+        .map(queue_size_bytes)
         .fold(0_u64, u64::saturating_add);
     let bytes_left = active_totals
         .map(remaining_bytes)
@@ -1668,7 +1912,9 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
         return Json(unchanged_history_response());
     }
 
-    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+    // Filter, count and total over the light pre-blob columns; only the
+    // returned page is loaded in full.
+    let summaries = arr_history_summaries(qm);
     let postprocessing: Vec<_> = qm
         .get_jobs()
         .into_iter()
@@ -1687,33 +1933,122 @@ fn handle_history(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Val
         })
         .collect();
 
-    Json(build_history_response(
-        &entries,
+    Json(build_history_response_with(
+        &summaries,
         &postprocessing,
         req,
         history_update,
+        |ids| qm.history_get_listed(ids).unwrap_or_default(),
     ))
 }
 
+/// The addfile response for an NZB refused as a duplicate: what SABnzbd
+/// returns, `status: true` with no `nzo_ids`, which the arrs blocklist.
+fn sab_duplicate_refusal() -> serde_json::Value {
+    serde_json::json!({ "status": true, "nzo_ids": [] })
+}
+
+#[cfg(test)]
 fn build_history_response(
     entries: &[HistoryEntry],
     postprocessing: &[(NzbJob, u8)],
     req: &SabApiRequest,
     history_update: u64,
 ) -> serde_json::Value {
-    let mut slots: Vec<SabHistorySlot> = postprocessing
+    let summaries: Vec<HistorySummary> = entries.iter().map(history_summary_of).collect();
+    build_history_response_with(&summaries, postprocessing, req, history_update, |ids| {
+        ids.iter()
+            .filter_map(|id| entries.iter().find(|entry| &entry.id == id).cloned())
+            .collect()
+    })
+}
+
+#[cfg(test)]
+fn history_summary_of(entry: &HistoryEntry) -> HistorySummary {
+    HistorySummary {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        category: entry.category.clone(),
+        status: entry.status,
+        total_bytes: entry.total_bytes,
+        downloaded_bytes: entry.downloaded_bytes,
+        added_at: entry.added_at,
+        completed_at: entry.completed_at,
+        output_dir: entry.output_dir.clone(),
+        error_message: entry.error_message.clone(),
+    }
+}
+
+/// A history entry carrying only the summary columns. Its slot has every
+/// field the SAB history filters read; the page is rebuilt from full rows.
+fn summary_entry(summary: &HistorySummary) -> HistoryEntry {
+    HistoryEntry {
+        client_removal: None,
+        id: summary.id.clone(),
+        name: summary.name.clone(),
+        category: summary.category.clone(),
+        status: summary.status,
+        total_bytes: summary.total_bytes,
+        downloaded_bytes: summary.downloaded_bytes,
+        added_at: summary.added_at,
+        completed_at: summary.completed_at,
+        download_time_secs: None,
+        output_dir: summary.output_dir.clone(),
+        stages: Vec::new(),
+        error_message: summary.error_message.clone(),
+        failure_code: None,
+        post_processing: None,
+        delete_archives: None,
+        server_stats: Vec::new(),
+        nzb_data: None,
+        retry_data: None,
+        par2_volumes_fetched: None,
+        par2_volumes_available: None,
+    }
+}
+
+/// Build the SAB history response from summary rows, loading full rows
+/// (via `load_full`, in the order given) only for the history slots on the
+/// requested page.
+fn build_history_response_with(
+    summaries: &[HistorySummary],
+    postprocessing: &[(NzbJob, u8)],
+    req: &SabApiRequest,
+    history_update: u64,
+    load_full: impl FnOnce(&[String]) -> Vec<HistoryEntry>,
+) -> serde_json::Value {
+    let mut slots: Vec<(Option<&str>, SabHistorySlot)> = postprocessing
         .iter()
-        .map(|(job, level)| SabHistorySlot::from_postprocessing(job, *level))
-        .chain(entries.iter().map(SabHistorySlot::from_entry))
-        .filter(|slot| history_slot_matches(slot, req))
+        .map(|(job, level)| (None, SabHistorySlot::from_postprocessing(job, *level)))
+        .chain(summaries.iter().map(|summary| {
+            (
+                Some(summary.id.as_str()),
+                SabHistorySlot::from_entry(&summary_entry(summary)),
+            )
+        }))
+        .filter(|(_, slot)| history_slot_matches(slot, req))
         .collect();
     let noofslots = slots.len();
-    let ppslots = slots.iter().filter(|slot| slot.postprocessing).count();
+    let ppslots = slots.iter().filter(|(_, slot)| slot.postprocessing).count();
     let start = req.start.unwrap_or(0).min(slots.len());
     let limit = req.limit.filter(|limit| *limit != 0).unwrap_or(50);
     let end = start.saturating_add(limit).min(slots.len());
-    slots = slots.drain(start..end).collect();
+    let page: Vec<_> = slots.drain(start..end).collect();
+    let ids: Vec<String> = page
+        .iter()
+        .filter_map(|(id, _)| id.map(str::to_owned))
+        .collect();
+    let full = load_full(&ids);
+    let slots: Vec<SabHistorySlot> = page
+        .into_iter()
+        .map(|(id, slot)| {
+            // A row deleted since the summary scan keeps its summary slot.
+            id.and_then(|id| full.iter().find(|entry| entry.id == id))
+                .map_or(slot, SabHistorySlot::from_entry)
+        })
+        .collect();
 
+    let entries = summaries;
     let total_bytes: u64 = entries.iter().map(|entry| entry.downloaded_bytes).sum();
     let now = chrono::Utc::now();
     let period_bytes = |days| {
@@ -1737,6 +2072,12 @@ fn build_history_response(
             "version": SABNZBD_COMPAT_VERSION
         }
     })
+}
+
+/// Every history row's summary columns, newest first; empty on a DB error.
+fn history_summaries(qm: &crate::queue_manager::QueueManager) -> Vec<HistorySummary> {
+    qm.history_summaries(&HistoryFilter::default())
+        .unwrap_or_default()
 }
 
 fn history_is_unchanged(requested: Option<u64>, current: u64) -> bool {
@@ -1819,6 +2160,11 @@ fn sab_query_bool(value: &str) -> bool {
 /// `_api_history_delete`. `del_files=1` additionally removes the entry's
 /// completed output directory from disk, matching real SABnzbd -- RustNZB
 /// otherwise never frees that space on history delete.
+///
+/// With `general.keep_history_on_arr_delete` (the default) the History row
+/// is kept, marked as removed by the calling client, and drops out of the
+/// SABnzbd history the *arrs poll. An *arr's "Remove Completed" is a disk
+/// cleanup; it should not erase rustnzb's own record of the download.
 fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value> {
     let target = req.value.as_deref().unwrap_or("");
     if target.is_empty() {
@@ -1827,25 +2173,15 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
 
     let qm = &state.queue_manager;
     let del_files = req.del_files.as_deref().is_some_and(sab_query_bool);
+    let keep_rows = state.config().general.keep_history_on_arr_delete;
+    let entries = if keep_rows {
+        arr_history_summaries(qm)
+    } else {
+        history_summaries(qm)
+    };
 
-    if target.eq_ignore_ascii_case("all") {
-        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
-        return match qm.history_clear() {
-            Ok(()) => {
-                if del_files {
-                    delete_history_files(qm, &entries, &[]);
-                }
-                Json(serde_json::json!({ "status": true }))
-            }
-            Err(error) => Json(serde_json::json!({
-                "status": false,
-                "error": error.to_string()
-            })),
-        };
-    }
-
-    // `value=failed` / `value=completed` clear every entry with that status
-    // (SABnzbd `_api_history_delete`).
+    // `value=all` clears everything; `value=failed` / `value=completed` clear
+    // every entry with that status (SABnzbd `_api_history_delete`).
     let status_filter = if target.eq_ignore_ascii_case("failed") {
         Some(JobStatus::Failed)
     } else if target.eq_ignore_ascii_case("completed") {
@@ -1853,55 +2189,96 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
     } else {
         None
     };
-    if let Some(status) = status_filter {
-        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
-        let (removed, kept): (Vec<_>, Vec<_>) = entries
+    let removed: Vec<HistorySummary> = if target.eq_ignore_ascii_case("all") {
+        entries.clone()
+    } else if let Some(status) = status_filter {
+        entries
             .iter()
+            .filter(|entry| entry.status == status)
             .cloned()
-            .partition(|entry| entry.status == status);
-        let mut removed_ok = Vec::new();
-        for entry in &removed {
-            if let Err(error) = qm.history_remove(&entry.id) {
-                if del_files {
-                    delete_history_files(qm, &removed_ok, &kept);
-                }
-                return Json(serde_json::json!({
-                    "status": false,
-                    "error": error.to_string()
-                }));
+            .collect()
+    } else {
+        let mut matched: Vec<HistorySummary> = Vec::new();
+        for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
+            let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
+            if let Some(entry) = entries
+                .iter()
+                .find(|entry| job_id_matches(&entry.id, search_id))
+                && !matched.iter().any(|seen| seen.id == entry.id)
+            {
+                matched.push(entry.clone());
             }
-            removed_ok.push(entry.clone());
         }
-        if del_files {
-            delete_history_files(qm, &removed, &kept);
+        matched
+    };
+    let bulk = status_filter.is_some() || target.eq_ignore_ascii_case("all");
+
+    let mut removed_ok: Vec<HistorySummary> = Vec::new();
+    let mut error = None;
+    if keep_rows {
+        let ids: Vec<String> = removed.iter().map(|entry| entry.id.clone()).collect();
+        let removed_by = req.client.as_deref().unwrap_or("SABnzbd API client");
+        match qm.history_mark_client_removed(&ids, removed_by, del_files) {
+            Ok(_) => {
+                tracing::info!(
+                    count = ids.len(),
+                    client = removed_by,
+                    del_files,
+                    "History entries removed via arr API (mode=history); rows kept"
+                );
+                removed_ok = removed.clone();
+            }
+            Err(e) => error = Some(e),
         }
-        return Json(serde_json::json!({ "status": true }));
+    } else if target.eq_ignore_ascii_case("all") {
+        match qm.history_clear() {
+            Ok(()) => removed_ok = removed.clone(),
+            Err(e) => error = Some(e),
+        }
+    } else {
+        for entry in &removed {
+            match qm.history_remove(&entry.id) {
+                Ok(()) => {
+                    tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
+                    removed_ok.push(entry.clone());
+                }
+                // A bulk clear stops at the first failure; a list of ids
+                // skips the one that failed, as it always has.
+                Err(e) if bulk => {
+                    error = Some(e);
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
     }
 
-    let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
-    let mut removed = Vec::new();
-    for raw_id in target.split(',').map(str::trim).filter(|id| !id.is_empty()) {
-        let search_id = raw_id.strip_prefix("SABnzbd_nzo_").unwrap_or(raw_id);
-        if let Some(entry) = entries
-            .iter()
-            .find(|entry| job_id_matches(&entry.id, search_id))
-            && qm.history_remove(&entry.id).is_ok()
-        {
-            tracing::info!(id = %entry.id, "Entry removed from history via arr API (mode=history)");
-            removed.push(entry.clone());
-        }
-    }
-    let removed_ids: Vec<String> = removed.iter().map(|entry| entry.id.clone()).collect();
-    let kept: Vec<_> = entries
-        .iter()
-        .filter(|entry| !removed_ids.contains(&entry.id))
-        .cloned()
-        .collect();
     if del_files {
-        delete_history_files(qm, &removed, &kept);
+        let kept: Vec<_> = entries
+            .iter()
+            .filter(|entry| !removed.iter().any(|gone| gone.id == entry.id))
+            .cloned()
+            .collect();
+        delete_history_files(qm, &removed_ok, &kept);
     }
 
-    Json(serde_json::json!({ "status": !removed_ids.is_empty() }))
+    match error {
+        Some(error) => Json(serde_json::json!({
+            "status": false,
+            "error": error.to_string()
+        })),
+        None if bulk => Json(serde_json::json!({ "status": true })),
+        None => Json(serde_json::json!({ "status": !removed_ok.is_empty() })),
+    }
+}
+
+/// The history rows the *arrs see: every row but those an *arr already
+/// removed and rustnzb kept. Empty on a DB error, like [`history_summaries`].
+fn arr_history_summaries(qm: &crate::queue_manager::QueueManager) -> Vec<HistorySummary> {
+    let removed = qm.history_client_removed_ids().unwrap_or_default();
+    let mut summaries = history_summaries(qm);
+    summaries.retain(|entry| !removed.contains(&entry.id));
+    summaries
 }
 
 /// Remove the output directories of `removed`, but never a directory that a
@@ -1909,8 +2286,8 @@ fn handle_history_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_js
 /// is not strictly inside the complete directory or a category directory.
 fn delete_history_files(
     qm: &crate::queue_manager::QueueManager,
-    removed: &[crate::nzb_core::models::HistoryEntry],
-    kept: &[crate::nzb_core::models::HistoryEntry],
+    removed: &[HistorySummary],
+    kept: &[HistorySummary],
 ) {
     let mut protected: Vec<std::path::PathBuf> = kept
         .iter()
@@ -2083,7 +2460,7 @@ fn handle_delete(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Valu
 
     // Also try history if not found in queue
     if !found {
-        let entries = qm.history_list(i64::MAX as usize).unwrap_or_default();
+        let entries = history_summaries(qm);
         for entry in &entries {
             if job_id_matches(&entry.id, search_id) {
                 let _ = qm.history_remove(&entry.id);
@@ -2107,12 +2484,11 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
     }
 
     let search_id = target_id.strip_prefix("SABnzbd_nzo_").unwrap_or(target_id);
-    let Some(entry) = state
-        .queue_manager
-        .history_list(i64::MAX as usize)
-        .unwrap_or_default()
+    let qm = &state.queue_manager;
+    let Some(entry) = history_summaries(qm)
         .into_iter()
         .find(|entry| job_id_matches(&entry.id, search_id))
+        .and_then(|summary| qm.history_get_listed(&[summary.id]).ok()?.pop())
     else {
         return Json(serde_json::json!({ "status": false, "error": "History job not found" }));
     };
@@ -2131,9 +2507,14 @@ fn handle_retry(state: &AppState, req: &SabApiRequest) -> Json<serde_json::Value
 /// `{"status": [nzo_id, ...]}`, one element per attempted entry and `null`
 /// where that retry failed, so this does the same.
 fn handle_retry_all(state: &AppState) -> Json<serde_json::Value> {
+    let failed = HistoryFilter {
+        status: Some(JobStatus::Failed),
+        ..Default::default()
+    };
     let entries = state
         .queue_manager
-        .history_list(i64::MAX as usize)
+        .history_page(&failed, 0, usize::MAX)
+        .map(|(entries, _)| entries)
         .unwrap_or_default();
     let nzo_ids: Vec<Option<String>> = entries
         .iter()
@@ -2583,10 +2964,11 @@ impl SabQueueSlot {
         speed_bps: u64,
         pp_level: u8,
     ) -> Self {
-        let mb = job.total_bytes as f64 / 1_048_576.0;
+        let size = queue_size_bytes(job);
+        let mb = size as f64 / 1_048_576.0;
         let mbleft = remaining_bytes(job) as f64 / 1_048_576.0;
-        let pct = if job.total_bytes > 0 {
-            (job.downloaded_bytes as f64 / job.total_bytes as f64 * 100.0) as u32
+        let pct = if size > 0 {
+            (job.downloaded_bytes as f64 / size as f64 * 100.0).min(100.0) as u32
         } else {
             0
         };
@@ -2626,7 +3008,7 @@ impl SabQueueSlot {
                 format_timeleft(running_bytes, speed_bps)
             },
             avg_age: "-".into(),
-            size: format_size_human(job.total_bytes),
+            size: format_size_human(size),
             sizeleft: format_size_human(remaining_bytes(job)),
             time_added: job.added_at.timestamp(),
         }
@@ -2637,8 +3019,14 @@ fn queue_nzo_id(job: &NzbJob) -> String {
     format!("SABnzbd_nzo_{}", sab_id_prefix(&job.id))
 }
 
+/// The job's size as the queue reports it: PAR2 recovery volumes held by
+/// `par2.defer_volumes` are left out until released, as SABnzbd does.
+fn queue_size_bytes(job: &NzbJob) -> u64 {
+    job.total_bytes.saturating_sub(job.held_par2_bytes)
+}
+
 fn remaining_bytes(job: &NzbJob) -> u64 {
-    job.total_bytes.saturating_sub(job.downloaded_bytes)
+    queue_size_bytes(job).saturating_sub(job.downloaded_bytes)
 }
 
 fn sab_priority_name(priority: Priority) -> &'static str {
@@ -2739,7 +3127,7 @@ struct SabStageLog {
 
 impl SabHistorySlot {
     fn from_entry(entry: &HistoryEntry) -> Self {
-        let stage_log: Vec<SabStageLog> = entry
+        let mut stage_log: Vec<SabStageLog> = entry
             .stages
             .iter()
             .map(|s| SabStageLog {
@@ -2747,6 +3135,21 @@ impl SabHistorySlot {
                 actions: vec![s.message.clone().unwrap_or_default()],
             })
             .collect();
+        if let (Some(fetched), Some(available)) =
+            (entry.par2_volumes_fetched, entry.par2_volumes_available)
+        {
+            let action = format!("PAR2 recovery volumes fetched: {fetched} of {available}");
+            match stage_log.iter_mut().find(|stage| stage.name == "Download") {
+                Some(stage) => stage.actions.push(action),
+                None => stage_log.insert(
+                    0,
+                    SabStageLog {
+                        name: "Download".into(),
+                        actions: vec![action],
+                    },
+                ),
+            }
+        }
 
         let storage = entry.output_dir.to_string_lossy().to_string();
         let bytes = entry.downloaded_bytes;
@@ -2915,13 +3318,25 @@ fn format_timeleft(bytes_left: u64, speed_bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_refusal_matches_sabnzbd_so_arrs_blocklist_it() {
+        // WI-2165: `status: false` made Sonarr retry forever; an empty
+        // `nzo_ids` with `status: true` is a rejected release it blocklists.
+        let response = sab_duplicate_refusal();
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert_eq!(response["nzo_ids"], serde_json::json!([]));
+        assert!(response.get("error").is_none());
+    }
     use std::path::Path;
 
     use arc_swap::ArcSwap;
     use chrono::TimeZone;
 
+    use tracing_subscriber::layer::SubscriberExt;
+
     use crate::auth::{CredentialStore, TokenStore};
-    use crate::log_buffer::LogBuffer;
+    use crate::log_buffer::{LogBuffer, LogBufferLayer};
     use crate::nzb_core::config::{AppConfig, CategoryConfig};
     use crate::nzb_core::db::Database;
     use crate::queue_manager::QueueManager;
@@ -3004,6 +3419,8 @@ mod tests {
 
     fn queue_job(id: &str, name: &str, category: &str, status: JobStatus) -> NzbJob {
         NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: name.into(),
             category: category.into(),
@@ -3039,6 +3456,7 @@ mod tests {
     ) -> HistoryEntry {
         let completed_at = chrono::Utc::now() - chrono::Duration::seconds(seconds_ago);
         HistoryEntry {
+            client_removal: None,
             id: id.into(),
             name: name.into(),
             category: category.into(),
@@ -3062,12 +3480,16 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: (status == JobStatus::Failed).then(Vec::new),
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         }
     }
 
     fn postprocessing_job() -> NzbJob {
         let now = chrono::Utc::now();
         NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: "postprocessing-job".into(),
             name: "Still Unpacking".into(),
             category: "tv".into(),
@@ -3111,6 +3533,66 @@ mod tests {
         for (status, expected) in cases {
             assert_eq!(sab_queue_status(status), expected);
         }
+    }
+
+    fn queue_sizes(job: &NzbJob) -> (serde_json::Value, serde_json::Value) {
+        let response = build_queue_response(
+            std::slice::from_ref(job),
+            false,
+            1_048_576,
+            0,
+            &SabApiRequest::default(),
+            |_| 3,
+        );
+        let queue = &response["queue"];
+        let slot = &queue["slots"][0];
+        assert_eq!(queue["mb"], slot["mb"]);
+        assert_eq!(queue["mbleft"], slot["mbleft"]);
+        (slot["mb"].clone(), slot["mbleft"].clone())
+    }
+
+    #[test]
+    fn held_par2_volumes_stay_out_of_queue_size_until_released() {
+        // 10 MiB in the NZB, 3 MiB of it recovery volumes held back.
+        let mut job = queue_job("held-par2", "Held", "tv", JobStatus::Downloading);
+        job.held_par2_bytes = 3 * 1_048_576;
+        assert_eq!(queue_sizes(&job), ("7.00".into(), "5.00".into()));
+
+        // Releasing a 2 MiB volume grows the size by that volume.
+        job.held_par2_bytes = 1_048_576;
+        assert_eq!(queue_sizes(&job), ("9.00".into(), "7.00".into()));
+
+        job.held_par2_bytes = 0;
+        assert_eq!(queue_sizes(&job), ("10.00".into(), "8.00".into()));
+    }
+
+    #[test]
+    fn history_stage_log_reports_par2_volumes_fetched_of_available() {
+        let mut entry = history_entry("vols", "Vols", "tv", JobStatus::Completed, 5);
+        entry.par2_volumes_fetched = Some(2);
+        entry.par2_volumes_available = Some(5);
+        let slot = serde_json::to_value(SabHistorySlot::from_entry(&entry)).unwrap();
+        let download = slot["stage_log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stage| stage["name"] == "Download")
+            .expect("Download stage");
+        assert_eq!(
+            download["actions"],
+            serde_json::json!(["PAR2 recovery volumes fetched: 2 of 5"])
+        );
+
+        entry.par2_volumes_fetched = None;
+        entry.par2_volumes_available = None;
+        let slot = serde_json::to_value(SabHistorySlot::from_entry(&entry)).unwrap();
+        assert!(
+            slot["stage_log"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|stage| stage["name"] != "Download")
+        );
     }
 
     #[test]
@@ -3300,6 +3782,7 @@ mod tests {
     fn history_reports_active_download_time_to_arr_clients() {
         let now = chrono::Utc::now();
         let entry = HistoryEntry {
+            client_removal: None,
             id: "history-active-time".into(),
             name: "queued item".into(),
             category: "sonarr".into(),
@@ -3318,6 +3801,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
 
         assert_eq!(SabHistorySlot::from_entry(&entry).download_time, 2);
@@ -3570,6 +4055,46 @@ mod tests {
     }
 
     #[test]
+    fn history_loads_full_rows_only_for_the_requested_page() {
+        let mut entries: Vec<HistoryEntry> = (0..6)
+            .map(|i| {
+                history_entry(
+                    &format!("job-{i}"),
+                    &format!("Job {i}"),
+                    "tv",
+                    JobStatus::Failed,
+                    i,
+                )
+            })
+            .collect();
+        for entry in &mut entries {
+            entry.nzb_data = Some(Vec::new());
+        }
+        let summaries: Vec<HistorySummary> = entries.iter().map(history_summary_of).collect();
+        let request = SabApiRequest {
+            start: Some(2),
+            limit: Some(2),
+            ..Default::default()
+        };
+        let mut loaded = Vec::new();
+        let response = build_history_response_with(&summaries, &[], &request, 1, |ids| {
+            loaded = ids.to_vec();
+            ids.iter()
+                .filter_map(|id| entries.iter().find(|e| &e.id == id).cloned())
+                .collect()
+        });
+
+        assert_eq!(loaded, ["job-2", "job-3"]);
+        let history = &response["history"];
+        assert_eq!(history["noofslots"], 6);
+        let slots = history["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 2);
+        // Fields only the full row carries come through on the page.
+        assert_eq!(slots[0]["name"], "Job 2");
+        assert_eq!(slots[0]["retry"], true);
+    }
+
+    #[test]
     fn matching_history_generation_uses_unchanged_response_contract() {
         assert!(history_is_unchanged(Some(42), 42));
         assert!(!history_is_unchanged(Some(41), 42));
@@ -3607,6 +4132,8 @@ mod tests {
             .single()
             .expect("valid fixture time");
         let job = NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: "contract-queue-job".into(),
             name: "SAB contract fixture".into(),
             category: "tv".into(),
@@ -3663,6 +4190,7 @@ mod tests {
             .single()
             .expect("valid fixture time");
         let entry = HistoryEntry {
+            client_removal: None,
             id: "contract-history-job".into(),
             name: "SAB history fixture".into(),
             category: "tv".into(),
@@ -3686,6 +4214,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         state.state.queue_manager.with_db(|database| {
             database
@@ -3749,6 +4279,8 @@ mod tests {
 
     fn add_live_job(test_state: &TestState, id: &str) {
         let job = NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: "Compat Layer Fixture".into(),
             category: "tv".into(),
@@ -3782,6 +4314,8 @@ mod tests {
 
     fn add_live_job_with_category(test_state: &TestState, id: &str, category: &str) {
         let job = NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: id.into(),
             name: "Change Cat Fixture".into(),
             category: category.into(),
@@ -4274,6 +4808,167 @@ mod tests {
         .0;
         assert_eq!(malformed["status"], serde_json::json!(false));
         assert!(malformed["error"].is_string());
+    }
+
+    /// Point `local_import_dir` at `dir` in the live config.
+    fn set_local_import_dir(test_state: &TestState, dir: Option<&Path>) {
+        let mut config = (*test_state.state.config()).clone();
+        config.general.local_import_dir = dir.map(Path::to_path_buf);
+        test_state.state.config.store(Arc::new(config));
+    }
+
+    async fn addlocalfile_value(test_state: &TestState, path: &str) -> serde_json::Value {
+        handle_addlocalfile(
+            &test_state.state,
+            Some(path.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("addlocalfile response")
+        .0
+    }
+
+    /// `addlocalfile` enqueues an absolute-path NZB from `local_import_dir`
+    /// the same way an upload is, and refuses relative paths, missing files
+    /// and the directory itself.
+    #[tokio::test]
+    async fn addlocalfile_enqueues_an_nzb_from_the_import_dir() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).expect("write local NZB");
+        set_local_import_dir(&test_state, Some(dir.path()));
+
+        let response = addlocalfile_value(&test_state, &path.to_string_lossy()).await;
+        assert_eq!(
+            response["status"],
+            serde_json::json!(true),
+            "resp={response}"
+        );
+        assert!(
+            response["nzo_ids"][0]
+                .as_str()
+                .is_some_and(|id| id.starts_with("SABnzbd_nzo_")),
+            "resp={response}"
+        );
+        assert_eq!(queued_names(&test_state), vec!["local-release".to_string()]);
+
+        for name in [
+            "local-release.nzb".to_string(),
+            dir.path()
+                .join("missing.nzb")
+                .to_string_lossy()
+                .into_owned(),
+            dir.path().to_string_lossy().into_owned(),
+        ] {
+            let refused = addlocalfile_value(&test_state, &name).await;
+            assert_eq!(
+                refused["status"],
+                serde_json::json!(false),
+                "resp={refused}"
+            );
+            assert!(refused["error"].is_string(), "resp={refused}");
+        }
+        assert_eq!(queued_names(&test_state).len(), 1);
+    }
+
+    /// Files outside the import directory are refused, whether named directly
+    /// or reached through `..` in the path.
+    #[tokio::test]
+    async fn addlocalfile_refuses_paths_outside_the_import_dir() {
+        let test_state = test_state();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let import = root.path().join("import");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.nzb"), SAMPLE_NZB).unwrap();
+        set_local_import_dir(&test_state, Some(&import));
+
+        let direct =
+            addlocalfile_value(&test_state, &outside.join("secret.nzb").to_string_lossy()).await;
+        assert_eq!(direct["status"], serde_json::json!(false), "resp={direct}");
+        assert!(
+            direct["error"]
+                .as_str()
+                .unwrap()
+                .contains("outside local_import_dir"),
+            "resp={direct}"
+        );
+
+        let traversal = addlocalfile_value(
+            &test_state,
+            &import.join("../outside/secret.nzb").to_string_lossy(),
+        )
+        .await;
+        assert_eq!(
+            traversal["status"],
+            serde_json::json!(false),
+            "resp={traversal}"
+        );
+        assert!(queued_names(&test_state).is_empty());
+    }
+
+    /// A symlink inside the import directory that points outside it is
+    /// refused: the canonical target is what gets checked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn addlocalfile_refuses_symlinks_that_leave_the_import_dir() {
+        let test_state = test_state();
+        let root = tempfile::tempdir().expect("root tempdir");
+        let import = root.path().join("import");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&import).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.nzb"), SAMPLE_NZB).unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.nzb"), import.join("link.nzb")).unwrap();
+        set_local_import_dir(&test_state, Some(&import));
+
+        let linked =
+            addlocalfile_value(&test_state, &import.join("link.nzb").to_string_lossy()).await;
+        assert_eq!(linked["status"], serde_json::json!(false), "resp={linked}");
+        assert!(queued_names(&test_state).is_empty());
+    }
+
+    /// `addlocalfile` is refused when no import directory is configured, and
+    /// when no API key is configured, even with an import directory set.
+    #[tokio::test]
+    async fn addlocalfile_is_refused_without_import_dir_or_api_key() {
+        let test_state = test_state();
+        let dir = tempfile::tempdir().expect("local NZB tempdir");
+        let path = dir.path().join("local-release.nzb");
+        std::fs::write(&path, SAMPLE_NZB).unwrap();
+        let path = path.to_string_lossy().into_owned();
+
+        let unset = addlocalfile_value(&test_state, &path).await;
+        assert_eq!(unset["status"], serde_json::json!(false), "resp={unset}");
+        assert!(
+            unset["error"]
+                .as_str()
+                .unwrap()
+                .contains("local_import_dir"),
+            "resp={unset}"
+        );
+
+        set_local_import_dir(&test_state, Some(dir.path()));
+        let mut config = (*test_state.state.config()).clone();
+        config.general.api_key = None;
+        test_state.state.config.store(Arc::new(config));
+        let keyless = addlocalfile_value(&test_state, &path).await;
+        assert_eq!(
+            keyless["status"],
+            serde_json::json!(false),
+            "resp={keyless}"
+        );
+        assert!(
+            keyless["error"].as_str().unwrap().contains("API key"),
+            "resp={keyless}"
+        );
+        assert!(queued_names(&test_state).is_empty());
     }
 
     /// SABnzbd's PAUSED_PRIORITY (-2) adds the job paused rather than at a
@@ -4861,6 +5556,101 @@ mod tests {
         assert_eq!(cleared, serde_json::json!({ "status": true }));
     }
 
+    /// `change_complete_action` takes `script_<name>` from the scripts
+    /// directory, reports it as `finishaction`, refuses power actions, and an
+    /// empty value clears it (both the mode and the `queue` sub-command).
+    #[tokio::test]
+    async fn change_complete_action_sets_and_reports_queue_script() {
+        let test_state = test_state();
+        let scripts = tempfile::tempdir().expect("scripts tempdir");
+        std::fs::write(scripts.path().join("done.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        test_state.state.queue_manager.set_postproc_scripts(
+            Some(scripts.path().to_path_buf()),
+            None,
+            None,
+            5,
+            4096,
+        );
+        let with_value = |value: &str| SabApiRequest {
+            value: Some(value.into()),
+            ..SabApiRequest::default()
+        };
+
+        let refused = dispatch_mode(
+            &test_state.state,
+            "change_complete_action",
+            &with_value("shutdown_pc"),
+        )
+        .0;
+        assert_eq!(refused["status"], false, "resp={refused}");
+        let accepted = dispatch_mode(
+            &test_state.state,
+            "change_complete_action",
+            &with_value("script_done.sh"),
+        )
+        .0;
+        assert_eq!(accepted, serde_json::json!({ "status": true }));
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert_eq!(fullstatus["status"]["finishaction"], "script_done.sh");
+
+        let cleared = SabApiRequest {
+            name: Some("change_complete_action".into()),
+            ..with_value("")
+        };
+        let queue = dispatch_mode(&test_state.state, "queue", &cleared).0;
+        assert_eq!(queue, serde_json::json!({ "status": true }));
+        let fullstatus =
+            dispatch_mode(&test_state.state, "fullstatus", &SabApiRequest::default()).0;
+        assert!(
+            fullstatus["status"]["finishaction"].is_null(),
+            "resp={fullstatus}"
+        );
+    }
+
+    /// Logged WARN and ERROR events are listed (newest first) with SAB's
+    /// `type`/`text`/`time` shape, INFO is not, and `name=clear` dismisses
+    /// what was logged so far while later warnings are reported again.
+    #[tokio::test]
+    async fn warnings_mode_lists_logged_warnings_until_cleared() {
+        let test_state = test_state();
+        let subscriber = tracing_subscriber::registry()
+            .with(LogBufferLayer::new(test_state.state.log_buffer.clone()));
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!("routine progress");
+            tracing::warn!("first problem");
+            tracing::error!("second problem");
+        });
+
+        let list = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        let warnings = list["warnings"].as_array().expect("warnings list");
+        assert_eq!(warnings.len(), 2, "resp={list}");
+        assert_eq!(warnings[0]["type"], "ERROR");
+        assert_eq!(warnings[0]["text"], "second problem");
+        assert_eq!(warnings[1]["type"], "WARNING");
+        assert_eq!(warnings[1]["text"], "first problem");
+        assert!(warnings[1]["time"].as_i64().is_some(), "resp={list}");
+
+        let clear = SabApiRequest {
+            name: Some("clear".into()),
+            ..SabApiRequest::default()
+        };
+        let cleared = dispatch_mode(&test_state.state, "warnings", &clear).0;
+        assert_eq!(cleared, serde_json::json!({ "status": true }));
+        let after_clear = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        assert_eq!(after_clear["warnings"], serde_json::json!([]));
+        let queue = dispatch_mode(&test_state.state, "queue", &SabApiRequest::default()).0;
+        assert_eq!(queue["queue"]["have_warnings"], "0");
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::warn!("third problem");
+        });
+        let relisted = dispatch_mode(&test_state.state, "warnings", &SabApiRequest::default()).0;
+        assert_eq!(relisted["warnings"][0]["text"], "third problem");
+        assert_eq!(relisted["warnings"].as_array().unwrap().len(), 1);
+    }
+
     /// SABnzbd's real `_api_queue_delete` accepts a comma-separated `value`
     /// list, removing every matching job in one call.
     #[tokio::test]
@@ -4886,6 +5676,7 @@ mod tests {
 
     fn insert_history_fixture(test_state: &TestState, id: &str, output_dir: std::path::PathBuf) {
         let entry = HistoryEntry {
+            client_removal: None,
             id: id.into(),
             name: id.into(),
             category: "tv".into(),
@@ -4904,6 +5695,8 @@ mod tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         test_state.state.queue_manager.with_db(|database| {
             database
@@ -4939,11 +5732,12 @@ mod tests {
         assert!(!output_dir.exists());
     }
 
-    /// A failed job keeps its partial download in `incomplete/` for retry.
-    /// Deleting its history entry, with or without `del_files`, must free it.
+    /// A partial download left in `incomplete/` by an older version must be
+    /// freed when its history entry is deleted, with or without `del_files`.
     #[tokio::test]
     async fn history_delete_removes_retained_incomplete_work_dir() {
         let test_state = test_state();
+        set_keep_history_on_arr_delete(&test_state, false);
         let incomplete = test_state.state.queue_manager.incomplete_dir();
         for (id, del_files) in [("sab-failed-keep", None), ("sab-failed-del", Some("1"))] {
             insert_history_status(&test_state, id, JobStatus::Failed, 10);
@@ -4994,6 +5788,7 @@ mod tests {
     #[tokio::test]
     async fn history_delete_failed_keeps_directory_shared_with_completed_entry() {
         let test_state = test_state();
+        set_keep_history_on_arr_delete(&test_state, false);
         let shared = test_state
             .state
             .config()
@@ -5060,6 +5855,7 @@ mod tests {
     async fn history_delete_by_status_removes_only_matching_entries() {
         for (value, kept) in [("failed", "job-done"), ("completed", "job-failed")] {
             let test_state = test_state();
+            set_keep_history_on_arr_delete(&test_state, false);
             insert_history_status(&test_state, "job-done", JobStatus::Completed, 1);
             insert_history_status(&test_state, "job-failed", JobStatus::Failed, 2);
 
@@ -5221,6 +6017,163 @@ mod tests {
         assert_eq!(test_state.state.queue_manager.get_jobs().len(), 2);
     }
 
+    fn set_keep_history_on_arr_delete(test_state: &TestState, keep: bool) {
+        test_state
+            .state
+            .update_config_with(|config| -> anyhow::Result<()> {
+                config.general.keep_history_on_arr_delete = keep;
+                Ok(())
+            })
+            .expect("update keep_history_on_arr_delete");
+    }
+
+    fn sab_history_ids(test_state: &TestState) -> Vec<String> {
+        let response = dispatch_mode(&test_state.state, "history", &SabApiRequest::default()).0;
+        response["history"]["slots"]
+            .as_array()
+            .expect("history slots")
+            .iter()
+            .map(|slot| slot["nzo_id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// An *arr's "Remove Completed" (`del_files=1`) deletes the files but,
+    /// by default, keeps rustnzb's History row, marked with the client, and
+    /// hides it from the SABnzbd history the *arrs poll.
+    #[tokio::test]
+    async fn arr_history_delete_keeps_the_row_and_removes_the_files() {
+        let test_state = test_state();
+        let complete = test_state.state.config().general.complete_dir.clone();
+        let output_dir = complete.join("tv").join("arr-removed");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        std::fs::write(output_dir.join("file.mkv"), b"data").expect("write fixture file");
+        insert_history_fixture(&test_state, "arr-removed", output_dir.clone());
+        insert_history_fixture(
+            &test_state,
+            "arr-other",
+            complete.join("tv").join("arr-other"),
+        );
+        assert_eq!(sab_history_ids(&test_state).len(), 2);
+
+        let req = SabApiRequest {
+            value: Some("SABnzbd_nzo_arr-removed".into()),
+            del_files: Some("1".into()),
+            client: Some("Sonarr".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!output_dir.exists(), "files are deleted as asked");
+
+        let entry = test_state
+            .state
+            .queue_manager
+            .history_get("arr-removed")
+            .expect("read history")
+            .expect("the History row is kept");
+        let removal = entry.client_removal.expect("row is marked");
+        assert_eq!(removal.removed_by, "Sonarr");
+        assert!(removal.files_deleted);
+        assert!(
+            history_ids(&test_state).contains(&"arr-removed".to_string()),
+            "rustnzb's own history still lists the row"
+        );
+        let sab_ids = sab_history_ids(&test_state);
+        assert_eq!(sab_ids.len(), 1, "the *arrs no longer see it: {sab_ids:?}");
+        assert!(!sab_ids[0].contains("arr-removed"));
+
+        // A repeat delete finds nothing left to remove for the *arr.
+        let again = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(again["status"], serde_json::json!(false));
+    }
+
+    /// An *arr's removeFailed keeps the History row but must still free the
+    /// failed job's leftover partial download (WI-2173).
+    #[tokio::test]
+    async fn arr_history_delete_keeping_rows_removes_failed_partials() {
+        let test_state = test_state();
+        let incomplete = test_state.state.queue_manager.incomplete_dir();
+        insert_history_status(&test_state, "arr-failed", JobStatus::Failed, 10);
+        let work_dir = incomplete.join("arr-failed");
+        std::fs::create_dir_all(&work_dir).expect("create leftover work dir");
+        std::fs::write(work_dir.join("partial.rar"), b"partial").expect("write partial");
+
+        let req = SabApiRequest {
+            value: Some("SABnzbd_nzo_arr-failed".into()),
+            client: Some("Sonarr".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!work_dir.exists(), "leftover partial download is removed");
+        assert!(
+            history_ids(&test_state).contains(&"arr-failed".to_string()),
+            "the History row is kept"
+        );
+        assert!(incomplete.is_dir(), "the incomplete root itself is kept");
+    }
+
+    /// With the setting off, an *arr delete drops the row too, as SABnzbd
+    /// does.
+    #[tokio::test]
+    async fn arr_history_delete_with_keep_off_removes_row_and_files() {
+        let test_state = test_state();
+        set_keep_history_on_arr_delete(&test_state, false);
+        let output_dir = test_state
+            .state
+            .config()
+            .general
+            .complete_dir
+            .join("tv")
+            .join("arr-gone");
+        std::fs::create_dir_all(&output_dir).expect("create fixture output dir");
+        insert_history_fixture(&test_state, "arr-gone", output_dir.clone());
+
+        let req = SabApiRequest {
+            value: Some("arr-gone".into()),
+            del_files: Some("1".into()),
+            client: Some("Radarr".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert!(!output_dir.exists());
+        assert!(history_ids(&test_state).is_empty());
+    }
+
+    /// `value=completed` in keep mode marks every visible completed row.
+    #[tokio::test]
+    async fn arr_history_delete_by_status_keeps_rows() {
+        let test_state = test_state();
+        insert_history_status(&test_state, "job-done", JobStatus::Completed, 1);
+        insert_history_status(&test_state, "job-failed", JobStatus::Failed, 2);
+        let req = SabApiRequest {
+            value: Some("completed".into()),
+            ..SabApiRequest::default()
+        };
+        let response = handle_history_delete(&test_state.state, &req).0;
+        assert_eq!(response["status"], serde_json::json!(true));
+        assert_eq!(history_ids(&test_state).len(), 2);
+        let sab_ids = sab_history_ids(&test_state);
+        assert_eq!(sab_ids.len(), 1);
+        assert!(sab_ids[0].contains("job-fail"));
+    }
+
+    /// The User-Agent product names the client.
+    #[test]
+    fn client_name_comes_from_the_user_agent() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_name_from_headers(&headers), None);
+        headers.insert(
+            axum::http::header::USER_AGENT,
+            "Sonarr/4.0.9.2244 (ubuntu 22.04)".parse().unwrap(),
+        );
+        assert_eq!(
+            client_name_from_headers(&headers).as_deref(),
+            Some("Sonarr")
+        );
+    }
+
     /// Without `del_files`, history delete only removes the DB record, as
     /// before.
     #[tokio::test]
@@ -5307,10 +6260,14 @@ mod tests {
             ..SabApiRequest::default()
         };
 
-        let response = h_sabnzbd_api_get(State(Arc::new(test_state.state)), Query(req))
-            .await
-            .expect("addurl over GET should succeed")
-            .into_response();
+        let response = h_sabnzbd_api_get(
+            State(Arc::new(test_state.state)),
+            Query(req),
+            HeaderMap::new(),
+        )
+        .await
+        .expect("addurl over GET should succeed")
+        .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -5388,7 +6345,7 @@ mod tests {
             mode: Some(mode.into()),
             ..SabApiRequest::default()
         };
-        let response = h_sabnzbd_api_get(State(Arc::new(state)), Query(req))
+        let response = h_sabnzbd_api_get(State(Arc::new(state)), Query(req), HeaderMap::new())
             .await
             .expect("GET response")
             .into_response();
@@ -5466,7 +6423,7 @@ mod tests {
             apikey: Some("contract-api-key".into()),
             ..SabApiRequest::default()
         };
-        let response = h_sabnzbd_api_get(State(state.clone()), Query(req))
+        let response = h_sabnzbd_api_get(State(state.clone()), Query(req), HeaderMap::new())
             .await
             .expect("addurl over GET")
             .into_response();
@@ -5478,6 +6435,52 @@ mod tests {
             .map(|job| job.name)
             .collect();
         (value, names)
+    }
+
+    /// A duplicate sent through `addurl` gets the same SABnzbd-style refusal
+    /// as addfile, `status: true` with no `nzo_ids`, so the arr blocklists
+    /// the release instead of re-grabbing it (WI-2165).
+    #[tokio::test]
+    async fn addurl_duplicate_gets_sabnzbd_refusal() {
+        let TestState { state, _tempdir } = test_state();
+        {
+            let mut config = (*state.config()).clone();
+            config.general.fetch_allowed_hosts = vec!["127.0.0.1".into()];
+            state.config.store(std::sync::Arc::new(config));
+        }
+        state
+            .queue_manager
+            .set_duplicate_policy(crate::nzb_core::config::DuplicatePolicy::Skip);
+        let state = Arc::new(state);
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            let url = spawn_nzb_server(SAMPLE_NZB).await;
+            let req = SabApiRequest {
+                mode: Some("addurl".into()),
+                name: Some(url),
+                apikey: Some("contract-api-key".into()),
+                ..SabApiRequest::default()
+            };
+            let response = h_sabnzbd_api_get(State(state.clone()), Query(req), HeaderMap::new())
+                .await
+                .expect("addurl over GET")
+                .into_response();
+            responses.push(json_body(response).await);
+        }
+        assert_eq!(
+            responses[0]["status"],
+            serde_json::json!(true),
+            "first={}",
+            responses[0]
+        );
+        assert_eq!(responses[0]["nzo_ids"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            responses[1],
+            sab_duplicate_refusal(),
+            "second={}",
+            responses[1]
+        );
+        assert_eq!(state.queue_manager.get_jobs().len(), 1);
     }
 
     /// `mode=addurl&name=<URL>` used the whole URL as the job name, which
@@ -5865,7 +6868,7 @@ mod tests {
                 apikey: Some("contract-api-key".into()),
                 ..SabApiRequest::default()
             };
-            let response = h_sabnzbd_api_get(State(state.clone()), Query(req))
+            let response = h_sabnzbd_api_get(State(state.clone()), Query(req), HeaderMap::new())
                 .await
                 .expect("addurl over GET")
                 .into_response();

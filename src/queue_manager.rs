@@ -17,8 +17,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use crate::nzb_core::config::{CategoryConfig, ServerConfig, normalize_history_retention};
-use crate::nzb_core::db::Database;
+use crate::nzb_core::config::{
+    CategoryConfig, DuplicatePolicy, NotificationConfig, ServerConfig, normalize_history_retention,
+};
+use crate::nzb_core::db::{Database, HistoryFilter, HistorySummary, nzb_digest};
 use crate::nzb_core::models::*;
 use crate::nzb_core::nzb_parser;
 use nzb_postproc::{
@@ -26,29 +28,22 @@ use nzb_postproc::{
     has_usable_output, parse_rar_volume, run_pipeline_with_cleanup, run_repair_pipeline,
 };
 
+use crate::damage_recorder::LedgerRecorder;
 use crate::direct_unpack::DirectUnpacker;
 use crate::log_buffer::LogBuffer;
+use crate::notifications::{NotificationEvent, NotificationKind, Notifier};
 use nzb_dispatch::{
     BandwidthConfig, BandwidthLimiter, DispatchEngine, DispatchHandle, ProgressUpdate,
 };
 
-fn cleanup_terminal_work_dir(
-    job_id: &str,
-    work_dir: &std::path::Path,
-    final_status: JobStatus,
-    retain_for_retry: bool,
-) {
+fn cleanup_terminal_work_dir(job_id: &str, work_dir: &std::path::Path, final_status: JobStatus) {
     if !work_dir.exists() {
         return;
     }
 
     let cleanup_result = match final_status {
-        // Failed downloads can be retried from their retained NZB history, so
-        // retaining raw articles only leaks disk without improving recovery.
-        JobStatus::Failed if retain_for_retry => {
-            info!(job_id, work_dir = %work_dir.display(), "Retaining partial job files for missing-article retry");
-            return;
-        }
+        // A failed job is final: a history retry re-downloads from the stored
+        // NZB, so keeping raw articles would only leak disk (WI-2173).
         JobStatus::Failed => std::fs::remove_dir_all(work_dir),
         // A successful job must not lose files if an output move failed. Only
         // remove the directory after the move/pipeline has left it empty.
@@ -160,6 +155,17 @@ fn claim_output_dir_fields(job_id: &str, output_dir: &mut std::path::PathBuf, cl
 /// (an interrupted post-processing run, or a direct unpack before a pause),
 /// provided it is still a real directory named `<base>` or `<base>.<n>`
 /// beside the job's derived target.
+/// Sweep damage-ledger rows that no queued or listed job can use (WI-1868).
+/// Runs when a job leaves the queue and at startup, so expired holes and the
+/// rows of removed jobs don't pile up.
+fn prune_damage_ledger(db: &Database) {
+    match db.ledger_prune(Utc::now()) {
+        Ok(0) => {}
+        Ok(n) => debug!(rows = n, "Pruned damage-ledger rows"),
+        Err(e) => warn!("Failed to prune the damage ledger: {e}"),
+    }
+}
+
 fn restore_claimed_output_dir(job: &mut NzbJob, checkpoint: &JobCheckpoint) -> bool {
     let Some(claimed) = checkpoint.output_dir.as_ref() else {
         return false;
@@ -244,10 +250,24 @@ fn retry_checkpoint_work_dir(retry_data: &[u8]) -> Option<std::path::PathBuf> {
         .work_dir
 }
 
+/// `(fetched, available)` PAR2 recovery volumes for a job whose download
+/// ended with the volume files `held` still unfetched, or `None` when the NZB
+/// carries no volumes.
+fn par2_volume_counts(job: &NzbJob, held: &[String]) -> Option<(u32, u32)> {
+    let volumes = job.files.iter().filter(|file| {
+        let lower = file.filename.to_lowercase();
+        lower.ends_with(".par2") && lower.contains(".vol")
+    });
+    let (available, held) = volumes.fold((0_u32, 0_u32), |(available, held_n), file| {
+        (available + 1, held_n + u32::from(held.contains(&file.id)))
+    });
+    (available > 0).then(|| (available - held, available))
+}
+
 /// Per-server totals. The `today_*`, `week_*` and `month_*` fields are rolling
 /// windows (the last 24 hours, 7 days and 30 days before the request), not
 /// calendar periods; the UI labels them "24 hours", "7 days" and "30 days".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServerStatsData {
     pub server_id: String,
     pub server_name: String,
@@ -266,7 +286,7 @@ pub struct ServerStatsData {
     pub last_active: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StatisticsPeriodData {
     pub downloads: usize,
     pub completed: usize,
@@ -280,14 +300,14 @@ pub struct StatisticsPeriodData {
     pub articles_missing: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DailyStatisticsData {
     pub date: String,
     #[serde(flatten)]
     pub totals: StatisticsPeriodData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct GlobalStatisticsData {
     pub generated_at: DateTime<Utc>,
     pub lifetime: StatisticsPeriodData,
@@ -422,6 +442,306 @@ async fn read_script_output<R: AsyncRead + Unpin>(
     let truncated = output.len() > max_output_bytes;
     output.truncate(max_output_bytes);
     Ok((output, truncated))
+}
+
+/// Run one operator script from `cwd` with `args` and `env`, capturing its
+/// output up to the configured bound and killing it at the timeout. The
+/// outcome is a `Script` stage that started at `started`.
+async fn run_bounded_script(
+    script: &std::path::Path,
+    cwd: &std::path::Path,
+    args: &[String],
+    env: Vec<(&'static str, String)>,
+    config: &PostProcScriptConfig,
+    started: Instant,
+) -> StageResult {
+    let failed = |message: String| StageResult {
+        name: "Script".into(),
+        status: StageStatus::Failed,
+        message: Some(message),
+        duration_secs: started.elapsed().as_secs_f64(),
+    };
+    let mut command = tokio::process::Command::new(script);
+    command
+        .current_dir(cwd)
+        .args(args)
+        .envs(env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return failed(format!("Unable to start post-processing script: {error}")),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let max_output_bytes = config.max_output_bytes;
+    let result = async {
+        let stdout_reader = async {
+            match stdout {
+                Some(reader) => read_script_output(reader, max_output_bytes).await,
+                None => Ok((Vec::new(), false)),
+            }
+        };
+        let stderr_reader = async {
+            match stderr {
+                Some(reader) => read_script_output(reader, max_output_bytes).await,
+                None => Ok((Vec::new(), false)),
+            }
+        };
+        let (stdout, stderr) = tokio::join!(stdout_reader, stderr_reader);
+        let stdout = stdout?;
+        let stderr = stderr?;
+        let status = child.wait().await?;
+        Ok::<_, io::Error>((status, stdout, stderr))
+    };
+
+    match tokio::time::timeout(config.timeout, result).await {
+        Ok(Ok((status, stdout, stderr))) if status.success() => StageResult {
+            name: "Script".into(),
+            status: StageStatus::Success,
+            message: Some(script_output_message(&stdout, &stderr)),
+            duration_secs: started.elapsed().as_secs_f64(),
+        },
+        Ok(Ok((status, stdout, stderr))) => failed(format!(
+            "Post-processing script exited with {status}: {}",
+            script_output_message(&stdout, &stderr)
+        )),
+        Ok(Err(error)) => failed(format!("Post-processing script failed: {error}")),
+        Err(_) => failed(format!(
+            "Post-processing script exceeded {} second timeout",
+            config.timeout.as_secs()
+        )),
+    }
+}
+
+/// SABnzbd's positional arguments to a post-processing script: final
+/// directory, original NZB name, job name, report number, category, group,
+/// post-processing status and failure URL. RustNZB keeps no separate NZB file
+/// name, so the second argument repeats the job name, and the report number,
+/// group and URL are empty.
+fn postproc_script_args(job: &NzbJob, stages: &[StageResult]) -> Vec<String> {
+    vec![
+        job.output_dir.to_string_lossy().into_owned(),
+        job.name.clone(),
+        job.name.clone(),
+        String::new(),
+        job.category.clone(),
+        String::new(),
+        postproc_status_code(stages).to_string(),
+        String::new(),
+    ]
+}
+
+/// Environment for a post-processing script.
+///
+/// It carries three families of names. The `SAB_*` variables follow
+/// SABnzbd's script contract, so a SABnzbd script that reads them works
+/// unchanged; every variable SABnzbd always sets is present, empty when
+/// RustNZB has no truthful value, because a missing key raises `KeyError`
+/// in a Python script. `NZBPP_*` follows NZBGet's contract, including the
+/// numeric `PARSTATUS`/`UNPACKSTATUS` codes and the `SUCCESS/ALL` shape of
+/// `NZBPP_STATUS`. `SAB_JOB`, `SAB_COMPLETE` and `RUSTNZB_STATUS` are the
+/// names RustNZB has always sent and are kept for scripts already using
+/// them.
+fn postproc_script_env(
+    job: &NzbJob,
+    final_status: JobStatus,
+    stages: &[StageResult],
+    script: &std::path::Path,
+    pp_level: u8,
+) -> Vec<(&'static str, String)> {
+    let directory = job.output_dir.to_string_lossy().into_owned();
+    let code = postproc_status_code(stages);
+    let success = final_status == JobStatus::Completed;
+    let password = job.password.clone().unwrap_or_default();
+    let group = job
+        .files
+        .iter()
+        .find_map(|file| file.groups.first().cloned())
+        .unwrap_or_default();
+    let script_name = script
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let total_status = if success { "SUCCESS" } else { "FAILURE" };
+    vec![
+        // SABnzbd always sets these, so they are always present here.
+        ("SAB_SCRIPT", script_name),
+        ("SAB_NZO_ID", job.id.clone()),
+        ("SAB_FINAL_NAME", job.name.clone()),
+        ("SAB_FILENAME", job.name.clone()),
+        ("SAB_COMPLETE_DIR", directory.clone()),
+        ("SAB_COMPLETE", directory.clone()),
+        ("SAB_CAT", job.category.clone()),
+        ("SAB_STATUS", final_status.to_string()),
+        (
+            "SAB_FAIL_MSG",
+            if success {
+                String::new()
+            } else {
+                job.error_message.clone().unwrap_or_default()
+            },
+        ),
+        ("SAB_BYTES", job.total_bytes.to_string()),
+        ("SAB_BYTES_TRIED", job.total_bytes.to_string()),
+        ("SAB_BYTES_DOWNLOADED", job.downloaded_bytes.to_string()),
+        ("SAB_PP_STATUS", code.to_string()),
+        ("SAB_PP", pp_level.to_string()),
+        ("SAB_REPAIR", u8::from(pp_level & 1 != 0).to_string()),
+        ("SAB_UNPACK", u8::from(pp_level & 2 != 0).to_string()),
+        ("SAB_PRIORITY", sab_priority(job.priority).to_string()),
+        ("SAB_GROUP", group),
+        ("SAB_PASSWORD", password.clone()),
+        (
+            "SAB_CORRECT_PASSWORD",
+            if success { password } else { String::new() },
+        ),
+        ("SAB_FILES", sab_files_json(job)),
+        // RustNZB verifies and repairs PAR2 natively, so there is no
+        // par2cmdline to name.
+        ("SAB_PAR2_COMMAND", String::new()),
+        ("SAB_RAR_COMMAND", sab_tool(nzb_postproc::find_unrar)),
+        ("SAB_7ZIP_COMMAND", sab_tool(nzb_postproc::unpack::find_7z)),
+        ("SAB_JOB", job.name.clone()),
+        // Declared so a script that reads the key does not crash. RustNZB
+        // does not track these.
+        ("SAB_URL", String::new()),
+        ("SAB_FAILURE_URL", String::new()),
+        ("SAB_AGE", String::new()),
+        ("SAB_AVG_BPS", String::new()),
+        ("SAB_DOWNLOAD_TIME", String::new()),
+        ("SAB_ORIG_NZB_GZ", String::new()),
+        ("SAB_DUPLICATE", String::new()),
+        ("SAB_DUPLICATE_KEY", String::new()),
+        ("SAB_UNWANTED_EXT", "0".to_string()),
+        ("SAB_OVERSIZED", "0".to_string()),
+        ("SAB_ENCRYPTED", "0".to_string()),
+        // NZBGet's contract. `NZBPP_STATUS` is `<TOTALSTATUS>/<detail>`.
+        ("NZBPP_NZBID", job.id.clone()),
+        ("NZBPP_NZBNAME", job.name.clone()),
+        ("NZBPP_NZBFILENAME", job.name.clone()),
+        ("NZBPP_DIRECTORY", directory.clone()),
+        ("NZBPP_FINALDIR", directory),
+        ("NZBPP_CATEGORY", job.category.clone()),
+        ("NZBPP_TOTALSTATUS", total_status.to_string()),
+        (
+            "NZBPP_STATUS",
+            nzbpp_status(total_status, stages, success).to_string(),
+        ),
+        ("NZBPP_SCRIPTSTATUS", "NONE".to_string()),
+        ("NZBPP_TOTALSIZE", job.total_bytes.to_string()),
+        ("NZBPP_PARSTATUS", nzbpp_par_status(stages).to_string()),
+        (
+            "NZBPP_UNPACKSTATUS",
+            nzbpp_unpack_status(stages).to_string(),
+        ),
+        ("RUSTNZB_STATUS", final_status.to_string()),
+    ]
+}
+
+/// A tool path for `SAB_*_COMMAND`, empty when the tool is absent — as
+/// SABnzbd sends an empty `SAB_7ZIP_COMMAND` when 7-Zip is not installed.
+fn sab_tool(find: impl FnOnce() -> Option<String>) -> String {
+    find().unwrap_or_default()
+}
+
+/// SABnzbd's priority numbering: Low -1, Normal 0, High 1, Force 2.
+fn sab_priority(priority: Priority) -> i8 {
+    match priority {
+        Priority::Low => -1,
+        Priority::Normal => 0,
+        Priority::High => 1,
+        Priority::Force => 2,
+    }
+}
+
+/// `SAB_FILES`: a JSON array of the files the job produced, relative to
+/// `SAB_COMPLETE_DIR`, as SABnzbd sends them.
+fn sab_files_json(job: &NzbJob) -> String {
+    let files: Vec<String> = regular_output_files(&job.output_dir)
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&job.output_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    serde_json::to_string(&files).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// NZBGet's `NZBPP_STATUS`: `<TOTALSTATUS>/<detail>`.
+fn nzbpp_status(total: &str, stages: &[StageResult], success: bool) -> String {
+    if success {
+        return "SUCCESS/ALL".to_string();
+    }
+    let failed = |name: &str| {
+        stages
+            .iter()
+            .any(|stage| stage.name == name && stage.status == StageStatus::Failed)
+    };
+    let detail = if failed("Verify") || failed("Repair") {
+        "PAR"
+    } else if failed("Extract") {
+        "UNPACK"
+    } else {
+        "HEALTH"
+    };
+    format!("{total}/{detail}")
+}
+
+/// NZBGet's `NZBPP_PARSTATUS`: 0 not checked, 1 checked and failed, 2
+/// checked successfully (repaired or already intact).
+fn nzbpp_par_status(stages: &[StageResult]) -> u8 {
+    let ran = stages.iter().any(|stage| {
+        (stage.name == "Verify" || stage.name == "Repair") && stage.status != StageStatus::Skipped
+    });
+    if !ran {
+        return 0;
+    }
+    let failed = stages.iter().any(|stage| {
+        (stage.name == "Verify" || stage.name == "Repair") && stage.status == StageStatus::Failed
+    });
+    if failed { 1 } else { 2 }
+}
+
+/// NZBGet's `NZBPP_UNPACKSTATUS`: 0 not run, 1 failed, 2 succeeded.
+/// NZBGet's 3 (write error) and 4 (wrong password) are not distinguishable
+/// from the stage result.
+fn nzbpp_unpack_status(stages: &[StageResult]) -> u8 {
+    match stages
+        .iter()
+        .find(|stage| stage.name == "Extract" && stage.status != StageStatus::Skipped)
+    {
+        None => 0,
+        Some(stage) if stage.status == StageStatus::Failed => 1,
+        Some(_) => 2,
+    }
+}
+
+/// SABnzbd's post-processing status code: 0 when verification and extraction
+/// both succeeded, 1 when verification or repair failed, 2 when extraction
+/// failed, and 3 when both failed.
+fn postproc_status_code(stages: &[StageResult]) -> u8 {
+    let failed = |name: &str| {
+        stages
+            .iter()
+            .any(|stage| stage.name == name && stage.status == StageStatus::Failed)
+    };
+    let verify_failed = failed("Verify") || failed("Repair");
+    let extract_failed = failed("Extract");
+    u8::from(verify_failed) + 2 * u8::from(extract_failed)
+}
+
+/// Whether `job_id` has just finished and no other job in the queue is still
+/// active, so the queue has drained. Called under the jobs lock straight
+/// after the job moves to history, so exactly one completion sees the drain.
+fn queue_drained_by(jobs: &HashMap<String, JobState>, job_id: &str) -> bool {
+    jobs.contains_key(job_id)
+        && jobs.iter().all(|(id, state)| {
+            id == job_id || matches!(state.job.status, JobStatus::Completed | JobStatus::Failed)
+        })
 }
 
 fn regular_output_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -708,9 +1028,23 @@ struct HopelessTracker {
     content_articles_failed: usize,
     /// Total content articles expected (non-par2).
     content_articles_total: usize,
+    /// The job carries at least one PAR2 file, so the parity tier applies
+    /// instead of the article-count grace (WI-145).
+    has_par2_set: bool,
+    /// Every recovery volume's block count is known from its filename. When
+    /// one is not, the declared total undercounts and the parity tier stays
+    /// out of the way.
+    recovery_blocks_known: bool,
+    /// Content files with at least one article refused by every server.
+    /// PAR2 slices never span files, so each is at least one damaged slice.
+    confirmed_missing_files: std::collections::HashSet<String>,
+    /// Confirmed-missing content articles not attributed to a file.
+    confirmed_missing_unattributed: usize,
 }
 
-/// Number of bad articles allowed before any abort checks kick in.
+/// Number of bad articles allowed before the byte-based abort checks kick in.
+/// Jobs with a PAR2 set are first judged by the parity tier, which needs no
+/// grace; this remains the only guard for jobs with no PAR2 set at all.
 const HOPELESS_GRACE_ARTICLES: usize = 5;
 /// Minimum content articles checked before the early failure check fires.
 const EARLY_CHECK_MIN_ARTICLES: usize = 10;
@@ -733,9 +1067,15 @@ impl HopelessTracker {
         let mut recovery_capacity_by_set = HashMap::new();
         let mut content_file_sets = HashMap::new();
         let mut pending_file_classifications = std::collections::HashSet::new();
+        let mut has_par2_set = false;
+        let mut recovery_blocks_known = true;
 
         for file in &job.files {
             if file.is_par2 {
+                has_par2_set = true;
+                if file.par2_vol.is_some() && file.par2_blocks.is_none() {
+                    recovery_blocks_known = false;
+                }
                 // A plain .par2 is the index. Only .volNN+MM.par2 or
                 // .volNN-MM.par2 recovery volumes declare usable blocks.
                 if file.par2_vol.is_some() && file.par2_blocks.is_some_and(|blocks| blocks > 0) {
@@ -791,6 +1131,10 @@ impl HopelessTracker {
             content_articles_checked: 0,
             content_articles_failed: 0,
             content_articles_total,
+            has_par2_set,
+            recovery_blocks_known,
+            confirmed_missing_files: std::collections::HashSet::new(),
+            confirmed_missing_unattributed: 0,
         }
     }
 
@@ -816,6 +1160,11 @@ impl HopelessTracker {
     ) {
         self.content_bytes = self.content_bytes.saturating_sub(file_bytes);
         self.content_articles_total = self.content_articles_total.saturating_sub(article_count);
+        self.has_par2_set = true;
+        if volume.is_some() && blocks.is_none() {
+            self.recovery_blocks_known = false;
+        }
+        self.confirmed_missing_files.remove(file_id);
         if volume.is_some() && blocks.is_some_and(|count| count > 0) {
             self.recovery_capacity_bytes = self.recovery_capacity_bytes.saturating_add(file_bytes);
             self.recovery_blocks_total = self
@@ -883,6 +1232,16 @@ impl HopelessTracker {
             return;
         }
         self.content_articles_checked += 1;
+        // Only an article refused by every server is a missing slice. A
+        // decode error may be a transport fault and stays unestablished.
+        if kind == nzb_dispatch::ArticleFailureKind::NotFound {
+            match file_id {
+                Some(id) => {
+                    self.confirmed_missing_files.insert(id.to_string());
+                }
+                None => self.confirmed_missing_unattributed += 1,
+            }
+        }
         // Only failures that count toward "definitively not retrievable"
         // increment the failed counter and missing-bytes total. A 502 or
         // AuthFailed on one server doesn't mean the article is gone.
@@ -918,6 +1277,15 @@ impl HopelessTracker {
     ) -> Option<HopelessAbort> {
         if !abort_hopeless {
             return None;
+        }
+
+        // Tier 0: parity. With a PAR2 set, judge confirmed damage against
+        // the recovery slices the release declares, not an article count.
+        if self.has_par2_set
+            && self.pending_file_classifications.is_empty()
+            && let Some(abort) = self.parity_check()
+        {
+            return Some(abort);
         }
 
         // Tier 1: grace period — allow minor gaps that par2 can fix
@@ -1041,6 +1409,63 @@ impl HopelessTracker {
     }
 }
 
+impl HopelessTracker {
+    /// Recovery slices still obtainable: declared by volume filenames, less
+    /// those lost to failed volume articles.
+    fn recovery_blocks_available(&self) -> u64 {
+        self.recovery_blocks_total
+            .saturating_sub(self.recovery_blocks_unavailable)
+    }
+
+    /// A lower bound on damaged slices from confirmed-missing articles. Only
+    /// articles every server refused count; provisional, transport-failed
+    /// and unasked articles are unestablished. Slices never span files, so
+    /// each file with a confirmed hole holds at least one damaged slice.
+    fn damaged_slices_lower_bound(&self) -> u64 {
+        let files = self.confirmed_missing_files.len() as u64;
+        if files == 0 && self.confirmed_missing_unattributed > 0 {
+            1
+        } else {
+            files
+        }
+    }
+
+    /// Hopeless when the slices certainly damaged exceed the recovery
+    /// slices available. Mid-download the damaged count is a lower bound;
+    /// the exact count comes from the slice map at job end
+    /// ([`parity_diagnosis`]).
+    fn parity_check(&self) -> Option<HopelessAbort> {
+        if !self.recovery_blocks_known {
+            return None;
+        }
+        let damaged = self.damaged_slices_lower_bound();
+        let available = self.recovery_blocks_available();
+        (damaged > available).then(|| HopelessAbort {
+            tier: "parity",
+            reason: format!(
+                "Aborted: at least {damaged} slice(s) missing but the release only \
+                 carries {available} recovery slice(s)"
+            ),
+        })
+    }
+}
+
+/// The end-of-download parity decision (WI-145). `damaged` slices are those
+/// the slice map confirmed; `Unknown` slices are unestablished and do not
+/// count. Recovery is the larger of what the PAR2 index carries and what the
+/// volume filenames declare, so neither source alone can cause an abort.
+/// `declared_available` is `None` when a volume's block count is unknown;
+/// then there is no decision.
+fn parity_diagnosis(map: &SliceMapSummary, declared_available: Option<u64>) -> Option<String> {
+    let damaged = map.damaged as u64;
+    let available = declared_available?.max(u64::from(map.recovery_block_count));
+    (damaged > available).then(|| {
+        format!(
+            "{damaged} slice(s) missing but the release only carries {available} recovery slice(s)"
+        )
+    })
+}
+
 /// Result of a positive [`HopelessTracker::check`] — both the reason string
 /// (for the user-visible error_message) and a stable `tier` label so logs
 /// and metrics can be grouped by which heuristic fired.
@@ -1105,6 +1530,9 @@ struct JobState {
     direct_unpacker: Option<DirectUnpacker>,
     /// Hopeless job tracker (None until download starts).
     hopeless_tracker: Option<HopelessTracker>,
+    /// The download's in-flight PAR2 repair fold, handed to post-processing
+    /// (WI-148). In memory only: a restart repairs from disk.
+    repair_fold: Option<nzb_decode::SharedFold>,
     /// Active download duration captured at terminal download resolution,
     /// including `prior_download_secs`.
     download_time_secs: Option<f64>,
@@ -1117,10 +1545,16 @@ struct JobState {
     /// Typed terminal failure code, tracked in memory until it is persisted to
     /// the terminal history row.
     failure_code: Option<JobFailureCode>,
+    /// PAR2 recovery volumes `(fetched, available)` when the download
+    /// finished, recorded on the history row.
+    par2_volumes: Option<(u32, u32)>,
     /// Whether `job.output_dir` is a complete-directory folder this job
     /// reserved for itself. Reserving happens when output is first written,
     /// not at add time, so queued jobs never hold a name.
     output_dir_claimed: bool,
+    /// The status the last progress save wrote to the queue row, so the save
+    /// only takes the job-list and database locks together on a transition.
+    persisted_status: Option<JobStatus>,
 }
 
 /// Field a manual queue sort orders by.
@@ -1186,7 +1620,7 @@ impl std::str::FromStr for QueueSortField {
 ///
 /// Exposed on the native API so a pause applied by the disk-space guard can
 /// be told apart from one the user asked for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PauseReason {
     /// The user paused this job.
@@ -1198,8 +1632,126 @@ pub enum PauseReason {
     DiskSpace,
     /// The job was paused after a news-server error.
     Server,
+    /// A time-of-day schedule rule is pausing downloads. The pause lifts
+    /// automatically when the window ends.
+    Schedule,
 }
 
+/// Every reason the queue is globally paused right now.
+///
+/// Holds are additive rather than a single owner: a disk-space hold can be
+/// open while a schedule window is open, and the queue must stay paused until
+/// *both* are gone. Each holder lifts only its own flag, so one ending never
+/// resumes work the other is still holding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PauseHolds {
+    /// A pause the user asked for and has not since lifted.
+    user: bool,
+    /// The disk-space guard tripped.
+    disk: Option<DateTime<Utc>>,
+    /// The schedule is keeping the queue paused. A window the user has
+    /// resumed inside sets this to `false` for the rest of that window.
+    schedule: bool,
+    /// Every pause-window occurrence currently open, by rule id and the date
+    /// the window started on (`rule@YYYY-MM-DD`).
+    ///
+    /// The set, not a change in it, says whether a window is newly open: a
+    /// window opening adds an occurrence, while another of two overlapping
+    /// windows closing only removes one and must not re-pause the queue.
+    open_windows: Vec<String>,
+    /// The occurrences the schedule has already acted on.
+    ///
+    /// A window pauses when it first appears here. Closing it removes it from
+    /// `open_windows` and from here, so the same occurrence reopening later is
+    /// new again.
+    triggered_windows: Vec<String>,
+    /// The occurrences the user has resumed by hand.
+    ///
+    /// A manual resume outlasts the window it was made in: a settings save or
+    /// a tick re-evaluates the same occurrence, so without this it would come
+    /// back. A timed user pause running out is not a manual resume and does
+    /// not record one.
+    resumed_windows: Vec<String>,
+    /// The occurrences a timed user pause is exempting: it was started while
+    /// they were open, so their automatic hold is suspended, and its expiry
+    /// restores it. Without this, "pause for 2h" before a window would pause
+    /// for the window's start and then resume straight into it.
+    user_paused_over: Vec<String>,
+}
+
+impl PauseHolds {
+    fn any(&self) -> bool {
+        self.user || self.disk.is_some() || self.schedule
+    }
+
+    /// The reason to show, most specific first. A pause the user asked for
+    /// outranks every automatic hold, a disk hold outranks a schedule window
+    /// that merely overlapped it, and the schedule is the reason only when it
+    /// is what keeps the queue paused.
+    fn reason(&self) -> Option<PauseReason> {
+        if self.user {
+            Some(PauseReason::Global)
+        } else if self.disk.is_some() {
+            Some(PauseReason::DiskSpace)
+        } else if self.schedule {
+            Some(PauseReason::Schedule)
+        } else {
+            None
+        }
+    }
+
+    /// The events a scheduled decision adds to the open windows, sorted.
+    ///
+    /// Every open rule contributes its `rule@date` occurrence, so a rule
+    /// overlapping another cannot hide it.
+    fn occurrences<'a>(windows: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+        let mut occurrences: Vec<String> = windows.into_iter().map(str::to_string).collect();
+        occurrences.sort();
+        occurrences.dedup();
+        occurrences
+    }
+
+    /// The occurrences a scheduled decision opens that have not been given a
+    /// chance to pause yet.
+    fn newly_opened(&self, windows: &[String]) -> Vec<String> {
+        windows
+            .iter()
+            .filter(|window| !contains(&self.triggered_windows, window))
+            .cloned()
+            .collect()
+    }
+
+    /// The occurrences the schedule still holds the queue for, of `windows`.
+    ///
+    /// An occurrence holds once it has been triggered and is not suspended by
+    /// a timed user pause; the remaining ones keep the queue paused while the
+    /// window that opened them is still open.
+    fn held_occurrences(&self, windows: &[String]) -> Vec<String> {
+        windows
+            .iter()
+            .filter(|window| contains(&self.triggered_windows, window))
+            .filter(|window| !contains(&self.resumed_windows, window))
+            .filter(|window| !contains(&self.user_paused_over, window))
+            .cloned()
+            .collect()
+    }
+
+    /// Drop the occurrences that are no longer open from the bookkeeping that
+    /// only describes open windows. A window that closes and later reopens is
+    /// then a new occurrence again, as the user expects.
+    fn retain_open(&mut self, open: &[String]) {
+        self.open_windows = open.to_vec();
+        self.triggered_windows
+            .retain(|window| contains(open, window));
+        self.resumed_windows.retain(|window| contains(open, window));
+        self.user_paused_over
+            .retain(|window| contains(open, window));
+    }
+}
+
+fn contains(haystack: &[String], needle: &str) -> bool {
+    haystack.iter().any(|value| value == needle)
+}
 /// Notification fired immediately when a job is accepted into the queue.
 #[derive(Debug, Clone)]
 pub struct JobAddedEvent {
@@ -1229,6 +1781,39 @@ pub enum HistoryRetryOutcome {
 /// Thread-safe queue manager that coordinates all downloads.
 ///
 /// Wrapped in `Arc` for sharing between the background task and HTTP handlers.
+/// The notification for a job reaching a terminal status, or `None` when
+/// the outcome is not reported. A post-processing stop for lack of disk
+/// space is reported as a disk event, not as a generic failure.
+fn terminal_notification(job: &NzbJob, final_status: JobStatus) -> Option<NotificationEvent> {
+    let event = match final_status {
+        JobStatus::Completed => NotificationEvent::new(
+            NotificationKind::Complete,
+            "Download complete",
+            job.name.clone(),
+        ),
+        JobStatus::Failed if job.error_message.as_deref() == Some(POSTPROC_DISK_FULL_MESSAGE) => {
+            NotificationEvent::new(
+                NotificationKind::DiskFull,
+                "Disk space low",
+                "Post-processing stopped: free space on a storage volume is below the minimum.",
+            )
+        }
+        JobStatus::Failed => NotificationEvent::new(
+            NotificationKind::Failed,
+            "Download failed",
+            job.error_message
+                .clone()
+                .unwrap_or_else(|| format!("{} failed", job.name)),
+        ),
+        _ => return None,
+    };
+    Some(event.for_job(&job.name, &job.category))
+}
+
+/// Error message the post-processing disk check records. Matched when
+/// notifying, so a disk stop is reported once, as a disk event.
+const POSTPROC_DISK_FULL_MESSAGE: &str = "Insufficient free disk space for post-processing";
+
 pub struct QueueManager {
     /// Active jobs keyed by job ID.
     jobs: Mutex<HashMap<String, JobState>>,
@@ -1249,10 +1834,24 @@ pub struct QueueManager {
     /// Keeping this separate from ordinary per-job pause state means that
     /// `resume_all` only resumes work stopped by `pause_all`.
     globally_paused_jobs: Mutex<HashSet<String>>,
-    /// Set while the current global pause was applied by the disk-space
-    /// guard rather than the user; holds when the guard tripped. The guard
-    /// lifts only pauses it owns.
-    disk_space_hold: Mutex<Option<DateTime<Utc>>>,
+    /// Everything currently holding the queue paused. Holds are additive:
+    /// the queue is paused while any of them is set, and resumes when the
+    /// last one is lifted. A disk-space hold that overlaps a pause window
+    /// therefore does not swallow the window, and the window ending does not
+    /// lift the disk hold.
+    pause_holds: Mutex<PauseHolds>,
+    /// Servers the schedule has taken out of rotation, as configured by the
+    /// user. The live list is the configured list with these disabled.
+    schedule_disabled_servers: Mutex<Vec<String>>,
+    /// The configured server list, before the schedule's overlay. Held so the
+    /// overlay can be recomputed whenever either side changes.
+    configured_servers: Mutex<Vec<ServerConfig>>,
+    /// The user's configured speed limit, which the schedule's cap overlays.
+    /// Zero means unlimited.
+    configured_speed_limit_bps: AtomicU64,
+    /// The cap the schedule currently imposes, if any. Overlays the
+    /// configured limit; `None` means the configured limit applies.
+    scheduled_speed_cap: Mutex<Option<u64>>,
     /// Global speed tracker.
     speed: SpeedTracker,
     /// Database for persistence.
@@ -1279,8 +1878,18 @@ pub struct QueueManager {
     history_retries: Mutex<HashMap<String, String>>,
     /// Automatically keep the queue ordered by remaining percentage.
     auto_sort_remaining_pct: AtomicBool,
+    /// What admission does with an NZB matching a queued or history job.
+    duplicate_policy: Mutex<DuplicatePolicy>,
     /// Optional bounded post-processing hooks.
     postproc_scripts: Mutex<PostProcScriptConfig>,
+    /// Outbound notification targets for job outcomes and disk pressure.
+    notifier: Mutex<Arc<Notifier>>,
+    /// Action run once the queue drains, set by `change_complete_action`.
+    complete_action: Mutex<Option<String>>,
+    /// `queue_complete_pers`: keep the action after it has run once.
+    queue_complete_persist: AtomicBool,
+    /// `par2.trust_inflight_verify`: let post-processing accept the slice map.
+    trust_inflight_verify: AtomicBool,
     /// Stage-specific resource gates shared by all post-processing jobs.
     postproc_resources: Arc<PostProcResourcePool>,
     /// Category configs for post-processing decisions.
@@ -1303,6 +1912,9 @@ pub struct QueueManager {
     early_failure_check: bool,
     /// Canonical article dispatcher owned by `nzb-dispatch`.
     dispatch: Arc<dyn DispatchEngine>,
+    /// Per-server connection budgets the dispatcher draws from. Every other
+    /// NNTP consumer of the same servers (WebDAV) must draw from these too.
+    server_budgets: Arc<nzb_nntp::budget::BudgetRegistry>,
     /// Minimum effective completion percentage, including usable PAR2 capacity.
     required_completion_pct: f64,
 }
@@ -1310,6 +1922,25 @@ pub struct QueueManager {
 impl QueueManager {
     const GLOBAL_PAUSED_JOBS_SETTING: &'static str = "globally_paused_job_ids";
     const DISK_SPACE_HOLD_SETTING: &'static str = "disk_space_hold_since";
+    /// Every pause-window occurrence currently open.
+    const SCHEDULE_WINDOWS_SETTING: &'static str = "schedule_pause_windows";
+    /// The occurrences that have already paused the queue.
+    const SCHEDULE_TRIGGERED_SETTING: &'static str = "schedule_triggered_windows";
+    /// The occurrences the user has resumed by hand.
+    const SCHEDULE_RESUMED_SETTING: &'static str = "schedule_resumed_windows";
+    /// The occurrences a timed user pause is exempting.
+    const SCHEDULE_USER_PAUSED_SETTING: &'static str = "schedule_user_paused_windows";
+    /// The user's own hold, stored as its own flag.
+    const USER_HOLD_SETTING: &'static str = "user_pause_hold";
+    /// The schedule's own hold, stored as its own flag.
+    const SCHEDULE_HOLD_SETTING: &'static str = "schedule_pause_hold";
+    /// Whether the schedule itself applied the pause. Only read for records
+    /// written before each hold carried its own flag.
+    const PAUSE_OWNER_SETTING: &'static str = "global_pause_owner";
+    const PAUSE_OWNER_USER: &'static str = "user";
+    const PAUSE_OWNER_DISK: &'static str = "disk_space";
+    const PAUSE_OWNER_SCHEDULE: &'static str = "schedule";
+    const QUEUE_COMPLETE_ACTION_SETTING: &'static str = "queue_complete_action";
 
     /// Create a new queue manager.
     #[allow(clippy::too_many_arguments)]
@@ -1376,11 +2007,14 @@ impl QueueManager {
         let download_bps = NonZeroU32::new(u32::try_from(speed_limit_bps).unwrap_or(u32::MAX));
         let bandwidth = Arc::new(BandwidthLimiter::new(BandwidthConfig { download_bps }));
 
+        let configured_servers = servers.clone();
         let servers_arc = Arc::new(Mutex::new(servers));
-        let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::new(
+        let server_budgets = Arc::new(nzb_nntp::budget::BudgetRegistry::default());
+        let dispatch: Arc<dyn DispatchEngine> = Arc::new(DispatchHandle::with_budgets(
             Arc::clone(&servers_arc),
             Arc::clone(&bandwidth),
             article_timeout_secs,
+            Arc::clone(&server_budgets),
         ));
         dispatch.start();
 
@@ -1394,7 +2028,11 @@ impl QueueManager {
             progress_shutdown: watch::channel(false).0,
             pause_transition: Mutex::new(()),
             globally_paused_jobs: Mutex::new(HashSet::new()),
-            disk_space_hold: Mutex::new(None),
+            pause_holds: Mutex::new(PauseHolds::default()),
+            schedule_disabled_servers: Mutex::new(Vec::new()),
+            configured_servers: Mutex::new(configured_servers),
+            configured_speed_limit_bps: AtomicU64::new(speed_limit_bps),
+            scheduled_speed_cap: Mutex::new(None),
             speed: SpeedTracker::new(),
             db: Mutex::new(db),
             incomplete_dir: Mutex::new(incomplete_dir),
@@ -1407,7 +2045,12 @@ impl QueueManager {
             max_active_downloads: AtomicUsize::new(max_active_downloads),
             history_retries: Mutex::new(HashMap::new()),
             auto_sort_remaining_pct: AtomicBool::new(false),
+            duplicate_policy: Mutex::new(DuplicatePolicy::default()),
             postproc_scripts: Mutex::new(PostProcScriptConfig::default()),
+            notifier: Mutex::new(Arc::new(Notifier::disabled())),
+            complete_action: Mutex::new(None),
+            queue_complete_persist: AtomicBool::new(false),
+            trust_inflight_verify: AtomicBool::new(true),
             postproc_resources: PostProcResourcePool::new(postproc_limits),
             categories: Mutex::new(categories),
             min_free_space: AtomicU64::new(min_free_space),
@@ -1415,6 +2058,7 @@ impl QueueManager {
             direct_unpack_enabled: AtomicBool::new(direct_unpack),
             max_nested_archive_depth,
             dispatch,
+            server_budgets,
             abort_hopeless,
             early_failure_check,
             required_completion_pct: required_completion_pct.clamp(100.0, 200.0),
@@ -1494,15 +2138,20 @@ impl QueueManager {
         self.add_tx.subscribe()
     }
 
-    /// Per-server `(server_id, active, limit)` triples for the live NNTP
-    /// connection pool. `active` is by-construction `<= limit` because the
-    /// pool is semaphore-backed.
+    /// Per-server `(server_id, open_sockets, limit)` triples for the live
+    /// NNTP connection pool: sockets that are connected and authenticated,
+    /// busy or idle (WI-2081). This is what `/api/status.nntp_connections[].connected`
+    /// and the SABnzbd `fullstatus` `serveractiveconn` report. `open_sockets`
+    /// is `<= limit` by construction.
     pub fn connection_snapshot(&self) -> Vec<(String, usize, usize)> {
         self.dispatch.connection_snapshot()
     }
 
-    /// Per-server sockets actively transferring articles. Connected workers
-    /// waiting for work are reported as free capacity.
+    /// Per-server `(server_id, transferring, limit)` triples: sockets in the
+    /// middle of an article fetch at this instant. Open sockets waiting for
+    /// work are not counted here; see [`Self::connection_snapshot`] for
+    /// those. Despite the name this is the *activity* count, not the
+    /// connected count — `/api/status` exposes it as `active`.
     pub fn connected_snapshot(&self) -> Vec<(String, usize, usize)> {
         self.dispatch.active_connection_snapshot()
     }
@@ -1578,10 +2227,97 @@ impl QueueManager {
         }
     }
 
-    /// Set max active downloads and start queued jobs if capacity allows.
+    /// Set max active downloads.
+    ///
+    /// Raising the limit (or setting it to 0, which means unlimited) starts
+    /// queued jobs up to the new capacity. Lowering it requeues the extra
+    /// active downloads — lowest priority, and within a priority the newest
+    /// in queue order — so the active count matches the setting. A requeued
+    /// job is paused in the dispatcher, which keeps its context and progress;
+    /// it resumes through the normal slot claim once capacity frees up.
     pub fn set_max_active_downloads(self: &Arc<Self>, max: usize) {
         self.max_active_downloads.store(max, Ordering::Relaxed);
+        self.requeue_over_limit();
         self.start_next_queued();
+    }
+
+    /// Move downloading jobs above `max_active_downloads` back to `Queued`.
+    ///
+    /// `max == 0` is unlimited and requeues nothing. Selection mirrors
+    /// preemption: the job with the lowest priority loses its slot, and ties
+    /// go to the one furthest down the queue (newest). The dispatcher's
+    /// pause keeps the in-flight context, so progress is not discarded.
+    fn requeue_over_limit(self: &Arc<Self>) {
+        let max = self.max_active_downloads.load(Ordering::Relaxed);
+        if max == 0 {
+            return;
+        }
+        loop {
+            let victim = {
+                let jobs = self.jobs.lock();
+                let order = self.job_order.lock();
+                let active = jobs
+                    .values()
+                    .filter(|s| s.job.status == JobStatus::Downloading)
+                    .count();
+                if active <= max {
+                    return;
+                }
+                let mut worst: Option<(String, u8, usize)> = None;
+                for (idx, id) in order.iter().enumerate() {
+                    if let Some(state) = jobs.get(id)
+                        && state.job.status == JobStatus::Downloading
+                    {
+                        let priority = state.job.priority as u8;
+                        if worst.as_ref().is_none_or(|(_, wp, widx)| {
+                            priority < *wp || (priority == *wp && idx > *widx)
+                        }) {
+                            worst = Some((id.clone(), priority, idx));
+                        }
+                    }
+                }
+                worst.map(|(id, _, _)| id)
+            };
+            let Some(id) = victim else {
+                return;
+            };
+            info!(
+                job_id = %id,
+                max_downloads = max,
+                "Requeueing active download: concurrent-jobs limit lowered"
+            );
+            // Pause first so workers stop pulling this job's articles. The
+            // context stays in the dispatcher; resume unpauses it.
+            self.dispatch.pause_job(&id);
+            let mut jobs = self.jobs.lock();
+            let Some(state) = jobs.get_mut(&id) else {
+                continue;
+            };
+            if state.job.status != JobStatus::Downloading {
+                continue;
+            }
+            state.job.status = JobStatus::Queued;
+            state.persisted_status = Some(JobStatus::Queued);
+            let db = self.db.lock();
+            let _ = db.queue_update_progress(
+                &id,
+                JobStatus::Queued,
+                state.job.downloaded_bytes,
+                state.job.articles_downloaded,
+                state.job.articles_failed,
+                state.job.files_completed,
+            );
+        }
+    }
+
+    /// Set what admission does with an NZB that matches a queued or history
+    /// job by name or content digest.
+    pub fn set_duplicate_policy(&self, policy: DuplicatePolicy) {
+        *self.duplicate_policy.lock() = policy;
+    }
+
+    pub fn duplicate_policy(&self) -> DuplicatePolicy {
+        *self.duplicate_policy.lock()
     }
 
     /// Enable or disable automatic remaining-percentage ordering.
@@ -1613,6 +2349,84 @@ impl QueueManager {
             timeout: Duration::from_secs(timeout_secs.max(1)),
             max_output_bytes,
         };
+    }
+
+    /// Replace the notification targets. Takes effect for events raised after
+    /// the call; in-flight deliveries finish with the previous targets.
+    pub fn set_notifications(&self, config: &NotificationConfig) {
+        *self.notifier.lock() = Arc::new(Notifier::from_config(config));
+    }
+
+    /// Send a notification about a job or the disk guard, if any target is set.
+    fn notify(&self, event: NotificationEvent) {
+        let notifier = Arc::clone(&self.notifier.lock());
+        notifier.notify(event);
+    }
+
+    /// The action `change_complete_action` set, to run once the queue drains.
+    pub fn queue_complete_action(&self) -> Option<String> {
+        self.complete_action.lock().clone()
+    }
+
+    /// Set `change_complete_action`; `None` or an empty value clears it. The
+    /// only action RustNZB runs is `script_<name>`, a script from
+    /// `scripts_dir`, which is checked here so a bad name is refused up front.
+    /// Shutdown, hibernate and standby are refused: RustNZB cannot act on the
+    /// host, and accepting them would silently do nothing.
+    pub fn set_queue_complete_action(&self, action: Option<&str>) -> Result<(), String> {
+        let action = action
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        if let Some(action) = action.as_deref() {
+            let Some(script) = action.strip_prefix("script_") else {
+                return Err(format!(
+                    "unsupported complete action '{action}': only script_<name> is supported"
+                ));
+            };
+            let scripts_dir = self.postproc_scripts.lock().scripts_dir.clone();
+            resolve_script_path(scripts_dir.as_deref(), std::path::Path::new(script))
+                .map_err(|error| format!("unable to use script '{script}': {error}"))?;
+        }
+        self.store_queue_complete_action(action);
+        Ok(())
+    }
+
+    /// Persist and apply the complete action (`None` clears it).
+    fn store_queue_complete_action(&self, action: Option<String>) {
+        self.db.lock().set_setting(
+            Self::QUEUE_COMPLETE_ACTION_SETTING,
+            action.as_deref().unwrap_or_default(),
+        );
+        *self.complete_action.lock() = action;
+    }
+
+    /// Set `queue_complete_pers`, from the `general` config.
+    pub fn set_queue_complete_persist(&self, persist: bool) {
+        self.queue_complete_persist.store(persist, Ordering::SeqCst);
+    }
+
+    /// `par2.trust_inflight_verify`: false makes post-processing verify every
+    /// PAR2 set from disk. Applies to post-processing started afterwards.
+    pub fn set_trust_inflight_verify(&self, on: bool) {
+        self.trust_inflight_verify.store(on, Ordering::SeqCst);
+    }
+
+    /// `par2.defer_volumes`: hold PAR2 recovery volumes until the slice map
+    /// shows damage. Applies to downloads started afterwards.
+    pub fn set_defer_par2_volumes(&self, on: bool) {
+        self.dispatch.set_defer_par2_volumes(on);
+    }
+
+    /// Start the complete action in the background, for callers that are not
+    /// async. Without a Tokio runtime there is nothing to run it on, so the
+    /// action is skipped.
+    fn spawn_queue_complete_action(self: &Arc<Self>) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let qm = Arc::clone(self);
+        tokio::spawn(async move { qm.run_queue_complete_action().await });
     }
 
     /// Stable sort of the queue by remaining work percentage. The original
@@ -1655,11 +2469,35 @@ impl QueueManager {
         self.postproc_resources.snapshot()
     }
 
-    /// Set the download speed limit in bytes per second (0 = unlimited).
+    /// Set the configured download speed limit in bytes per second
+    /// (0 = unlimited).
+    ///
+    /// This is the user's value. An active schedule cap overrides it until
+    /// the window ends, at which point this value comes back.
     pub fn set_speed_limit(&self, bps: u64) {
+        self.configured_speed_limit_bps.store(bps, Ordering::SeqCst);
+        self.apply_effective_speed_limit();
+    }
+
+    /// The user's configured speed limit, before any schedule cap.
+    pub fn configured_speed_limit(&self) -> u64 {
+        self.configured_speed_limit_bps.load(Ordering::SeqCst)
+    }
+
+    /// Apply the schedule's cap over the configured limit. `None` lifts it.
+    fn set_scheduled_speed_cap(&self, cap: Option<u64>) {
+        *self.scheduled_speed_cap.lock() = cap;
+        self.apply_effective_speed_limit();
+    }
+
+    fn apply_effective_speed_limit(&self) {
         use std::num::NonZeroU32;
+        let effective = self
+            .scheduled_speed_cap
+            .lock()
+            .unwrap_or(self.configured_speed_limit());
         // Saturate rather than wrap: `as u32` turns 4 GiB/s + 1 into 1 B/s.
-        let limit = NonZeroU32::new(u32::try_from(bps).unwrap_or(u32::MAX));
+        let limit = NonZeroU32::new(u32::try_from(effective).unwrap_or(u32::MAX));
         self.bandwidth.set_download_bps(limit);
     }
 
@@ -1751,6 +2589,7 @@ impl QueueManager {
                 if let Some(tracker) = state.hopeless_tracker.as_mut() {
                     tracker.reset_progress_clock();
                 }
+                state.persisted_status = Some(JobStatus::Downloading);
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     job_id,
@@ -1778,6 +2617,18 @@ impl QueueManager {
         job: NzbJob,
         nzb_data: Option<Vec<u8>>,
     ) -> crate::nzb_core::Result<()> {
+        self.admit_job(job, nzb_data, true)
+    }
+
+    /// Shared admission path for [`Self::add_job`] and history retries. A
+    /// retry passes `enforce_duplicates: false`, because its own history row
+    /// would otherwise match the job it is re-queuing.
+    fn admit_job(
+        self: &Arc<Self>,
+        job: NzbJob,
+        nzb_data: Option<Vec<u8>>,
+        enforce_duplicates: bool,
+    ) -> crate::nzb_core::Result<()> {
         if crate::nzb_core::path::safe_component(&job.category).is_none() {
             return Err(crate::nzb_core::NzbError::Other(
                 "category must be a single safe path component".to_string(),
@@ -1804,12 +2655,17 @@ impl QueueManager {
                 "job output directory is outside configured storage roots".to_string(),
             ));
         }
-        // Ensure work directory exists
-        std::fs::create_dir_all(&job.work_dir)?;
-
-        // Persist to DB
+        // Persist to DB. The duplicate check runs under the same lock as the
+        // insert, so two identical uploads cannot both pass it.
         {
             let db = self.db.lock();
+            if enforce_duplicates {
+                let digest = nzb_data.as_deref().map(nzb_digest);
+                self.check_duplicate_admission(&db, &job, digest.as_deref())?;
+            }
+            // Ensure work directory exists. This follows the check so a
+            // refused NZB leaves no directory behind.
+            std::fs::create_dir_all(&job.work_dir)?;
             db.queue_insert(&job)?;
             // Store raw NZB data if available
             if let Some(ref data) = nzb_data {
@@ -1851,11 +2707,16 @@ impl QueueManager {
             return Ok(QueueAdmissionOutcome::Existing(observation.admission));
         }
 
-        std::fs::create_dir_all(&job.work_dir)?;
-        let outcome =
-            self.db
-                .lock()
-                .queue_admit(&job, &nzb_data, idempotency_key, payload_digest)?;
+        let outcome = {
+            let mut db = self.db.lock();
+            // The policy applies to a first admission only. A key that is
+            // already bound is answered as a replay, not as a duplicate.
+            if db.queue_admission_observe(idempotency_key)?.is_none() {
+                self.check_duplicate_admission(&db, &job, Some(&nzb_digest(&nzb_data)))?;
+            }
+            std::fs::create_dir_all(&job.work_dir)?;
+            db.queue_admit(&job, &nzb_data, idempotency_key, payload_digest)?
+        };
         match &outcome {
             QueueAdmissionOutcome::Inserted(_) => {
                 self.activate_admitted_job(job, Some(nzb_data));
@@ -1880,6 +2741,55 @@ impl QueueManager {
         idempotency_key: &str,
     ) -> crate::nzb_core::Result<Option<QueueAdmissionObservation>> {
         self.db.lock().queue_admission_observe(idempotency_key)
+    }
+
+    /// Apply the duplicate policy to an incoming job. The caller holds the
+    /// database lock, so the match cannot change before the job is inserted.
+    /// `Skip` refuses the job; `Warn` admits it and records the match.
+    fn check_duplicate_admission(
+        &self,
+        db: &Database,
+        job: &NzbJob,
+        digest: Option<&str>,
+    ) -> crate::nzb_core::Result<()> {
+        let policy = self.duplicate_policy();
+        if policy == DuplicatePolicy::Allow {
+            return Ok(());
+        }
+        let matches = db.find_duplicate_candidates(&job.name, digest)?;
+        let Some(first) = matches
+            .iter()
+            .find(|candidate| candidate.by_digest)
+            .or(matches.first())
+        else {
+            return Ok(());
+        };
+        let location = match first.location {
+            DuplicateLocation::Queue => "queue",
+            DuplicateLocation::History => "history",
+        };
+        let matched_by = match (first.by_name, first.by_digest) {
+            (true, true) => "name and content",
+            (true, false) => "name",
+            _ => "content",
+        };
+        if policy == DuplicatePolicy::Skip {
+            crate::increment_counter("jobs.duplicate_refused");
+            return Err(crate::nzb_core::NzbError::DuplicateNzb(format!(
+                "\"{}\" duplicates {location} job \"{}\" by {matched_by}",
+                job.name, first.name
+            )));
+        }
+        crate::increment_counter("jobs.duplicate_admitted");
+        warn!(
+            name = %job.name,
+            matched_id = %first.id,
+            matched_name = %first.name,
+            location,
+            matched_by,
+            "NZB duplicates an existing job; admitted because duplicate_policy is warn"
+        );
+        Ok(())
     }
 
     /// Activate an already-persisted job: emit the added event and place it in
@@ -1920,11 +2830,14 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                repair_fold: None,
                 download_time_secs: None,
                 prior_download_secs: 0.0,
                 carried_bytes,
                 failure_code: None,
+                par2_volumes: None,
                 output_dir_claimed: false,
+                persisted_status: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             if !requested_paused {
@@ -1945,11 +2858,14 @@ impl QueueManager {
             nzb_data,
             direct_unpacker: None,
             hopeless_tracker: None,
+            repair_fold: None,
             download_time_secs: None,
             prior_download_secs: 0.0,
             carried_bytes,
             failure_code: None,
+            par2_volumes: None,
             output_dir_claimed: false,
+            persisted_status: None,
         };
         self.jobs.lock().insert(job_id.clone(), state);
         self.job_order.lock().push(job_id);
@@ -1996,7 +2912,7 @@ impl QueueManager {
             original_id = %entry.id,
             "Retrying NZB from history"
         );
-        self.add_job(job, Some(nzb_data))?;
+        self.admit_job(job, Some(nzb_data), false)?;
         retries.insert(entry.id.clone(), job_id.clone());
         Ok(HistoryRetryOutcome::Started(job_id))
     }
@@ -2013,7 +2929,10 @@ impl QueueManager {
         nzb_data: &[u8],
         retry_data: Option<&[u8]>,
     ) -> crate::nzb_core::Result<NzbJob> {
-        let mut job = nzb_parser::parse_nzb(&entry.name, nzb_data)?;
+        let parse_started = std::time::Instant::now();
+        let mut job = tracing::info_span!("nzb_parse", name = %entry.name, bytes = nzb_data.len())
+            .in_scope(|| nzb_parser::parse_nzb(&entry.name, nzb_data))?;
+        crate::record_stage("parse", parse_started.elapsed().as_secs_f64());
         job.category = entry.category.clone();
         job.output_dir = self.output_dir_for(&job.category, &job.name)?;
         job.work_dir = self.incomplete_dir().join(&job.id);
@@ -2123,17 +3042,40 @@ impl QueueManager {
                 "Paused job due to low disk space on a job storage volume"
             );
             let mut jobs = self.jobs.lock();
+            let mut alert = None;
             if let Some(state) = jobs.get_mut(job_id) {
+                // Notify once per hold, not on every re-check of a held job.
+                if state.failure_code != Some(JobFailureCode::StorageUnavailable) {
+                    alert = Some(
+                        NotificationEvent::new(
+                            NotificationKind::DiskFull,
+                            "Disk space low",
+                            "Downloads paused: free space on a storage volume is below the minimum.",
+                        )
+                        .for_job(&state.job.name, &state.job.category),
+                    );
+                }
                 state.job.status = JobStatus::Paused;
                 state.job.error_message = Some("Paused: low disk space".to_string());
                 state.failure_code = Some(JobFailureCode::StorageUnavailable);
             }
+            drop(jobs);
+            if let Some(alert) = alert {
+                self.notify(alert);
+            }
             return;
         }
 
+        // Dispatch/queue wait: time since the job was queued. A job resumed
+        // after a restart counts from its original add time.
+        let queue_wait = (chrono::Utc::now() - job.added_at)
+            .to_std()
+            .unwrap_or_default();
+        crate::record_stage("queue_wait", queue_wait.as_secs_f64());
         info!(
             job_id = %job_id,
             name = %job.name,
+            queue_wait_secs = queue_wait.as_secs_f64(),
             total_bytes = job.total_bytes,
             article_count = job.article_count,
             file_count = job.file_count,
@@ -2204,6 +3146,7 @@ impl QueueManager {
         let mut last_db_update = Instant::now();
         let mut shutdown = self.progress_shutdown.subscribe();
         let mut draining = false;
+        let mut ledger = LedgerRecorder::default();
 
         loop {
             let update = tokio::select! {
@@ -2224,7 +3167,30 @@ impl QueueManager {
                     continue;
                 }
             };
+            // Write buffered ledger evidence before a terminal article or job
+            // event, so it sees every outcome that led to it. Other events
+            // leave the batch to fill.
+            if matches!(
+                update,
+                ProgressUpdate::ArticleFailed { .. }
+                    | ProgressUpdate::JobFinished { .. }
+                    | ProgressUpdate::JobAborted { .. }
+            ) {
+                self.flush_ledger(&job_id, &mut ledger);
+            }
             match update {
+                ProgressUpdate::ArticleOutcome {
+                    file_id,
+                    segment_number,
+                    message_id,
+                    outcome,
+                    ..
+                } => {
+                    ledger.push(file_id, segment_number, message_id, outcome);
+                    if ledger.is_full() {
+                        self.flush_ledger(&job_id, &mut ledger);
+                    }
+                }
                 ProgressUpdate::WaitingForProviders { message, .. } => {
                     let mut changed = false;
                     {
@@ -2445,7 +3411,7 @@ impl QueueManager {
 
                     // Batch DB writes (every 2 seconds)
                     if last_db_update.elapsed() >= Duration::from_secs(2) {
-                        self.persist_job_progress(&job_id);
+                        self.persist_job_progress_blocking(&job_id).await;
                         last_db_update = Instant::now();
                     }
                     if self.auto_sort_remaining_pct() {
@@ -2630,8 +3596,44 @@ impl QueueManager {
                     success,
                     articles_failed,
                     download_time_secs,
+                    slice_map,
+                    repair_fold,
                     ..
                 } => {
+                    // The slice map gives the exact damage: refuse to hand a
+                    // release to PAR2 when it holds more damaged slices than
+                    // recovery slices (WI-145).
+                    let diagnosis = self
+                        .abort_hopeless
+                        .then(|| {
+                            let map = slice_map.as_ref()?;
+                            let jobs = self.jobs.lock();
+                            let tracker = jobs.get(&job_id)?.hopeless_tracker.as_ref()?;
+                            let declared = tracker
+                                .recovery_blocks_known
+                                .then(|| tracker.recovery_blocks_available());
+                            parity_diagnosis(map, declared)
+                        })
+                        .flatten();
+                    if let Some(diagnosis) = diagnosis {
+                        warn!(
+                            job_id = %job_id,
+                            tier = "parity",
+                            reason = %diagnosis,
+                            "Job is hopeless — not repairable"
+                        );
+                        if let Some(state) = self.jobs.lock().get_mut(&job_id) {
+                            state.job.slice_map = slice_map;
+                        }
+                        self.finish_aborted(
+                            &job_id,
+                            format!("Aborted: {diagnosis}"),
+                            articles_failed,
+                            download_time_secs,
+                        )
+                        .await;
+                        break;
+                    }
                     let repairable_damage = self.jobs.lock().get(&job_id).is_some_and(|state| {
                         state.hopeless_tracker.as_ref().is_some_and(|tracker| {
                             let usable = tracker
@@ -2654,7 +3656,9 @@ impl QueueManager {
                     // The final article has resolved, so no worker can write
                     // another segment for this job. Release the worker-pool
                     // context now to close its persistent assembler handles
-                    // before PAR2/unpack opens the completed files.
+                    // before PAR2/unpack opens the completed files. Read the
+                    // volumes it left held first, for the history row.
+                    let held = self.dispatch.held_par2_files(&job_id).unwrap_or_default();
                     self.dispatch.release_completed_job(&job_id);
 
                     // Mark as PostProcessing immediately so the slot is freed
@@ -2667,6 +3671,9 @@ impl QueueManager {
                                 Some(state.prior_download_secs + download_time_secs);
                             state.job.status = JobStatus::PostProcessing;
                             state.job.completed_at = Some(chrono::Utc::now());
+                            state.job.slice_map = slice_map;
+                            state.repair_fold = repair_fold;
+                            state.par2_volumes = par2_volume_counts(&state.job, &held);
                         }
                     }
                     self.history_changed();
@@ -2682,58 +3689,102 @@ impl QueueManager {
                     download_time_secs,
                     ..
                 } => {
-                    crate::increment_counter("jobs.hopeless_aborts");
-                    warn!(
-                        job_id = %job_id,
-                        reason = %reason,
-                        articles_failed,
-                        "Job aborted by download engine"
-                    );
-                    // The terminal update is emitted only after queued and
-                    // in-flight articles drain. Dropping this context closes
-                    // all assembler handles before history or any later stage
-                    // can inspect the work directory.
-                    self.dispatch.release_completed_job(&job_id);
-                    {
-                        let mut jobs = self.jobs.lock();
-                        if let Some(state) = jobs.get_mut(&job_id) {
-                            state.download_time_secs =
-                                Some(state.prior_download_secs + download_time_secs);
-                            state.job.status = JobStatus::Failed;
-                            state.job.error_message = Some(reason.clone());
-                            state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
-                            state.job.articles_failed =
-                                state.job.articles_failed.max(articles_failed);
-                            state.job.completed_at = Some(chrono::Utc::now());
-                            let tracker = state.hopeless_tracker.as_ref();
-                            warn!(
-                                job_id = %job_id,
-                                terminal_reason = %reason,
-                                missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
-                                usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
-                                recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
-                                recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
-                                "Terminal job summary"
-                            );
-                            // Confirmed hopeless damage must not enter PAR2,
-                            // extraction, or cleanup. Persist the original
-                            // reason directly as a failed history row.
-                            self.move_to_history(state, Vec::new());
-                        }
-                    }
-                    self.persist_job_progress(&job_id);
-                    self.start_next_queued();
-                    let jid = job_id.clone();
-                    let qm = Arc::clone(&self);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(8)).await;
-                        qm.jobs.lock().remove(&jid);
-                        qm.job_order.lock().retain(|id| id != &jid);
-                    });
+                    self.finish_aborted(&job_id, reason, articles_failed, download_time_secs)
+                        .await;
                     break;
                 }
             }
         }
+        self.flush_ledger(&job_id, &mut ledger);
+    }
+
+    /// Tear down a job the download stopped as hopeless: record the failure
+    /// with `reason` and move it straight to history, skipping PAR2,
+    /// extraction and cleanup.
+    async fn finish_aborted(
+        self: &Arc<Self>,
+        job_id: &str,
+        reason: String,
+        articles_failed: usize,
+        download_time_secs: f64,
+    ) {
+        crate::increment_counter("jobs.hopeless_aborts");
+        warn!(
+            job_id = %job_id,
+            reason = %reason,
+            articles_failed,
+            "Job aborted by download engine"
+        );
+        // The terminal update is emitted only after queued and
+        // in-flight articles drain. Dropping this context closes
+        // all assembler handles before history or any later stage
+        // can inspect the work directory.
+        self.dispatch.release_completed_job(job_id);
+        let queue_drained = {
+            let mut jobs = self.jobs.lock();
+            let finished = if let Some(state) = jobs.get_mut(job_id) {
+                state.download_time_secs = Some(state.prior_download_secs + download_time_secs);
+                state.job.status = JobStatus::Failed;
+                state.job.error_message = Some(reason.clone());
+                state.failure_code = Some(JobFailureCode::ArticlesUnavailable);
+                state.job.articles_failed = state.job.articles_failed.max(articles_failed);
+                state.job.completed_at = Some(chrono::Utc::now());
+                let tracker = state.hopeless_tracker.as_ref();
+                warn!(
+                    job_id = %job_id,
+                    terminal_reason = %reason,
+                    missing_content_bytes = tracker.map_or(0, |t| t.content_bytes_missing),
+                    usable_recovery_bytes = tracker.map_or(0, |t| t.recovery_capacity_bytes.saturating_sub(t.recovery_bytes_unavailable)),
+                    recovery_blocks_total = tracker.map_or(0, |t| t.recovery_blocks_total),
+                    recovery_blocks_unavailable = tracker.map_or(0, |t| t.recovery_blocks_unavailable),
+                    "Terminal job summary"
+                );
+                // Confirmed hopeless damage must not enter PAR2,
+                // extraction, or cleanup. Persist the original
+                // reason directly as a failed history row.
+                self.move_to_history(state, Vec::new());
+                true
+            } else {
+                false
+            };
+            finished && queue_drained_by(&jobs, job_id)
+        };
+        self.persist_job_progress_blocking(job_id).await;
+        self.start_next_queued();
+        if queue_drained {
+            self.run_queue_complete_action().await;
+        }
+        let jid = job_id.to_string();
+        let qm = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            qm.jobs.lock().remove(&jid);
+            qm.job_order.lock().retain(|id| id != &jid);
+        });
+    }
+
+    /// Ids of the servers a fetch could use; they fingerprint ledger records.
+    fn enabled_server_ids(&self) -> Vec<String> {
+        self.servers
+            .lock()
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Write a job's buffered article outcomes to the damage ledger.
+    fn flush_ledger(&self, job_id: &str, ledger: &mut LedgerRecorder) {
+        if ledger.is_empty() {
+            return;
+        }
+        if ledger.needs_file_index()
+            && let Some(state) = self.jobs.lock().get(job_id)
+        {
+            ledger.set_file_order(state.job.files.iter().map(|f| f.id.as_str()));
+        }
+        let enabled = self.enabled_server_ids();
+        ledger.flush(job_id, &self.db.lock(), &enabled);
     }
 
     /// Called when a job's download phase completes.
@@ -2762,6 +3813,8 @@ impl QueueManager {
             password,
             content_articles_failed,
             delete_archives,
+            slice_map,
+            repair_fold,
         ) = {
             let mut jobs = self.jobs.lock();
             let Some(state) = jobs.get_mut(job_id) else {
@@ -2797,10 +3850,12 @@ impl QueueManager {
                 pw,
                 content_failed,
                 state.job.delete_archives.unwrap_or(true),
+                state.job.slice_map.clone(),
+                state.repair_fold.take(),
             )
         };
         // Record the reserved folder so a restart resumes into it.
-        self.persist_job_progress(job_id);
+        self.persist_job_progress_blocking(job_id).await;
 
         // Repair and extraction can write to both the incomplete and the
         // category output volumes. Apply the same guard to both paths before
@@ -2809,24 +3864,32 @@ impl QueueManager {
             self.min_free_space(),
             [work_dir.as_path(), output_dir.as_path()].as_slice(),
         ) {
-            let mut jobs = self.jobs.lock();
-            if let Some(state) = jobs.get_mut(job_id) {
-                let message = "Insufficient free disk space for post-processing".to_string();
-                state.job.status = JobStatus::Failed;
-                state.job.error_message = Some(message.clone());
-                self.move_to_history(
-                    state,
-                    vec![StageResult {
-                        name: "Disk".into(),
-                        status: StageStatus::Failed,
-                        message: Some(message),
-                        duration_secs: 0.0,
-                    }],
-                );
-            }
-            drop(jobs);
-            self.persist_job_progress(job_id);
+            let queue_drained = {
+                let mut jobs = self.jobs.lock();
+                let finished = if let Some(state) = jobs.get_mut(job_id) {
+                    let message = POSTPROC_DISK_FULL_MESSAGE.to_string();
+                    state.job.status = JobStatus::Failed;
+                    state.job.error_message = Some(message.clone());
+                    self.move_to_history(
+                        state,
+                        vec![StageResult {
+                            name: "Disk".into(),
+                            status: StageStatus::Failed,
+                            message: Some(message),
+                            duration_secs: 0.0,
+                        }],
+                    );
+                    true
+                } else {
+                    false
+                };
+                finished && queue_drained_by(&jobs, job_id)
+            };
+            self.persist_job_progress_blocking(job_id).await;
             self.start_next_queued();
+            if queue_drained {
+                self.run_queue_complete_action().await;
+            }
             let qm = Arc::clone(self);
             let jid = job_id.to_string();
             tokio::spawn(async move {
@@ -2896,20 +3959,31 @@ impl QueueManager {
                 skip_extract: direct_unpack_success,
                 password: password.clone(),
                 max_nested_archive_depth: self.max_nested_archive_depth,
+                slice_map,
+                trust_inflight_verify: self.trust_inflight_verify.load(Ordering::SeqCst),
+                repair_fold,
             };
 
+            let pp_span = tracing::info_span!(parent: None, "postproc", job_id = %job_id, pp_level);
             let result = if pp_level >= 2 {
-                run_pipeline_with_cleanup(
-                    &work_dir,
-                    &config,
-                    Some(&self.postproc_resources),
-                    &cleanup_patterns,
-                    &unwanted_extensions,
+                tracing::Instrument::instrument(
+                    run_pipeline_with_cleanup(
+                        &work_dir,
+                        &config,
+                        Some(&self.postproc_resources),
+                        &cleanup_patterns,
+                        &unwanted_extensions,
+                    ),
+                    pp_span,
                 )
                 .await
             } else {
                 // Repair only (SABnzbd `pp=1`): the archives are the output.
-                run_repair_pipeline(&work_dir, &config, Some(&self.postproc_resources)).await
+                tracing::Instrument::instrument(
+                    run_repair_pipeline(&work_dir, &config, Some(&self.postproc_resources)),
+                    pp_span,
+                )
+                .await
             };
 
             info!(
@@ -2966,7 +4040,7 @@ impl QueueManager {
             })
         };
         let script_stage = match script_status {
-            Some(status) => self.run_postproc_script(job_id, status).await,
+            Some(status) => self.run_postproc_script(job_id, status, &stages).await,
             None => None,
         };
         let mut stages = stages;
@@ -2983,16 +4057,25 @@ impl QueueManager {
             stages.push(stage);
         }
 
-        // Move to history with real stage results
-        {
+        // Move to history with real stage results. The drain check runs under
+        // the same lock, so only the completion that empties the queue sees it.
+        let queue_drained = {
             let mut jobs = self.jobs.lock();
-            if let Some(state) = jobs.get_mut(job_id) {
-                self.move_to_history(state, stages);
+            match jobs.get_mut(job_id) {
+                Some(state) => {
+                    self.move_to_history(state, stages);
+                    queue_drained_by(&jobs, job_id)
+                }
+                None => false,
             }
-        }
+        };
 
         // Persist final state
-        self.persist_job_progress(job_id);
+        self.persist_job_progress_blocking(job_id).await;
+
+        if queue_drained {
+            self.run_queue_complete_action().await;
+        }
 
         // Keep the completed/failed job visible in the queue briefly so the
         // UI has a chance to show the transition.  Fast downloads can go from
@@ -3011,6 +4094,7 @@ impl QueueManager {
         &self,
         job_id: &str,
         final_status: JobStatus,
+        stages: &[StageResult],
     ) -> Option<StageResult> {
         let (job, script_config) = {
             let jobs = self.jobs.lock();
@@ -3018,8 +4102,8 @@ impl QueueManager {
             (state.job.clone(), self.postproc_scripts.lock().clone())
         };
         let configured = match final_status {
-            JobStatus::Completed => script_config.success,
-            JobStatus::Failed => script_config.failure,
+            JobStatus::Completed => script_config.success.clone(),
+            JobStatus::Failed => script_config.failure.clone(),
             _ => None,
         }?;
         let started = Instant::now();
@@ -3035,92 +4119,72 @@ impl QueueManager {
             }
         };
 
-        let files = regular_output_files(&job.output_dir);
-        let file_list = files
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut command = tokio::process::Command::new(&script);
-        command
-            .current_dir(&job.output_dir)
-            .env("SAB_STATUS", final_status.to_string())
-            .env("SAB_JOB", &job.name)
-            .env("SAB_CAT", &job.category)
-            .env("SAB_FILENAME", &job.name)
-            .env("SAB_COMPLETE", &job.output_dir)
-            .env("SAB_BYTES", job.total_bytes.to_string())
-            .env("SAB_BYTES_DOWNLOADED", job.downloaded_bytes.to_string())
-            .env("SAB_FILES", file_list)
-            .env("RUSTNZB_STATUS", final_status.to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let args = postproc_script_args(&job, stages);
+        let pp_level = self.post_processing_level(&job);
+        let env = postproc_script_env(&job, final_status, stages, &script, pp_level);
+        Some(
+            run_bounded_script(
+                &script,
+                &job.output_dir,
+                &args,
+                env,
+                &script_config,
+                started,
+            )
+            .await,
+        )
+    }
+
+    /// Run the `script_<name>` set by `change_complete_action` once the queue
+    /// has drained. The script runs from the complete directory under the
+    /// post-processing limits. A failure is logged, so it is also listed as a
+    /// warning.
+    async fn run_queue_complete_action(&self) {
+        let Some(action) = self.queue_complete_action() else {
+            return;
+        };
+        let Some(script) = action.strip_prefix("script_") else {
+            return;
+        };
+        let config = self.postproc_scripts.lock().clone();
+        let complete_dir = self.complete_dir.lock().clone();
+        let path = match resolve_script_path(
+            config.scripts_dir.as_deref(),
+            std::path::Path::new(script),
+        ) {
+            Ok(path) => path,
             Err(error) => {
-                return Some(StageResult {
-                    name: "Script".into(),
-                    status: StageStatus::Failed,
-                    message: Some(format!("Unable to start post-processing script: {error}")),
-                    duration_secs: started.elapsed().as_secs_f64(),
-                });
+                warn!(script, %error, "Queue-complete script cannot be resolved");
+                self.reset_queue_complete_action();
+                return;
             }
         };
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let max_output_bytes = script_config.max_output_bytes;
-        let result = async {
-            let stdout_reader = async {
-                match stdout {
-                    Some(reader) => read_script_output(reader, max_output_bytes).await,
-                    None => Ok((Vec::new(), false)),
-                }
-            };
-            let stderr_reader = async {
-                match stderr {
-                    Some(reader) => read_script_output(reader, max_output_bytes).await,
-                    None => Ok((Vec::new(), false)),
-                }
-            };
-            let (stdout, stderr) = tokio::join!(stdout_reader, stderr_reader);
-            let stdout = stdout?;
-            let stderr = stderr?;
-            let status = child.wait().await?;
-            Ok::<_, io::Error>((status, stdout, stderr))
-        };
+        let stage = run_bounded_script(
+            &path,
+            &complete_dir,
+            &[],
+            Vec::new(),
+            &config,
+            Instant::now(),
+        )
+        .await;
+        if stage.status == StageStatus::Failed {
+            warn!(
+                script,
+                message = stage.message.as_deref().unwrap_or_default(),
+                "Queue-complete script failed"
+            );
+        } else {
+            info!(script, "Queue-complete script finished");
+        }
+        self.reset_queue_complete_action();
+    }
 
-        match tokio::time::timeout(script_config.timeout, result).await {
-            Ok(Ok((status, stdout, stderr))) if status.success() => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Success,
-                message: Some(script_output_message(&stdout, &stderr)),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
-            Ok(Ok((status, stdout, stderr))) => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Failed,
-                message: Some(format!(
-                    "Post-processing script exited with {status}: {}",
-                    script_output_message(&stdout, &stderr)
-                )),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
-            Ok(Err(error)) => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Failed,
-                message: Some(format!("Post-processing script failed: {error}")),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
-            Err(_) => Some(StageResult {
-                name: "Script".into(),
-                status: StageStatus::Failed,
-                message: Some(format!(
-                    "Post-processing script exceeded {} second timeout",
-                    script_config.timeout.as_secs()
-                )),
-                duration_secs: started.elapsed().as_secs_f64(),
-            }),
+    /// SABnzbd runs the action once and then resets it, unless the action is
+    /// persistent (`queue_complete_pers`).
+    fn reset_queue_complete_action(&self) {
+        if !self.queue_complete_persist.load(Ordering::SeqCst) {
+            self.store_queue_complete_action(None);
         }
     }
 
@@ -3236,6 +4300,7 @@ impl QueueManager {
         let retry_data =
             serde_json::to_vec(&checkpoint_for_job(&state.job, state.output_dir_claimed)).ok();
         let history_entry = HistoryEntry {
+            client_removal: None,
             id: state.job.id.clone(),
             name: state.job.name.clone(),
             category: state.job.category.clone(),
@@ -3255,6 +4320,8 @@ impl QueueManager {
             server_stats: state.job.server_stats.clone(),
             nzb_data: state.nzb_data.clone(),
             retry_data,
+            par2_volumes_fetched: state.par2_volumes.map(|(fetched, _)| fetched),
+            par2_volumes_available: state.par2_volumes.map(|(_, available)| available),
         };
 
         let db = self.db.lock();
@@ -3299,6 +4366,7 @@ impl QueueManager {
         if let Err(e) = db.queue_remove(&state.job.id) {
             error!(job_id = %state.job.id, "Failed to remove from queue: {e}");
         }
+        prune_damage_ledger(&db);
 
         // Enforce retention
         if let Some(max) = *self.history_retention.lock()
@@ -3309,25 +4377,21 @@ impl QueueManager {
         drop(db);
 
         if history_persisted {
-            let retain_for_retry = final_status == JobStatus::Failed
-                && state.nzb_data.is_some()
-                && state
-                    .job
-                    .files
-                    .iter()
-                    .any(|file| file.articles.iter().any(|article| article.downloaded));
-            cleanup_terminal_work_dir(
-                &state.job.id,
-                &state.job.work_dir,
-                final_status,
-                retain_for_retry,
-            );
+            self.notify_terminal(state, final_status);
+            cleanup_terminal_work_dir(&state.job.id, &state.job.work_dir, final_status);
         } else {
             warn!(
                 job_id = %state.job.id,
                 work_dir = %state.job.work_dir.display(),
                 "Retaining terminal work directory because history persistence failed"
             );
+        }
+    }
+
+    /// Notify about a job that has just reached history.
+    fn notify_terminal(&self, state: &JobState, final_status: JobStatus) {
+        if let Some(event) = terminal_notification(&state.job, final_status) {
+            self.notify(event);
         }
     }
 
@@ -3352,36 +4416,95 @@ impl QueueManager {
 
     /// Persist current job progress to the database, including article-level
     /// checkpoint data for resume support.
+    /// Persist a job's progress counters and resume checkpoint.
+    ///
+    /// The snapshot is taken under the job-list lock, which is released
+    /// before the checkpoint is serialised and before the database lock is
+    /// taken: the two locks are never held together, so `get_jobs()` (queue
+    /// and status polls) never waits behind a database write or a slow query.
     fn persist_job_progress(&self, job_id: &str) {
-        let jobs = self.jobs.lock();
-        if let Some(state) = jobs.get(job_id) {
-            // Accumulated active time: the final total once the download
-            // resolved, otherwise earlier runs plus the live engine run.
-            let download_time_secs = state.download_time_secs.unwrap_or_else(|| {
-                state.prior_download_secs + self.dispatch.job_active_secs(job_id).unwrap_or(0.0)
-            });
-            let db = self.db.lock();
-            if let Err(e) = db.queue_update_progress(
-                job_id,
-                state.job.status,
+        let snapshot = {
+            let jobs = self.jobs.lock();
+            let Some(state) = jobs.get(job_id) else {
+                return;
+            };
+            let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
+            checkpoint.carried_bytes = state.carried_bytes;
+            (
+                state.persisted_status != Some(state.job.status),
                 state.job.downloaded_bytes,
                 state.job.articles_downloaded,
                 state.job.articles_failed,
                 state.job.files_completed,
+                state.download_time_secs,
+                state.prior_download_secs,
+                checkpoint,
+            )
+        };
+        let (
+            status_changed,
+            downloaded_bytes,
+            articles_downloaded,
+            articles_failed,
+            files_completed,
+            final_download_secs,
+            prior_download_secs,
+            mut checkpoint,
+        ) = snapshot;
+        // Accumulated active time: the final total once the download
+        // resolved, otherwise earlier runs plus the live engine run.
+        checkpoint.download_time_secs = final_download_secs.unwrap_or_else(|| {
+            prior_download_secs + self.dispatch.job_active_secs(job_id).unwrap_or(0.0)
+        });
+        let data = serde_json::to_vec(&checkpoint);
+
+        // Counters and checkpoint only: the snapshot's status may already be
+        // stale (a pause or resume can land before the database lock is
+        // free), so it is never written from here.
+        {
+            let db = self.db.lock();
+            if let Err(e) = db.queue_update_counters(
+                job_id,
+                downloaded_bytes,
+                articles_downloaded,
+                articles_failed,
+                files_completed,
             ) {
                 warn!(job_id = %job_id, "Failed to persist progress: {e}");
             }
-
-            // Build and store checkpoint of downloaded article segments
-            let mut checkpoint = checkpoint_for_job(&state.job, state.output_dir_claimed);
-            checkpoint.download_time_secs = download_time_secs;
-            checkpoint.carried_bytes = state.carried_bytes;
-
-            if let Ok(data) = serde_json::to_vec(&checkpoint)
+            if let Ok(data) = data
                 && let Err(e) = db.queue_store_job_data(job_id, &data)
             {
                 warn!(job_id = %job_id, "Failed to persist checkpoint: {e}");
             }
+        }
+
+        // On a status transition, write the job list's current status under
+        // jobs -> db, the same order the pause and resume paths use.
+        if status_changed {
+            let mut jobs = self.jobs.lock();
+            let Some(state) = jobs.get_mut(job_id) else {
+                return;
+            };
+            let status = state.job.status;
+            if state.persisted_status != Some(status) {
+                let db = self.db.lock();
+                match db.queue_update_status(job_id, status) {
+                    Ok(()) => state.persisted_status = Some(status),
+                    Err(e) => warn!(job_id = %job_id, "Failed to persist status: {e}"),
+                }
+            }
+        }
+    }
+
+    /// [`Self::persist_job_progress`] on a blocking thread, for async callers:
+    /// the database write never runs on an async worker.
+    async fn persist_job_progress_blocking(self: &Arc<Self>, job_id: &str) {
+        let qm = Arc::clone(self);
+        let job_id = job_id.to_string();
+        if let Err(e) = tokio::task::spawn_blocking(move || qm.persist_job_progress(&job_id)).await
+        {
+            warn!("Progress persist task failed: {e}");
         }
     }
 
@@ -3532,6 +4655,7 @@ impl QueueManager {
                         if let Some(state) = jobs.get_mut(d_id.as_str()) {
                             state.job.status = JobStatus::Paused;
                             // Persist to DB
+                            state.persisted_status = Some(JobStatus::Paused);
                             let db = self.db.lock();
                             let _ = db.queue_update_progress(
                                 d_id,
@@ -3579,6 +4703,7 @@ impl QueueManager {
                 state.job.error_message = None;
             }
 
+            state.persisted_status = Some(JobStatus::Paused);
             let db = self.db.lock();
             db.queue_update_progress(
                 id,
@@ -3634,6 +4759,7 @@ impl QueueManager {
                 // paused in the pool; `start_next_queued` resumes it once a
                 // slot frees up.
                 state.job.status = JobStatus::Queued;
+                state.persisted_status = Some(JobStatus::Queued);
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     id,
@@ -3659,6 +4785,7 @@ impl QueueManager {
                 if let Some(tracker) = state.hopeless_tracker.as_mut() {
                     tracker.reset_progress_clock();
                 }
+                state.persisted_status = Some(JobStatus::Downloading);
                 let db = self.db.lock();
                 let _ = db.queue_update_progress(
                     id,
@@ -3696,7 +4823,7 @@ impl QueueManager {
     /// failure (the error message) is lost the moment the user clears it.
     /// A job removed with no error (the user simply doesn't want it) is
     /// just deleted, matching prior behavior.
-    pub fn remove_job(&self, id: &str) -> crate::nzb_core::Result<()> {
+    pub fn remove_job(self: &Arc<Self>, id: &str) -> crate::nzb_core::Result<()> {
         // Post-processing owns the work directory and JobState until its
         // terminal history transaction completes. Treat an external queue
         // cleanup request during this window as deferred view cleanup; do
@@ -3718,6 +4845,17 @@ impl QueueManager {
         self.dispatch.cancel_job(id);
         let removed = self.jobs.lock().remove(id);
         if let Some(state) = removed {
+            // Removing the last active job drains the queue. Checked under the
+            // same lock as the removal, so only the removal that empties it
+            // sees the drain.
+            let was_active = !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed);
+            let drained = was_active
+                && self.jobs.lock().values().all(|other| {
+                    matches!(other.job.status, JobStatus::Completed | JobStatus::Failed)
+                });
+            if drained {
+                self.spawn_queue_complete_action();
+            }
             self.globally_paused_jobs.lock().remove(id);
             self.persist_globally_paused_jobs();
             if let Some(handle) = state.progress_handle {
@@ -3729,6 +4867,7 @@ impl QueueManager {
 
             if state.job.error_message.is_some() && !history_already_persisted {
                 let history_entry = HistoryEntry {
+                    client_removal: None,
                     id: state.job.id.clone(),
                     name: state.job.name.clone(),
                     category: state.job.category.clone(),
@@ -3749,6 +4888,8 @@ impl QueueManager {
                     server_stats: state.job.server_stats.clone(),
                     nzb_data: state.nzb_data.clone(),
                     retry_data: None,
+                    par2_volumes_fetched: None,
+                    par2_volumes_available: None,
                 };
                 if let Err(e) =
                     db.history_insert_with_carried_bytes(&history_entry, state.carried_bytes)
@@ -3768,14 +4909,14 @@ impl QueueManager {
 
             // Remove from DB
             let _ = db.queue_remove(id);
+            prune_damage_ledger(&db);
             drop(db);
 
             // Remove from order
             self.job_order.lock().retain(|jid| jid != id);
 
-            // Try to clean up work directory. A terminal job whose history
-            // row already exists may have retained its partial download for
-            // retry; deleting that history entry removes it instead.
+            // Try to clean up work directory. Once a terminal job's history
+            // row exists, that row's cleanup owns the directory.
             if !history_already_persisted && state.job.work_dir.exists() {
                 let _ = std::fs::remove_dir_all(&state.job.work_dir);
             }
@@ -3854,25 +4995,204 @@ impl QueueManager {
     }
 
     /// Pause all downloads globally.
-    pub fn pause_all(&self) {
-        self.pause_all_with_hold(None);
+    pub fn pause_all(self: &Arc<Self>) {
+        self.pause_for_hold(|holds| holds.user = true);
     }
 
-    /// Pause all downloads. `disk_space_hold` marks a pause applied by the
-    /// disk-space guard; `None` is a user pause, which also takes ownership
-    /// of any existing disk hold so the guard will not lift it.
-    fn pause_all_with_hold(&self, disk_space_hold: Option<DateTime<Utc>>) {
-        let _transition = self.pause_transition.lock();
-        // Publish the global gate before touching individual jobs. This
-        // prevents every scheduling and per-job resume path from starting
-        // more work while the active contexts are being paused.
-        self.globally_paused.store(true, Ordering::SeqCst);
-        self.db.lock().set_setting("globally_paused", "true");
-        self.set_disk_space_hold(disk_space_hold);
-        // A plain pause is indefinite: cancel any pending timed resume.
-        // `pause_for` sets its deadline after calling this.
-        *self.pause_until.lock() = None;
+    /// Pause all downloads on behalf of the disk-space guard, which lifts the
+    /// hold itself once space frees up.
+    fn pause_all_with_hold(self: &Arc<Self>, disk_space_hold: Option<DateTime<Utc>>) {
+        self.pause_for_hold(|holds| {
+            if let Some(since) = disk_space_hold {
+                holds.disk = Some(since);
+            }
+        });
+    }
 
+    /// Add a hold and pause the queue if it was not already paused.
+    ///
+    /// Holds are additive and each holder lifts only its own, so a pause that
+    /// is already in effect keeps everything else that caused it. `apply`
+    /// mutates the holds while the transition lock is held.
+    fn pause_for_hold(self: &Arc<Self>, apply: impl FnOnce(&mut PauseHolds)) {
+        let _transition = self.pause_transition.lock();
+        // Every pause is indefinite unless `pause_for` sets a deadline after
+        // this returns, so drop any pending timed resume whether or not the
+        // queue was already held: a second pause must not inherit the first
+        // one's clock.
+        *self.pause_until.lock() = None;
+        let was_paused = {
+            let mut holds = self.pause_holds.lock();
+            apply(&mut holds);
+            if holds.user {
+                // The user's pause now covers every open window: suspend their
+                // hold, so a manually lifted disk hold does not resume a window
+                // the user is paused through. The exemption lasts only as long
+                // as the user's pause, so a window opening later keeps its own.
+                holds.user_paused_over = holds.open_windows.clone();
+                holds.schedule = false;
+            }
+            let paused = self.globally_paused.load(Ordering::SeqCst);
+            self.publish_holds(&holds);
+            paused
+        };
+        if !was_paused {
+            self.pause_jobs_for_global_hold();
+        }
+    }
+
+    /// Apply an evaluated window set: pause on a window that newly opened,
+    /// and resume when the last window the schedule was holding closes.
+    ///
+    /// `windows` names every open occurrence (`rule@date`). A window pauses
+    /// when its occurrence is first seen; one closing out of an overlap only
+    /// removes itself, so the windows still open keep the queue paused and do
+    /// not pause it again. A user resume lasts for the rest of that window; the
+    /// next occurrence pauses again.
+    ///
+    /// Applying the same decision again is not a new window: occurrences
+    /// already seen stay seen, so a settings save or the next monitor tick
+    /// cannot undo a manual resume.
+    fn apply_schedule_hold(self: &Arc<Self>, windows: &[String]) {
+        let _transition = self.pause_transition.lock();
+        let (pause_requested, resume_requested) = {
+            let mut holds = self.pause_holds.lock();
+            let before = holds.clone();
+            let was_held = holds.schedule;
+            let newly_opened = holds.newly_opened(windows);
+            // Every window that newly opens takes a hold, even while a user
+            // pause covers it: the user's pause outranks the hold for as long
+            // as it runs, and the hold is what keeps the queue paused
+            // afterwards.
+            holds.triggered_windows.extend(newly_opened);
+            holds.triggered_windows.sort();
+            holds.triggered_windows.dedup();
+            holds.retain_open(windows);
+            // A user pause covers every window it is started in, so the
+            // schedule takes no hold while it is in force.
+            holds.schedule = !holds.held_occurrences(windows).is_empty() && !holds.user;
+            let paused = self.globally_paused.load(Ordering::SeqCst);
+            let pause_requested = holds.schedule && !was_held && !paused;
+            let resume_requested = !holds.schedule && was_held && !holds.any();
+            // A tick that changes nothing writes nothing: the startup tick
+            // with an idle schedule must not materialise pause settings on a
+            // database that never chose one.
+            if *holds != before {
+                self.publish_holds(&holds);
+            }
+            (pause_requested, resume_requested)
+        };
+        if pause_requested {
+            self.pause_jobs_for_global_hold();
+        }
+        if resume_requested {
+            self.resume_jobs_after_holds();
+        }
+    }
+
+    /// Lift the user's hold, leaving every automatic hold in place.
+    ///
+    /// This is a timed pause running out, which is the user's own pause
+    /// ending rather than a manual override: a window that opened while the
+    /// pause covered it takes effect now, instead of the queue resuming
+    /// straight into the window.
+    fn expire_user_hold(self: &Arc<Self>) {
+        let _transition = self.pause_transition.lock();
+        let (pause_requested, resume_requested) = {
+            let mut holds = self.pause_holds.lock();
+            let was_held = holds.schedule;
+            holds.user = false;
+            // Hand the suspended windows their hold back, as if the user
+            // pause had never covered them.
+            holds.user_paused_over.clear();
+            holds.schedule = !holds.held_occurrences(&holds.open_windows).is_empty() && !holds.user;
+            // The user's pause was holding the queue, so a window opening
+            // under it only changes which hold explains the pause. Pausing
+            // jobs again would be a no-op, but keeping the guard makes this
+            // path behave exactly like `apply_schedule_hold`.
+            let paused = self.globally_paused.load(Ordering::SeqCst);
+            let pause_requested = holds.schedule && !was_held && !paused;
+            let resume_requested = !holds.any();
+            self.publish_holds(&holds);
+            (pause_requested, resume_requested)
+        };
+        if pause_requested {
+            self.pause_jobs_for_global_hold();
+        } else if resume_requested {
+            self.resume_jobs_after_holds();
+        }
+    }
+
+    /// Publish the global gate and persist the current holds.
+    ///
+    /// The gate is set while the holds still say paused, never cleared here:
+    /// only [`Self::resume_hold`] may lift the last hold and resume.
+    fn publish_holds(&self, holds: &PauseHolds) {
+        self.store_holds(holds);
+        self.persist_holds(holds);
+    }
+
+    /// Publish the global gate for `holds` without touching the database.
+    ///
+    /// Startup uses this: loading state must not write it back, or a database
+    /// that never chose a pause would gain the default rows on first boot and
+    /// look like it had.
+    fn store_holds(&self, holds: &PauseHolds) {
+        self.globally_paused.store(holds.any(), Ordering::SeqCst);
+    }
+
+    /// Write `holds` as the settings a restart reads back.
+    fn persist_holds(&self, holds: &PauseHolds) {
+        let db = self.db.lock();
+        db.set_setting(
+            "globally_paused",
+            if holds.any() { "true" } else { "false" },
+        );
+        // Each hold is persisted as its own flag. A single ranked "owner"
+        // string cannot describe two holds at once: a disk hold overlapping a
+        // window would restore only one of them, and the restart would drop
+        // the other.
+        db.set_setting(
+            Self::USER_HOLD_SETTING,
+            if holds.user { "true" } else { "false" },
+        );
+        db.set_setting(
+            Self::SCHEDULE_HOLD_SETTING,
+            if holds.schedule { "true" } else { "false" },
+        );
+        let value = holds.disk.map(|at| at.to_rfc3339()).unwrap_or_default();
+        db.set_setting(Self::DISK_SPACE_HOLD_SETTING, &value);
+        // Kept for readers of the old key, and for records written before each
+        // hold had its own flag.
+        db.set_setting(
+            Self::PAUSE_OWNER_SETTING,
+            if holds.user {
+                Self::PAUSE_OWNER_USER
+            } else if holds.schedule {
+                Self::PAUSE_OWNER_SCHEDULE
+            } else if holds.disk.is_some() {
+                Self::PAUSE_OWNER_DISK
+            } else {
+                ""
+            },
+        );
+        for (key, windows) in [
+            (Self::SCHEDULE_WINDOWS_SETTING, &holds.open_windows),
+            (Self::SCHEDULE_TRIGGERED_SETTING, &holds.triggered_windows),
+            (Self::SCHEDULE_RESUMED_SETTING, &holds.resumed_windows),
+            (Self::SCHEDULE_USER_PAUSED_SETTING, &holds.user_paused_over),
+        ] {
+            let value = serde_json::to_string(windows).unwrap_or_else(|_| "[]".into());
+            db.set_setting(key, &value);
+        }
+    }
+
+    /// Pause every active job as part of a global pause.
+    ///
+    /// The caller holds [`Self::pause_transition`] and has already published
+    /// the gate, so no resume path can start work while the contexts are
+    /// being paused.
+    fn pause_jobs_for_global_hold(&self) {
         // Collect ids to pause in the pool, to avoid holding the jobs lock
         // while calling into the worker pool.
         let to_pause: Vec<String> = {
@@ -3903,56 +5223,27 @@ impl QueueManager {
         info!("All downloads paused");
     }
 
-    /// Pause all downloads for a specified duration.
+    /// Lift one holder's pause, resuming only when no hold is left.
     ///
-    /// Durations are clamped to a year. `chrono::Duration::seconds` panics on
-    /// values past its range, and a wrapped negative duration would resume
-    /// immediately after `pause_all` had already run.
-    pub fn pause_for(self: &Arc<Self>, duration_secs: u64) {
-        const MAX_PAUSE_SECS: u64 = 365 * 24 * 60 * 60;
-        let duration_secs = duration_secs.min(MAX_PAUSE_SECS);
-        self.pause_all();
-        let until_value = Utc::now()
-            + chrono::Duration::try_seconds(i64::try_from(duration_secs).unwrap_or(i64::MAX))
-                .expect("clamped pause duration fits in chrono");
-        *self.pause_until.lock() = Some(until_value);
-
-        let qm = Arc::clone(self);
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(duration_secs)).await;
-            // Only this exact timer may resume the queue. A newer timed pause
-            // must not be cancelled when an older timer wakes up.
-            let should_resume = {
-                let until = qm.pause_until.lock();
-                until
-                    .as_ref()
-                    .is_some_and(|current| *current == until_value)
-            };
-            if should_resume {
-                *qm.pause_until.lock() = None;
-                qm.resume_all();
-                info!("Auto-resumed after timed pause");
-            }
-        });
-
-        info!(duration_secs, "Paused for duration");
-    }
-
-    /// Get remaining pause time in seconds (None if not timed).
-    pub fn pause_remaining_secs(&self) -> Option<i64> {
-        let until = self.pause_until.lock();
-        until.map(|u| {
-            let remaining = u - Utc::now();
-            remaining.num_seconds().max(0)
-        })
-    }
-
-    /// Resume all downloads globally.
-    pub fn resume_all(self: &Arc<Self>) {
+    /// `apply` mutates the holds while the transition lock is held; if the
+    /// queue is still held afterwards the gate stays put and the reason moves
+    /// to the holder that remains.
+    fn resume_hold(self: &Arc<Self>, apply: impl FnOnce(&mut PauseHolds)) {
         let _transition = self.pause_transition.lock();
-        self.globally_paused.store(false, Ordering::SeqCst);
-        self.db.lock().set_setting("globally_paused", "false");
-        self.set_disk_space_hold(None);
+        let resume = {
+            let mut holds = self.pause_holds.lock();
+            apply(&mut holds);
+            self.publish_holds(&holds);
+            !holds.any()
+        };
+        if resume {
+            self.resume_jobs_after_holds();
+        }
+    }
+
+    /// Mark every globally paused job Queued and start work, once the last
+    /// hold is gone. The caller holds [`Self::pause_transition`].
+    fn resume_jobs_after_holds(self: &Arc<Self>) {
         *self.pause_until.lock() = None;
 
         let paused_by_global = std::mem::take(&mut *self.globally_paused_jobs.lock());
@@ -3981,6 +5272,144 @@ impl QueueManager {
         info!("All downloads resumed");
     }
 
+    /// Pause all downloads for a specified duration.
+    ///
+    /// Durations are clamped to a year. `chrono::Duration::seconds` panics on
+    /// values past its range, and a wrapped negative duration would resume
+    /// immediately after `pause_all` had already run.
+    pub fn pause_for(self: &Arc<Self>, duration_secs: u64) {
+        const MAX_PAUSE_SECS: u64 = 365 * 24 * 60 * 60;
+        let duration_secs = duration_secs.min(MAX_PAUSE_SECS);
+        self.pause_all();
+        let until_value = Utc::now()
+            + chrono::Duration::try_seconds(i64::try_from(duration_secs).unwrap_or(i64::MAX))
+                .expect("clamped pause duration fits in chrono");
+        *self.pause_until.lock() = Some(until_value);
+
+        let qm = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(duration_secs)).await;
+            // Only this exact timer may resume the queue. A newer timed pause
+            // must not be cancelled when an older timer wakes up.
+            let should_resume = {
+                let until = qm.pause_until.lock();
+                until
+                    .as_ref()
+                    .is_some_and(|current| *current == until_value)
+            };
+            if should_resume {
+                *qm.pause_until.lock() = None;
+                // The user's own pause has ended, so lift only their hold. A
+                // disk hold keeps its own, and a window that opened while the
+                // timed pause covered it takes effect now instead of being
+                // resumed straight into.
+                qm.expire_user_hold();
+                info!("Auto-resumed after timed pause");
+            }
+        });
+
+        info!(duration_secs, "Paused for duration");
+    }
+
+    /// Apply a schedule decision to the queue.
+    ///
+    /// The schedule holds only what it applied: it will not resume a pause the
+    /// user or the disk guard started, and it lifts its own hold only when
+    /// the window ends. Holds are additive, so a window that opens while the
+    /// disk guard already holds the queue still takes effect: the queue keeps
+    /// running paused through the window once the guard lets go, and resumes
+    /// at the end of it. Speed caps and server exclusions are overlays — the
+    /// configured values are never rewritten.
+    ///
+    /// `saved` marks a decision applied because the settings were saved, as
+    /// opposed to a monitor tick. A save is applied immediately *and* by the
+    /// next tick, and a save that leaves a window open must not read as a new
+    /// window — otherwise saving settings inside a window would undo a manual
+    /// resume. It adopts the open window instead of opening it again.
+    pub fn apply_schedule(
+        self: &Arc<Self>,
+        decision: &crate::nzb_core::schedule::ScheduleDecision,
+        enabled: bool,
+    ) {
+        let idle = crate::nzb_core::schedule::ScheduleDecision::default();
+        let decision = if enabled { decision } else { &idle };
+
+        // Windows are keyed by occurrence, not just "open": a pause rule
+        // pauses when its window opens, so a manual resume inside it holds
+        // until the next window. The next window for the same rule has a
+        // different start date, so it does pause again.
+        //
+        // A decision built by hand carries no occurrence. One anonymous window
+        // per open period is enough: closing it forgets the occurrence, so
+        // reopening the same decision pauses again.
+        let windows = PauseHolds::occurrences(decision.pause_windows.iter().map(String::as_str));
+        let windows = if decision.pause && windows.is_empty() {
+            vec!["anonymous".to_string()]
+        } else {
+            windows
+        };
+        self.apply_schedule_hold(&windows);
+
+        // Speed cap: only touch the limiter when the value changes, so a
+        // running download does not see a needless limiter update each tick.
+        if self.scheduled_speed_cap.lock().as_ref() != decision.speed_limit_bps.as_ref() {
+            self.set_scheduled_speed_cap(decision.speed_limit_bps);
+        }
+
+        // Server exclusions.
+        if *self.schedule_disabled_servers.lock() != decision.disabled_servers {
+            *self.schedule_disabled_servers.lock() = decision.disabled_servers.clone();
+            self.apply_server_overlay();
+        }
+    }
+
+    /// Whether the schedule is the reason the queue is paused right now.
+    ///
+    /// Its window may be open while a disk hold or a user pause also holds
+    /// the queue; in that case the schedule is not what is keeping it
+    /// paused, and this reports `false`.
+    pub fn schedule_pause_active(&self) -> bool {
+        self.pause_holds.lock().reason() == Some(PauseReason::Schedule)
+    }
+
+    /// The speed cap the schedule is applying right now, if any.
+    pub fn scheduled_speed_cap(&self) -> Option<u64> {
+        *self.scheduled_speed_cap.lock()
+    }
+
+    /// Get remaining pause time in seconds (None if not timed).
+    pub fn pause_remaining_secs(&self) -> Option<i64> {
+        let until = self.pause_until.lock();
+        until.map(|u| {
+            let remaining = u - Utc::now();
+            remaining.num_seconds().max(0)
+        })
+    }
+
+    /// Resume all downloads: lift every hold, the user's included.
+    ///
+    /// The window's occurrence is left in place, so the rest of that window
+    /// is not treated as newly opened: the tick that follows does not pause
+    /// again. The next window has a different occurrence and does.
+    pub fn resume_all(self: &Arc<Self>) {
+        self.resume_hold(|holds| {
+            holds.user = false;
+            holds.disk = None;
+            // The user takes over the open windows for the rest of this
+            // occurrence: the schedule must not pause them again, even on the
+            // next tick.
+            // The occurrence being resumed is the one the schedule last
+            // evaluated, which is also the one on the queue's holds.
+            holds
+                .resumed_windows
+                .extend(holds.triggered_windows.iter().cloned());
+            holds.resumed_windows.sort();
+            holds.resumed_windows.dedup();
+            holds.schedule = false;
+            holds.user_paused_over.clear();
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Server management
     // -----------------------------------------------------------------------
@@ -3991,12 +5420,34 @@ impl QueueManager {
     /// server errors (e.g. auth failure / service unavailable) are
     /// automatically resumed.
     pub fn update_servers(self: &Arc<Self>, servers: Vec<ServerConfig>) {
-        let enabled = servers.iter().filter(|s| s.enabled).count();
-        info!(total = servers.len(), enabled, "Updating server list");
+        info!(total = servers.len(), "Updating server list");
+        *self.configured_servers.lock() = servers;
+        self.apply_server_overlay();
+    }
 
-        self.dispatch.update_servers(servers);
+    /// Push the configured list, with the schedule's exclusions disabled, to
+    /// the dispatcher.
+    fn apply_server_overlay(self: &Arc<Self>) {
+        let disabled = self.schedule_disabled_servers.lock().clone();
+        let effective: Vec<ServerConfig> = {
+            let configured = self.configured_servers.lock();
+            configured
+                .iter()
+                .map(|server| {
+                    let mut server = server.clone();
+                    if disabled.iter().any(|id| id == &server.id) {
+                        server.enabled = false;
+                    }
+                    server
+                })
+                .collect()
+        };
+        let enabled = effective.iter().filter(|s| s.enabled).count();
+        info!(total = effective.len(), enabled, "Applying server list");
 
-        // Auto-resume jobs paused by server errors now that config changed
+        self.dispatch.update_servers(effective);
+
+        // Auto-resume jobs paused by server errors now that servers are back.
         if enabled > 0 {
             self.resume_server_paused_jobs();
         }
@@ -4036,9 +5487,26 @@ impl QueueManager {
         }
     }
 
-    /// Get current server configs.
+    /// The per-server connection budgets shared by the downloader and any
+    /// other NNTP consumer of the configured servers.
+    pub fn server_budgets(&self) -> Arc<nzb_nntp::budget::BudgetRegistry> {
+        Arc::clone(&self.server_budgets)
+    }
+
+    /// Get the configured server list, before the schedule's overlay.
     pub fn get_servers(&self) -> Vec<ServerConfig> {
+        self.configured_servers.lock().clone()
+    }
+
+    /// The server list as the dispatcher sees it: configured servers with
+    /// the schedule's exclusions disabled.
+    pub fn live_servers(&self) -> Vec<ServerConfig> {
         self.servers.lock().clone()
+    }
+
+    /// Servers the schedule currently has out of rotation.
+    pub fn schedule_disabled_servers(&self) -> Vec<String> {
+        self.schedule_disabled_servers.lock().clone()
     }
 
     // -----------------------------------------------------------------------
@@ -4047,17 +5515,38 @@ impl QueueManager {
 
     /// Get a snapshot of all jobs in the queue.
     pub fn get_jobs(&self) -> Vec<NzbJob> {
-        let jobs = self.jobs.lock();
-        let order = self.job_order.lock();
-        let mut result = Vec::with_capacity(order.len());
-        for id in order.iter() {
-            if let Some(state) = jobs.get(id) {
-                let mut job = state.job.clone();
-                job.speed_bps = state.speed.bps();
-                result.push(job);
+        let mut result = {
+            let jobs = self.jobs.lock();
+            let order = self.job_order.lock();
+            let mut result = Vec::with_capacity(order.len());
+            for id in order.iter() {
+                if let Some(state) = jobs.get(id) {
+                    let mut job = state.job.clone();
+                    job.speed_bps = state.speed.bps();
+                    result.push(job);
+                }
             }
+            result
+        };
+        // The dispatcher's job map is a separate lock; never take it under
+        // the job list.
+        for job in &mut result {
+            self.fill_held_par2_bytes(job);
         }
         result
+    }
+
+    /// Set `job.held_par2_bytes` from the volumes the dispatcher still holds.
+    fn fill_held_par2_bytes(&self, job: &mut NzbJob) {
+        job.held_par2_bytes = match self.dispatch.held_par2_files(&job.id) {
+            Some(held) if !held.is_empty() => job
+                .files
+                .iter()
+                .filter(|file| held.contains(&file.id))
+                .map(|file| file.bytes)
+                .sum(),
+            _ => 0,
+        };
     }
 
     /// Get jobs that are still actionable in the active download queue.
@@ -4079,12 +5568,13 @@ impl QueueManager {
 
     /// Get a single job by ID (with files included).
     pub fn get_job(&self, job_id: &str) -> Option<NzbJob> {
-        let jobs = self.jobs.lock();
-        jobs.get(job_id).map(|state| {
+        let mut job = self.jobs.lock().get(job_id).map(|state| {
             let mut job = state.job.clone();
             job.speed_bps = state.speed.bps();
             job
-        })
+        })?;
+        self.fill_held_par2_bytes(&mut job);
+        Some(job)
     }
 
     /// Get the current download speed in bytes per second.
@@ -4102,24 +5592,17 @@ impl QueueManager {
         if !self.is_paused() {
             return None;
         }
-        Some(if self.disk_space_hold.lock().is_some() {
-            PauseReason::DiskSpace
-        } else {
-            PauseReason::Global
-        })
+        self.pause_holds.lock().reason()
     }
 
     /// When the disk-space guard paused downloads, if it is holding them now.
     pub fn disk_space_hold_since(&self) -> Option<DateTime<Utc>> {
-        *self.disk_space_hold.lock()
+        self.pause_holds.lock().disk
     }
 
-    fn set_disk_space_hold(&self, since: Option<DateTime<Utc>>) {
-        *self.disk_space_hold.lock() = since;
-        let value = since.map(|at| at.to_rfc3339()).unwrap_or_default();
-        self.db
-            .lock()
-            .set_setting(Self::DISK_SPACE_HOLD_SETTING, &value);
+    /// Lift the disk guard's hold, leaving every other hold in place.
+    fn clear_disk_hold(self: &Arc<Self>) {
+        self.resume_hold(|holds| holds.disk = None);
     }
 
     /// Why a queued job is paused, or `None` when it is not paused.
@@ -4156,20 +5639,27 @@ impl QueueManager {
         let paths = self.disk_guard_paths();
         let path_refs: Vec<_> = paths.iter().map(std::path::PathBuf::as_path).collect();
         if !disk_space_available(threshold, &path_refs) {
-            if !self.is_paused() {
+            if self.disk_space_hold_since().is_none() {
                 warn!(
                     free_bytes = paths.first().map_or(0, |path| get_disk_free(path)),
                     min_free_space = threshold,
                     "Low disk space on a configured storage volume, auto-pausing downloads"
                 );
                 self.pause_all_with_hold(Some(Utc::now()));
+                self.notify(NotificationEvent::new(
+                    NotificationKind::DiskFull,
+                    "Disk space low",
+                    "Downloads paused: free space on a storage volume is below the minimum.",
+                ));
             }
             return;
         }
 
-        if self.is_paused() && self.disk_space_hold.lock().is_some() {
-            info!("Disk space recovered, resuming downloads paused by the disk guard");
-            self.resume_all();
+        if self.disk_space_hold_since().is_some() {
+            info!("Disk space recovered, lifting the disk guard's hold");
+            // Only the guard's own hold: a pause window that opened during
+            // the hold keeps the queue paused for the rest of the window.
+            self.clear_disk_hold();
         }
         self.resume_storage_held_jobs();
     }
@@ -4329,6 +5819,29 @@ impl QueueManager {
     pub fn history_list(&self, limit: usize) -> crate::nzb_core::Result<Vec<HistoryEntry>> {
         let db = self.db.lock();
         db.history_list(limit)
+    }
+
+    /// One SQL-filtered page of history plus the total match count.
+    pub fn history_page(
+        &self,
+        filter: &HistoryFilter,
+        offset: usize,
+        limit: usize,
+    ) -> crate::nzb_core::Result<(Vec<HistoryEntry>, usize)> {
+        self.db.lock().history_page(filter, offset, limit)
+    }
+
+    /// Lightweight rows for every history entry matching `filter`.
+    pub fn history_summaries(
+        &self,
+        filter: &HistoryFilter,
+    ) -> crate::nzb_core::Result<Vec<HistorySummary>> {
+        self.db.lock().history_summaries(filter)
+    }
+
+    /// List-shaped history entries for `ids`, in the order given.
+    pub fn history_get_listed(&self, ids: &[String]) -> crate::nzb_core::Result<Vec<HistoryEntry>> {
+        self.db.lock().history_get_listed(ids)
     }
 
     /// Aggregate per-server article and byte statistics from active jobs and
@@ -4570,7 +6083,7 @@ impl QueueManager {
             let entry = db.history_get(id)?;
             let retained = entry
                 .as_ref()
-                .map(|entry| self.history_work_dirs(&db, entry))
+                .map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
                 .unwrap_or_default();
             db.history_remove(id)?;
             if entry.is_some() {
@@ -4584,15 +6097,110 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Keep history entries an external client removed, marked with who
+    /// removed them and when. Returns how many rows were marked.
+    pub fn history_mark_client_removed(
+        &self,
+        ids: &[String],
+        removed_by: &str,
+        files_deleted: bool,
+    ) -> crate::nzb_core::Result<usize> {
+        let (marked, leftovers) = {
+            let db = self.db.lock();
+            let leftovers: Vec<std::path::PathBuf> = ids
+                .iter()
+                .filter_map(|id| db.history_get(id).ok().flatten())
+                .filter(|entry| entry.status == JobStatus::Failed)
+                .flat_map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
+                .collect();
+            let marked =
+                db.history_mark_client_removed(ids, removed_by, Utc::now(), files_deleted)?;
+            (marked, leftovers)
+        };
+        if marked > 0 {
+            self.history_changed();
+        }
+        // The row stays for rustnzb's own record, but a failed job's partial
+        // download is of no use to anyone once the *arr has dropped it.
+        for work_dir in leftovers {
+            self.remove_unreferenced_work_dir(&work_dir, "history entry removed by client");
+        }
+        Ok(marked)
+    }
+
+    /// Ids of the history entries an external client has removed.
+    pub fn history_client_removed_ids(
+        &self,
+    ) -> crate::nzb_core::Result<std::collections::HashSet<String>> {
+        self.db.lock().history_client_removed_ids()
+    }
+
+    /// Move history entries into the undo window instead of deleting them.
+    ///
+    /// Their retained work directories stay put: the row still owns them
+    /// until the undo window closes, so a restore is lossless.
+    pub fn history_trash(
+        &self,
+        ids: &[String],
+        deadline: DateTime<Utc>,
+    ) -> crate::nzb_core::Result<Vec<HistorySummary>> {
+        let trashed = {
+            let db = self.db.lock();
+            db.history_trash(ids, deadline)?
+        };
+        if !trashed.is_empty() {
+            self.history_changed();
+        }
+        Ok(trashed)
+    }
+
+    /// Bring trashed entries back before their deadline.
+    pub fn history_restore(
+        &self,
+        ids: &[String],
+        now: DateTime<Utc>,
+    ) -> crate::nzb_core::Result<Vec<String>> {
+        let restored = {
+            let db = self.db.lock();
+            db.history_restore(ids, now)?
+        };
+        if !restored.is_empty() {
+            self.history_changed();
+        }
+        Ok(restored)
+    }
+
+    /// Purge every trashed entry whose undo window has closed, then reclaim
+    /// the work directories only those rows still referenced.
+    pub fn history_purge_expired(&self, now: DateTime<Utc>) -> crate::nzb_core::Result<usize> {
+        let (purged, retained) = {
+            let db = self.db.lock();
+            let purged = db.history_purge_expired(now)?;
+            let retained: Vec<_> = purged
+                .iter()
+                .flat_map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
+                .collect();
+            (purged, retained)
+        };
+        if purged.is_empty() {
+            return Ok(0);
+        }
+        self.history_changed();
+        for work_dir in retained {
+            self.remove_unreferenced_work_dir(&work_dir, "trashed history entry expired");
+        }
+        Ok(purged.len())
+    }
+
     /// Clear all history.
     pub fn history_clear(&self) -> crate::nzb_core::Result<()> {
         let retained = {
             let db = self.db.lock();
             let had_entries = db.history_count()? != 0;
             let retained: Vec<_> = db
-                .history_list(i64::MAX as usize)?
+                .history_summaries(&HistoryFilter::default())?
                 .iter()
-                .flat_map(|entry| self.history_work_dirs(&db, entry))
+                .flat_map(|entry| self.history_work_dirs(&db, &entry.id, entry.status))
                 .collect();
             db.history_clear()?;
             if had_entries {
@@ -4609,10 +6217,15 @@ impl QueueManager {
     /// Incomplete work directories a history row may have retained: its own
     /// `incomplete/<id>` and, for a failed row, the directory its retry
     /// checkpoint names (a retry reuses an earlier attempt's directory).
-    fn history_work_dirs(&self, db: &Database, entry: &HistoryEntry) -> Vec<std::path::PathBuf> {
-        let mut dirs = vec![self.incomplete_dir().join(&entry.id)];
-        if entry.status == JobStatus::Failed
-            && let Ok(Some(data)) = db.history_get_retry_data(&entry.id)
+    fn history_work_dirs(
+        &self,
+        db: &Database,
+        id: &str,
+        status: JobStatus,
+    ) -> Vec<std::path::PathBuf> {
+        let mut dirs = vec![self.incomplete_dir().join(id)];
+        if status == JobStatus::Failed
+            && let Ok(Some(data)) = db.history_get_retry_data(id)
             && let Some(work_dir) = retry_checkpoint_work_dir(&data)
             && !dirs.contains(&work_dir)
         {
@@ -4622,16 +6235,11 @@ impl QueueManager {
     }
 
     /// Canonical incomplete directories still referenced by a queue job or a
-    /// history row. With `only_named`, retry checkpoints are parsed only when
-    /// they mention that directory name, which keeps a single delete cheap.
+    /// non-failed history row.
     ///
-    /// Fails closed: any error reading the queue, the history, or one row's
-    /// retry checkpoint is returned rather than treated as "nothing references
+    /// Fails closed: any error reading the queue or the history is returned rather than treated as "nothing references
     /// these directories", because callers use the result to decide deletion.
-    fn referenced_work_dirs(
-        &self,
-        only_named: Option<&std::ffi::OsStr>,
-    ) -> crate::nzb_core::Result<HashSet<std::path::PathBuf>> {
+    fn referenced_work_dirs(&self) -> crate::nzb_core::Result<HashSet<std::path::PathBuf>> {
         let incomplete = self.incomplete_dir();
         // Terminal jobs linger in the queue view briefly after their history
         // row is written; their directory belongs to that row, not the queue.
@@ -4642,23 +6250,19 @@ impl QueueManager {
             .filter(|state| !matches!(state.job.status, JobStatus::Completed | JobStatus::Failed))
             .map(|state| state.job.work_dir.clone())
             .collect();
-        let needle = only_named.map(|name| name.to_string_lossy().into_owned().into_bytes());
         {
             let db = self.db.lock();
             paths.extend(db.queue_list()?.into_iter().map(|job| job.work_dir));
-            for entry in db.history_list(i64::MAX as usize)? {
-                paths.push(incomplete.join(&entry.id));
+            let visible = db.history_summaries(&HistoryFilter::default())?;
+            let trashed = db.history_trashed_summaries()?;
+            // A trashed row still owns its directory until its undo window
+            // closes, so it counts as a reference exactly like a visible one.
+            // Failed rows own nothing: a failed job's partial download is
+            // deleted when it fails, so any left over (from older versions)
+            // is reclaimable.
+            for entry in visible.iter().chain(trashed.iter()) {
                 if entry.status != JobStatus::Failed {
-                    continue;
-                }
-                let Some(data) = db.history_get_retry_data(&entry.id)? else {
-                    continue;
-                };
-                let mentioned = needle.as_ref().is_none_or(|needle| {
-                    !needle.is_empty() && data.windows(needle.len()).any(|window| window == needle)
-                });
-                if mentioned && let Some(work_dir) = retry_checkpoint_work_dir(&data) {
-                    paths.push(work_dir);
+                    paths.push(incomplete.join(&entry.id));
                 }
             }
         }
@@ -4678,7 +6282,7 @@ impl QueueManager {
         let Some(work_dir) = incomplete_child_dir(&root, candidate) else {
             return;
         };
-        let Ok(referenced) = self.referenced_work_dirs(work_dir.file_name()) else {
+        let Ok(referenced) = self.referenced_work_dirs() else {
             warn!(
                 work_dir = %work_dir.display(),
                 "Keeping work directory: its references could not be read"
@@ -4718,7 +6322,7 @@ impl QueueManager {
         let Ok(entries) = std::fs::read_dir(&root) else {
             return;
         };
-        let Ok(referenced) = self.referenced_work_dirs(None) else {
+        let Ok(referenced) = self.referenced_work_dirs() else {
             warn!("Skipping orphan sweep: queue or history could not be read");
             return;
         };
@@ -4861,8 +6465,12 @@ impl QueueManager {
     /// Re-parses NZB data for each job and applies any saved checkpoint to
     /// mark already-downloaded articles, so downloads resume where they left off.
     pub fn restore_from_db(self: &Arc<Self>) -> crate::nzb_core::Result<()> {
-        // Restore globally_paused from persisted state
-        let (was_paused, persisted_global_ids) = {
+        prune_damage_ledger(&self.db.lock());
+        // Restore globally_paused from persisted state. Every hold that was
+        // persisted comes back as its own flag, so a restart cannot turn a
+        // schedule pause into a user pause the schedule can never lift (or
+        // the other way around).
+        let restored = {
             let db = self.db.lock();
             let paused = db
                 .get_setting("globally_paused")
@@ -4870,22 +6478,86 @@ impl QueueManager {
             let ids = db
                 .get_setting(Self::GLOBAL_PAUSED_JOBS_SETTING)
                 .and_then(|value| serde_json::from_str::<HashSet<String>>(&value).ok());
-            (paused, ids)
-        };
-        if was_paused {
-            self.globally_paused.store(true, Ordering::SeqCst);
-            let hold = self
-                .db
-                .lock()
+            let flag = |key: &str| db.get_setting(key).is_some_and(|value| value == "true");
+            let list = |key: &str| {
+                db.get_setting(key)
+                    .and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
+                    .unwrap_or_default()
+            };
+            let disk = db
                 .get_setting(Self::DISK_SPACE_HOLD_SETTING)
                 .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
                 .map(|at| at.with_timezone(&Utc));
-            *self.disk_space_hold.lock() = hold;
-            info!(
-                disk_space_hold = hold.is_some(),
-                "Restored global pause state from database"
-            );
+            let owner = db
+                .get_setting(Self::PAUSE_OWNER_SETTING)
+                .unwrap_or_default();
+            // Records written before each hold had its own flag describe one
+            // reason only, so they fall back to the owner.
+            let legacy = db.get_setting(Self::USER_HOLD_SETTING).is_none()
+                && db.get_setting(Self::SCHEDULE_HOLD_SETTING).is_none();
+            let holds = PauseHolds {
+                user: if legacy {
+                    owner == Self::PAUSE_OWNER_USER || (owner.is_empty() && disk.is_none())
+                } else {
+                    flag(Self::USER_HOLD_SETTING)
+                },
+                disk,
+                schedule: if legacy {
+                    owner == Self::PAUSE_OWNER_SCHEDULE
+                } else {
+                    flag(Self::SCHEDULE_HOLD_SETTING)
+                },
+                resumed_windows: list(Self::SCHEDULE_RESUMED_SETTING),
+                open_windows: list(Self::SCHEDULE_WINDOWS_SETTING),
+                triggered_windows: list(Self::SCHEDULE_TRIGGERED_SETTING),
+                user_paused_over: list(Self::SCHEDULE_USER_PAUSED_SETTING),
+            };
+            (paused, ids, holds)
+        };
+        let (was_paused, persisted_global_ids, persisted_holds) = restored;
+        // The holds themselves only come back when the queue was paused: a
+        // record that says it was not paused has no live hold to restore.
+        //
+        // The window bookkeeping is different, and is restored either way. A
+        // manual resume inside a window leaves `globally_paused` false while
+        // the occurrence it overrode is still open; dropping `triggered_windows`
+        // and `resumed_windows` with it would make the first tick after a
+        // restart read that window as newly opened and pause the queue again.
+        let holds = PauseHolds {
+            user: was_paused && persisted_holds.user,
+            disk: if was_paused {
+                persisted_holds.disk
+            } else {
+                None
+            },
+            schedule: was_paused && persisted_holds.schedule,
+            open_windows: persisted_holds.open_windows,
+            triggered_windows: persisted_holds.triggered_windows,
+            resumed_windows: persisted_holds.resumed_windows,
+            user_paused_over: persisted_holds.user_paused_over,
+        };
+        {
+            let mut current = self.pause_holds.lock();
+            *current = holds.clone();
         }
+        // Load, do not save: restoring must not materialise settings a
+        // database never held, or a first boot would look like a chosen pause.
+        self.store_holds(&holds);
+        info!(
+            was_paused,
+            disk_space_hold = holds.disk.is_some(),
+            schedule_hold = holds.schedule,
+            user_hold = holds.user,
+            open_windows = ?holds.open_windows,
+            "Restored global pause state from database"
+        );
+
+        let complete_action = self
+            .db
+            .lock()
+            .get_setting(Self::QUEUE_COMPLETE_ACTION_SETTING)
+            .filter(|value| !value.is_empty());
+        *self.complete_action.lock() = complete_action;
 
         // Reclaim partial downloads nothing can reach any more before any
         // job starts writing into the incomplete directory.
@@ -5023,11 +6695,14 @@ impl QueueManager {
                 nzb_data,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                repair_fold: None,
                 download_time_secs,
                 prior_download_secs,
                 carried_bytes,
                 failure_code: None,
+                par2_volumes: None,
                 output_dir_claimed,
+                persisted_status: None,
             };
             self.jobs.lock().insert(job_id.clone(), state);
             self.job_order.lock().push(job_id);
@@ -5332,6 +7007,14 @@ impl QueueManager {
                 }
                 if tick_count.is_multiple_of(30) {
                     qm.enforce_disk_guard();
+                    // Trashed history rows are hard-deleted once their undo
+                    // window closes; that is also when their retained work
+                    // directories become reclaimable.
+                    match qm.history_purge_expired(Utc::now()) {
+                        Ok(0) => {}
+                        Ok(count) => info!(count, "Purged trashed history entries"),
+                        Err(e) => warn!(error = %e, "Failed to purge trashed history entries"),
+                    }
                 }
             }
         });
@@ -5342,8 +7025,36 @@ impl QueueManager {
 mod global_pause_tests {
     use super::*;
 
+    #[test]
+    fn terminal_notification_maps_outcomes() {
+        let root = std::path::Path::new("/unused");
+        let mut done = job("done", JobStatus::Completed, root);
+        done.category = "tv".into();
+
+        let complete = terminal_notification(&done, JobStatus::Completed).unwrap();
+        assert_eq!(complete.kind, NotificationKind::Complete);
+        assert_eq!(complete.job_name.as_deref(), Some("done"));
+        assert_eq!(complete.category.as_deref(), Some("tv"));
+
+        let mut broken = job("broken", JobStatus::Failed, root);
+        broken.error_message = Some("archive is corrupt".into());
+        let failed = terminal_notification(&broken, JobStatus::Failed).unwrap();
+        assert_eq!(failed.kind, NotificationKind::Failed);
+        assert_eq!(failed.message, "archive is corrupt");
+
+        let mut full = job("full", JobStatus::Failed, root);
+        full.error_message = Some(POSTPROC_DISK_FULL_MESSAGE.into());
+        let disk = terminal_notification(&full, JobStatus::Failed).unwrap();
+        assert_eq!(disk.kind, NotificationKind::DiskFull);
+
+        let paused = job("paused", JobStatus::Paused, root);
+        assert!(terminal_notification(&paused, JobStatus::Paused).is_none());
+    }
+
     fn job(id: &str, status: JobStatus, root: &std::path::Path) -> NzbJob {
         NzbJob {
+            slice_map: None,
+            held_par2_bytes: 0,
             id: id.to_string(),
             name: id.to_string(),
             category: "Default".to_string(),
@@ -5388,14 +7099,279 @@ mod global_pause_tests {
         assert_eq!(manager.post_processing_level(&job), 3);
     }
 
+    const DUPLICATE_NZB: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="poster@example.com" date="1234567890" subject="show.s01e01.rar (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="100" number="1">show-s01e01-1@example.com</segment></segments>
+  </file>
+</nzb>"#;
+
+    fn duplicate_payload_variant() -> Vec<u8> {
+        String::from_utf8(DUPLICATE_NZB.to_vec())
+            .unwrap()
+            .replace("show-s01e01-1@", "show-s01e01-2@")
+            .into_bytes()
+    }
+
+    fn admit_duplicate_candidate(
+        manager: &Arc<QueueManager>,
+        tempdir: &tempfile::TempDir,
+        name: &str,
+        payload: &[u8],
+    ) -> crate::nzb_core::Result<String> {
+        let mut job = nzb_parser::parse_nzb(name, payload).expect("parse");
+        job.work_dir = tempdir.path().join("incomplete").join(&job.id);
+        job.output_dir = tempdir.path().join("complete").join(&job.name);
+        let id = job.id.clone();
+        manager.add_job(job, Some(payload.to_vec()))?;
+        Ok(id)
+    }
+
+    /// The default `warn` policy admits a repeat, as before, and records the match.
+    #[tokio::test]
+    async fn same_nzb_is_admitted_twice_under_default_warn_policy() {
+        let (manager, tempdir) = manager();
+        assert_eq!(manager.duplicate_policy(), DuplicatePolicy::Warn);
+        for _ in 0..2 {
+            admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+                .expect("warn admits");
+        }
+        assert_eq!(manager.queue_size(), 2);
+    }
+
+    #[tokio::test]
+    async fn skip_policy_refuses_a_repeat_and_leaves_no_directory() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+            .expect("first copy admitted");
+
+        let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB);
+        assert!(
+            matches!(refused, Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("queue job")),
+            "{refused:?}"
+        );
+        assert_eq!(manager.queue_size(), 1);
+        let refused_job = nzb_parser::parse_nzb("Show.S01E01", DUPLICATE_NZB).unwrap();
+        assert!(
+            !tempdir
+                .path()
+                .join("incomplete")
+                .join(&refused_job.id)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_policy_matches_by_name_when_the_payload_differs() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+            .expect("first copy admitted");
+
+        let renamed_payload = duplicate_payload_variant();
+        let refused =
+            admit_duplicate_candidate(&manager, &tempdir, "show.s01e01", &renamed_payload);
+        assert!(matches!(
+            refused,
+            Err(crate::nzb_core::NzbError::DuplicateNzb(_))
+        ));
+        assert_eq!(manager.queue_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn allow_policy_admits_repeats_without_checking() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Allow);
+        for _ in 0..2 {
+            admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB)
+                .expect("allow admits");
+        }
+        assert_eq!(manager.queue_size(), 2);
+    }
+
+    #[tokio::test]
+    async fn skip_policy_refuses_a_repeat_of_a_finished_job() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let finished = HistoryEntry {
+            client_removal: None,
+            id: "finished-show".into(),
+            name: "Show.S01E01".into(),
+            category: "Default".into(),
+            status: JobStatus::Completed,
+            total_bytes: 100,
+            downloaded_bytes: 100,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E01"),
+            stages: Vec::new(),
+            error_message: None,
+            failure_code: None,
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
+        };
+        manager.db.lock().history_insert(&finished).unwrap();
+
+        let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E01", DUPLICATE_NZB);
+        assert!(matches!(
+            refused,
+            Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("history job")
+        ));
+    }
+
+    #[tokio::test]
+    async fn skip_policy_admits_a_regrab_of_a_failed_history_job() {
+        // WI-2165: an arr re-grabs a release whose earlier attempt failed.
+        // SABnzbd admits it; refusing it sent Sonarr into a retry loop.
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let failed = HistoryEntry {
+            client_removal: None,
+            id: "failed-regrab".into(),
+            name: "Show.S01E16".into(),
+            category: "Default".into(),
+            status: JobStatus::Failed,
+            total_bytes: 100,
+            downloaded_bytes: 10,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E16"),
+            stages: Vec::new(),
+            error_message: Some("incomplete".into()),
+            failure_code: Some(JobFailureCode::ArticlesUnavailable),
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
+        };
+        manager.db.lock().history_insert(&failed).unwrap();
+
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E16", DUPLICATE_NZB)
+            .expect("a failed history job does not block a re-grab");
+        assert_eq!(manager.queue_size(), 1);
+        // The re-grab is added as a new job; the old Failed row is kept.
+        let kept = manager.db.lock().history_get("failed-regrab").unwrap();
+        assert_eq!(kept.map(|entry| entry.status), Some(JobStatus::Failed));
+
+        // The re-grab is now queued, so a further copy is refused.
+        let refused = admit_duplicate_candidate(&manager, &tempdir, "Show.S01E16", DUPLICATE_NZB);
+        assert!(matches!(
+            refused,
+            Err(crate::nzb_core::NzbError::DuplicateNzb(ref message)) if message.contains("queue job")
+        ));
+    }
+
+    #[tokio::test]
+    async fn skip_policy_admits_a_regrab_of_a_deleted_history_job() {
+        // WI-2165: a completed job the user deleted from history no longer
+        // blocks the arr from grabbing the release again.
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let deleted = HistoryEntry {
+            client_removal: None,
+            id: "deleted-regrab".into(),
+            name: "Show.S01E17".into(),
+            category: "Default".into(),
+            status: JobStatus::Completed,
+            total_bytes: 100,
+            downloaded_bytes: 100,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E17"),
+            stages: Vec::new(),
+            error_message: None,
+            failure_code: None,
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
+        };
+        {
+            let db = manager.db.lock();
+            db.history_insert(&deleted).unwrap();
+            db.history_trash(&["deleted-regrab".to_string()], Utc::now())
+                .unwrap();
+        }
+
+        admit_duplicate_candidate(&manager, &tempdir, "Show.S01E17", DUPLICATE_NZB)
+            .expect("a deleted history job does not block a re-grab");
+        assert_eq!(manager.queue_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_retry_is_not_refused_by_its_own_history_row() {
+        let (manager, tempdir) = manager();
+        manager.set_duplicate_policy(DuplicatePolicy::Skip);
+        let failed = HistoryEntry {
+            client_removal: None,
+            id: "failed-show".into(),
+            name: "Show.S01E01".into(),
+            category: "Default".into(),
+            status: JobStatus::Failed,
+            total_bytes: 100,
+            downloaded_bytes: 10,
+            added_at: Utc::now(),
+            completed_at: Utc::now(),
+            download_time_secs: None,
+            output_dir: tempdir.path().join("complete").join("Show.S01E01"),
+            stages: Vec::new(),
+            error_message: Some("incomplete".into()),
+            failure_code: Some(JobFailureCode::ArticlesUnavailable),
+            post_processing: None,
+            delete_archives: None,
+            server_stats: Vec::new(),
+            nzb_data: Some(DUPLICATE_NZB.to_vec()),
+            retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
+        };
+        manager.db.lock().history_insert(&failed).unwrap();
+
+        let outcome = manager
+            .retry_history_entry(&failed)
+            .expect("retry is not a duplicate of itself");
+        assert!(matches!(outcome, HistoryRetryOutcome::Started(_)));
+        assert_eq!(manager.queue_size(), 1);
+    }
+
     fn manager() -> (Arc<QueueManager>, tempfile::TempDir) {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let db = Database::open_memory().expect("database");
-        let manager = QueueManager::new(
+        let manager = build_manager(db, tempdir.path());
+        (manager, tempdir)
+    }
+
+    /// A manager over a database file in `dir`, so a second one built over the
+    /// same path sees what the first persisted. In-memory handles are shared
+    /// by clone, which cannot model a restart: restoring into one still reads
+    /// the same live state it already had.
+    fn file_manager(dir: &std::path::Path) -> Arc<QueueManager> {
+        let db = Database::open(&dir.join("restart").with_extension("db")).expect("database");
+        build_manager(db, dir)
+    }
+
+    fn build_manager(db: Database, dir: &std::path::Path) -> Arc<QueueManager> {
+        QueueManager::new(
             Vec::new(),
             db,
-            tempdir.path().join("incomplete"),
-            tempdir.path().join("complete"),
+            dir.join("incomplete"),
+            dir.join("complete"),
             LogBuffer::default(),
             1,
             Vec::new(),
@@ -5407,8 +7383,7 @@ mod global_pause_tests {
             false,
             100.0,
             30,
-        );
-        (manager, tempdir)
+        )
     }
 
     fn insert_job(manager: &QueueManager, job: NzbJob) {
@@ -5427,14 +7402,74 @@ mod global_pause_tests {
                 nzb_data: None,
                 direct_unpacker: None,
                 hopeless_tracker: None,
+                repair_fold: None,
                 download_time_secs: None,
                 prior_download_secs: 0.0,
                 carried_bytes: 0,
                 failure_code: None,
+                par2_volumes: None,
                 output_dir_claimed: false,
+                persisted_status: None,
             },
         );
         manager.job_order.lock().push(id);
+    }
+
+    #[tokio::test]
+    async fn lowering_max_active_downloads_requeues_the_lowest_priority_job() {
+        let (manager, tempdir) = manager();
+        manager.set_max_active_downloads(2);
+
+        let mut first = job("keep", JobStatus::Downloading, tempdir.path());
+        first.priority = Priority::High;
+        first.downloaded_bytes = 40;
+        first.articles_downloaded = 4;
+        let mut second = job("drop", JobStatus::Downloading, tempdir.path());
+        second.priority = Priority::Low;
+        second.downloaded_bytes = 70;
+        second.articles_downloaded = 7;
+        insert_job(&manager, first);
+        insert_job(&manager, second);
+
+        manager.set_max_active_downloads(1);
+
+        let kept = manager.get_job("keep").expect("kept job");
+        let dropped = manager.get_job("drop").expect("requeued job");
+        assert_eq!(kept.status, JobStatus::Downloading);
+        assert_eq!(dropped.status, JobStatus::Queued);
+        // Requeue must not discard progress already on disk.
+        assert_eq!(dropped.downloaded_bytes, 70);
+        assert_eq!(dropped.articles_downloaded, 7);
+        assert_eq!(
+            manager
+                .jobs
+                .lock()
+                .values()
+                .filter(|state| state.job.status == JobStatus::Downloading)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn lowering_max_active_downloads_requeues_the_newest_when_priority_ties() {
+        let (manager, tempdir) = manager();
+        let mut older = job("older", JobStatus::Downloading, tempdir.path());
+        older.downloaded_bytes = 10;
+        let mut newer = job("newer", JobStatus::Downloading, tempdir.path());
+        newer.downloaded_bytes = 20;
+        insert_job(&manager, older);
+        insert_job(&manager, newer);
+
+        manager.set_max_active_downloads(1);
+
+        assert_eq!(
+            manager.get_job("older").unwrap().status,
+            JobStatus::Downloading
+        );
+        let requeued = manager.get_job("newer").unwrap();
+        assert_eq!(requeued.status, JobStatus::Queued);
+        assert_eq!(requeued.downloaded_bytes, 20);
     }
 
     #[tokio::test]
@@ -5646,6 +7681,7 @@ mod global_pause_tests {
             "work_dir": work_dir,
         });
         let entry = HistoryEntry {
+            client_removal: None,
             id: "retry".into(),
             name: "retry".into(),
             category: "Default".into(),
@@ -5664,6 +7700,8 @@ mod global_pause_tests {
             server_stats: Vec::new(),
             nzb_data: None,
             retry_data: None,
+            par2_volumes_fetched: None,
+            par2_volumes_available: None,
         };
         let retry_data = serde_json::to_vec(&checkpoint).unwrap();
 
@@ -5712,11 +7750,398 @@ mod global_pause_tests {
         insert_job(&manager, completed);
 
         let stage = manager
-            .run_postproc_script("script-job", JobStatus::Completed)
+            .run_postproc_script("script-job", JobStatus::Completed, &[])
             .await
             .unwrap();
         assert_eq!(stage.status, StageStatus::Success);
         assert!(stage.message.unwrap().contains("output truncated"));
+    }
+
+    /// The script gets SABnzbd's positional arguments and the `NZBPP_*`
+    /// environment next to the `SAB_*` names it always had.
+    #[tokio::test]
+    async fn postproc_script_receives_sab_arguments_and_nzbpp_env() {
+        let (manager, tempdir) = manager();
+        let record = tempdir.path().join("record.txt");
+        let script = tempdir.path().join("record.sh");
+        let body = r#"#!/bin/sh
+{ for a in "$@"; do printf 'arg:%s\n' "$a"; done; env | grep -E '^(NZBPP|SAB)_' | sort; } > RECORD_PATH
+"#
+        .replace("RECORD_PATH", &record.to_string_lossy());
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        manager.set_postproc_scripts(None, Some(script), None, 5, 4096);
+        let mut completed = job("script-job", JobStatus::Completed, tempdir.path());
+        completed.category = "tv".into();
+        completed.output_dir = tempdir.path().join("output");
+        std::fs::create_dir_all(&completed.output_dir).unwrap();
+        insert_job(&manager, completed.clone());
+
+        let stage = manager
+            .run_postproc_script("script-job", JobStatus::Completed, &[])
+            .await
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Success, "{stage:?}");
+
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        let output = completed.output_dir.to_string_lossy().into_owned();
+        assert_eq!(
+            lines[..8],
+            [
+                format!("arg:{output}"),
+                "arg:script-job".to_string(),
+                "arg:script-job".to_string(),
+                "arg:".to_string(),
+                "arg:tv".to_string(),
+                "arg:".to_string(),
+                "arg:0".to_string(),
+                "arg:".to_string(),
+            ],
+            "{recorded}"
+        );
+        for expected in [
+            "NZBPP_CATEGORY=tv".to_string(),
+            format!("NZBPP_DIRECTORY={output}"),
+            "NZBPP_NZBID=script-job".to_string(),
+            "NZBPP_NZBNAME=script-job".to_string(),
+            "NZBPP_PARSTATUS=0".to_string(),
+            "NZBPP_STATUS=SUCCESS/ALL".to_string(),
+            "NZBPP_UNPACKSTATUS=0".to_string(),
+            "SAB_CAT=tv".to_string(),
+            "SAB_STATUS=Completed".to_string(),
+        ] {
+            assert!(
+                lines.contains(&expected.as_str()),
+                "missing {expected}: {recorded}"
+            );
+        }
+    }
+
+    /// A failed job's script sees the failure in both contracts: SABnzbd's
+    /// `SAB_FAIL_MSG`/`SAB_STATUS` and NZBGet's `NZBPP_TOTALSTATUS` and
+    /// `<TOTAL>/<detail>` status.
+    #[tokio::test]
+    async fn postproc_script_env_reports_a_failure_with_a_repair_detail() {
+        let (manager, tempdir) = manager();
+        let record = tempdir.path().join("record.txt");
+        let script = tempdir.path().join("record.sh");
+        let body = format!(
+            "#!/bin/sh\nenv | grep -E '^(NZBPP|SAB)_' | sort > {}\n",
+            record.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        manager.set_postproc_scripts(None, None, Some(script), 5, 4096);
+        let mut broken = job("broken-job", JobStatus::Failed, tempdir.path());
+        broken.error_message = Some("3 blocks could not be repaired".into());
+        broken.output_dir = tempdir.path().join("output");
+        std::fs::create_dir_all(&broken.output_dir).unwrap();
+        insert_job(&manager, broken);
+
+        let stages = [StageResult {
+            name: "Repair".into(),
+            status: StageStatus::Failed,
+            message: Some("not enough recovery blocks".into()),
+            duration_secs: 0.0,
+        }];
+        let stage = manager
+            .run_postproc_script("broken-job", JobStatus::Failed, &stages)
+            .await
+            .unwrap();
+        assert_eq!(stage.status, StageStatus::Success, "{stage:?}");
+
+        let recorded = std::fs::read_to_string(&record).unwrap();
+        for expected in [
+            "SAB_STATUS=Failed",
+            "SAB_FAIL_MSG=3 blocks could not be repaired",
+            "SAB_PP_STATUS=1",
+            "NZBPP_TOTALSTATUS=FAILURE",
+            "NZBPP_STATUS=FAILURE/PAR",
+            "NZBPP_PARSTATUS=1",
+            "NZBPP_UNPACKSTATUS=0",
+        ] {
+            assert!(
+                recorded.lines().any(|line| line == expected),
+                "missing {expected}: {recorded}"
+            );
+        }
+    }
+
+    /// A successful unpack reports success in NZBGet's numeric codes, and a
+    /// failed extraction is `FAILURE/UNPACK` rather than a repair failure.
+    #[test]
+    fn nzbpp_codes_describe_the_stage_that_ran() {
+        let stage = |name: &str, status: StageStatus| StageResult {
+            name: name.into(),
+            status,
+            message: None,
+            duration_secs: 0.0,
+        };
+        let unpacked = [
+            stage("Verify", StageStatus::Success),
+            stage("Extract", StageStatus::Success),
+        ];
+        assert_eq!(nzbpp_par_status(&unpacked), 2);
+        assert_eq!(nzbpp_unpack_status(&unpacked), 2);
+        assert_eq!(nzbpp_status("SUCCESS", &unpacked, true), "SUCCESS/ALL");
+
+        let failed_unpack = [
+            stage("Verify", StageStatus::Success),
+            stage("Extract", StageStatus::Failed),
+        ];
+        assert_eq!(nzbpp_par_status(&failed_unpack), 2);
+        assert_eq!(nzbpp_unpack_status(&failed_unpack), 1);
+        assert_eq!(
+            nzbpp_status("FAILURE", &failed_unpack, false),
+            "FAILURE/UNPACK"
+        );
+
+        // No stages means nothing ran, not a successful check.
+        assert_eq!(nzbpp_par_status(&[]), 0);
+        assert_eq!(nzbpp_unpack_status(&[]), 0);
+        // A skipped verify is not a check; the job reported no PAR2 work.
+        let skipped = [stage("Verify", StageStatus::Skipped)];
+        assert_eq!(nzbpp_par_status(&skipped), 0);
+        assert_eq!(nzbpp_unpack_status(&skipped), 0);
+    }
+
+    /// `SAB_FILES` is SABnzbd's JSON array, relative to the complete
+    /// directory, and the priority and job level use their own numbering.
+    #[test]
+    fn sab_files_and_priority_follow_sabnzbd() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let output = tempdir.path().join("output");
+        std::fs::create_dir_all(output.join("nested")).unwrap();
+        std::fs::write(output.join("a.mkv"), b"a").unwrap();
+        std::fs::write(output.join("nested/b.srt"), b"b").unwrap();
+
+        let mut completed = job("files-job", JobStatus::Completed, tempdir.path());
+        completed.output_dir = output;
+        completed.priority = Priority::High;
+        completed.pp_override = Some(2);
+
+        let env = postproc_script_env(
+            &completed,
+            JobStatus::Completed,
+            &[],
+            std::path::Path::new("/scripts/post.sh"),
+            2,
+        );
+        let value = |name: &str| {
+            env.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+
+        let files: Vec<String> = serde_json::from_str(value("SAB_FILES")).unwrap();
+        assert_eq!(files, ["a.mkv", "nested/b.srt"]);
+        assert_eq!(value("SAB_PRIORITY"), "1");
+        assert_eq!(value("SAB_PP"), "2");
+        assert_eq!(value("SAB_REPAIR"), "0");
+        assert_eq!(value("SAB_UNPACK"), "1");
+        assert_eq!(value("SAB_SCRIPT"), "post.sh");
+
+        assert_eq!(sab_priority(Priority::Low), -1);
+        assert_eq!(sab_priority(Priority::Normal), 0);
+        assert_eq!(sab_priority(Priority::Force), 2);
+    }
+
+    #[test]
+    fn postproc_status_code_matches_sabnzbd_codes() {
+        let stage = |name: &str, status: StageStatus| StageResult {
+            name: name.into(),
+            status,
+            message: None,
+            duration_secs: 0.0,
+        };
+        let ok = [
+            stage("Verify", StageStatus::Success),
+            stage("Extract", StageStatus::Success),
+        ];
+        assert_eq!(postproc_status_code(&ok), 0);
+        let verify_failed = [stage("Repair", StageStatus::Failed)];
+        assert_eq!(postproc_status_code(&verify_failed), 1);
+        let unpack_failed = [stage("Extract", StageStatus::Failed)];
+        assert_eq!(postproc_status_code(&unpack_failed), 2);
+        let both = [
+            stage("Verify", StageStatus::Failed),
+            stage("Extract", StageStatus::Failed),
+        ];
+        assert_eq!(postproc_status_code(&both), 3);
+    }
+
+    /// A `done.sh` script that appends `ran` to a marker file, installed as
+    /// the scripts directory. Returns the marker path.
+    fn install_marker_script(manager: &QueueManager, root: &std::path::Path) -> std::path::PathBuf {
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        // The script runs from the complete directory, which startup creates.
+        std::fs::create_dir_all(root.join("complete")).unwrap();
+        let marker = root.join("drained.txt");
+        let script = scripts.join("done.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho ran >> '{}'\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        manager.set_postproc_scripts(Some(scripts), None, None, 5, 4096);
+        manager
+            .set_queue_complete_action(Some("script_done.sh"))
+            .unwrap();
+        marker
+    }
+
+    /// `change_complete_action` runs its script when the last active job
+    /// finishes, not while another job is still active, and then resets.
+    #[tokio::test]
+    async fn queue_complete_action_runs_script_once_queue_drains() {
+        let (manager, tempdir) = manager();
+        let marker = install_marker_script(&manager, tempdir.path());
+        assert!(
+            manager
+                .set_queue_complete_action(Some("script_missing.sh"))
+                .is_err()
+        );
+        assert!(
+            manager
+                .set_queue_complete_action(Some("shutdown_pc"))
+                .is_err()
+        );
+        assert_eq!(
+            manager.queue_complete_action().as_deref(),
+            Some("script_done.sh")
+        );
+
+        insert_job(&manager, job("first", JobStatus::Completed, tempdir.path()));
+        insert_job(
+            &manager,
+            job("second", JobStatus::Downloading, tempdir.path()),
+        );
+        assert!(!queue_drained_by(&manager.jobs.lock(), "first"));
+        manager.jobs.lock().get_mut("second").unwrap().job.status = JobStatus::Completed;
+        assert!(queue_drained_by(&manager.jobs.lock(), "second"));
+
+        manager.run_queue_complete_action().await;
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+        // Not persistent (`queue_complete_pers` off), so the action is reset.
+        assert_eq!(manager.queue_complete_action(), None);
+        assert_eq!(
+            manager
+                .db
+                .lock()
+                .get_setting(QueueManager::QUEUE_COMPLETE_ACTION_SETTING),
+            Some(String::new())
+        );
+    }
+
+    /// `par2.trust_inflight_verify` is on by default and the setter turns it off.
+    #[tokio::test]
+    async fn trust_inflight_verify_defaults_on_and_follows_config() {
+        let (manager, _tempdir) = manager();
+        assert!(manager.trust_inflight_verify.load(Ordering::SeqCst));
+        manager.set_trust_inflight_verify(false);
+        assert!(!manager.trust_inflight_verify.load(Ordering::SeqCst));
+    }
+
+    /// With `queue_complete_pers` the action survives its run.
+    #[tokio::test]
+    async fn queue_complete_action_persists_when_pers_is_set() {
+        let (manager, tempdir) = manager();
+        let marker = install_marker_script(&manager, tempdir.path());
+        manager.set_queue_complete_persist(true);
+
+        manager.run_queue_complete_action().await;
+        manager.run_queue_complete_action().await;
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\nran\n");
+        assert_eq!(
+            manager.queue_complete_action().as_deref(),
+            Some("script_done.sh")
+        );
+    }
+
+    /// Removing the last active job drains the queue and runs the action.
+    #[tokio::test]
+    async fn removing_last_active_job_runs_queue_complete_action() {
+        let (manager, tempdir) = manager();
+        let marker = install_marker_script(&manager, tempdir.path());
+        insert_job(
+            &manager,
+            job("only", JobStatus::Downloading, tempdir.path()),
+        );
+
+        manager.remove_job("only").unwrap();
+        // The removal spawns the action; wait for its script to finish.
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+    }
+
+    /// A job that hopelessly aborts and leaves the queue empty runs the action.
+    #[tokio::test]
+    async fn hopeless_abort_of_last_job_runs_queue_complete_action() {
+        let (manager, tempdir) = manager();
+        let marker = install_marker_script(&manager, tempdir.path());
+        insert_job(
+            &manager,
+            job("doomed", JobStatus::Downloading, tempdir.path()),
+        );
+        let (progress_tx, progress_rx) = mpsc::channel(4);
+        let handler = tokio::spawn(Arc::clone(&manager).handle_progress(
+            "doomed".to_string(),
+            progress_rx,
+            Arc::new(SpeedTracker::new()),
+        ));
+
+        progress_tx
+            .send(ProgressUpdate::JobAborted {
+                job_id: "doomed".to_string(),
+                reason: "all articles unavailable".to_string(),
+                articles_failed: 1,
+                download_time_secs: 0.5,
+            })
+            .await
+            .unwrap();
+        drop(progress_tx);
+        handler.await.unwrap();
+
+        assert_eq!(manager.get_job("doomed").unwrap().status, JobStatus::Failed);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
+    }
+
+    /// A job that fails the post-processing disk-space guard runs the action
+    /// once it is the last job in the queue.
+    #[tokio::test]
+    async fn disk_space_failure_of_last_job_runs_queue_complete_action() {
+        let (manager, tempdir) = manager();
+        let marker = install_marker_script(&manager, tempdir.path());
+        insert_job(
+            &manager,
+            job("full-disk", JobStatus::Downloading, tempdir.path()),
+        );
+        manager.set_min_free_space(u64::MAX);
+
+        manager.on_job_finished("full-disk", true, 0).await;
+
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran\n");
     }
 
     #[tokio::test]
@@ -5895,6 +8320,601 @@ mod global_pause_tests {
     }
 
     #[tokio::test]
+    async fn schedule_pause_ownership_survives_a_restart() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let decision = crate::nzb_core::schedule::ScheduleDecision {
+            active_rule_ids: vec!["quiet".into()],
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&decision, true);
+        assert!(manager.is_paused());
+        assert!(manager.schedule_pause_active());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+        assert_eq!(
+            manager
+                .db
+                .lock()
+                .get_setting("global_pause_owner")
+                .as_deref(),
+            Some("schedule")
+        );
+
+        // A restart rebuilds the pause from the database. The schedule must
+        // still own it, or the window ending could never resume the queue.
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
+        restarted.restore_from_db().unwrap();
+        assert!(restarted.is_paused());
+        assert!(restarted.schedule_pause_active());
+        assert_eq!(restarted.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // A user Pause All during the window takes ownership, so the window
+        // ending leaves their pause alone.
+        restarted.pause_all();
+        assert!(!restarted.schedule_pause_active());
+        assert_eq!(restarted.global_pause_reason(), Some(PauseReason::Global));
+        // Close and reopen the window: a user pause is not the schedule's to
+        // lift, so reopening must not replace the user's ownership with its
+        // own.
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        restarted.apply_schedule(&decision, true);
+        assert!(
+            restarted.is_paused(),
+            "a user pause is not the schedule's to lift"
+        );
+        assert_eq!(
+            restarted
+                .db
+                .lock()
+                .get_setting("global_pause_owner")
+                .as_deref(),
+            Some("user")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_resume_inside_a_window_holds_until_the_window_closes() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            active_rule_ids: vec!["quiet".into()],
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // The user overrides the schedule for this window.
+        manager.resume_all();
+        assert!(!manager.is_paused());
+        assert!(!manager.schedule_pause_active());
+
+        // Every subsequent tick inside the window sees the same decision. The
+        // pause is edge-triggered, so none of them may re-pause the queue.
+        for _ in 0..5 {
+            manager.apply_schedule(&open, true);
+            assert!(
+                !manager.is_paused(),
+                "a manual resume must survive the rest of the window"
+            );
+        }
+
+        // When the window closes the schedule has nothing to lift, and the
+        // next window opening pauses again.
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(!manager.is_paused());
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+    }
+
+    #[tokio::test]
+    async fn a_window_opening_while_the_user_is_paused_leaves_the_user_owner() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        manager.pause_all();
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+        assert!(!manager.schedule_pause_active());
+
+        // The window ending must not resume a pause the user owns.
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(
+            manager.is_paused(),
+            "a user pause outlives the window that opened during it"
+        );
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+    }
+
+    #[tokio::test]
+    async fn a_restart_inside_a_window_still_lifts_the_pause_when_it_ends() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.schedule_pause_active());
+
+        // A restart restores the schedule-owned pause from the database. The
+        // window must be rebuilt with it, or the end of the window would be
+        // read as "no change" and the queue would stay paused forever.
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
+        restarted.restore_from_db().unwrap();
+        assert!(restarted.schedule_pause_active());
+
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(
+            !restarted.is_paused(),
+            "the window ending after a restart still resumes the queue"
+        );
+        assert!(!restarted.schedule_pause_active());
+    }
+
+    #[tokio::test]
+    async fn a_window_opening_during_a_disk_hold_keeps_pausing_after_the_hold_lifts() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        // The guard trips first, so its hold is the only one there is.
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+
+        // A pause window then opens. It must be recorded even though the
+        // queue is already paused, or it would never take effect.
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            pause_windows: vec!["quiet@2026-10-20".into()],
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert_eq!(
+            manager.global_pause_reason(),
+            Some(PauseReason::DiskSpace),
+            "the disk hold is still the reason while the window overlaps it"
+        );
+
+        // Space frees up. The guard lifts only its own hold; the window is
+        // still open, so downloads must not run straight through it.
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert!(
+            manager.is_paused(),
+            "the queue ran through a pause window that opened during a disk hold"
+        );
+        assert!(manager.schedule_pause_active());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // And the window ending resumes, as usual.
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(!manager.is_paused());
+        assert!(!manager.schedule_pause_active());
+    }
+
+    #[tokio::test]
+    async fn a_manual_resume_inside_a_window_survives_a_restart() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            pause_windows: vec!["quiet@2026-10-20".into()],
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+
+        // The user overrides the schedule for this window, then the process
+        // restarts while the window is still open.
+        manager.resume_all();
+        assert!(!manager.is_paused());
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
+        restarted.restore_from_db().unwrap();
+        assert!(!restarted.is_paused());
+
+        // The monitor's first tick after the restart re-applies the same open
+        // window. It must not re-pause what the user just resumed.
+        restarted.apply_schedule(&open, true);
+        assert!(
+            !restarted.is_paused(),
+            "a restart inside a window undid a manual resume"
+        );
+
+        // Closing the window changes nothing, and the next window pauses.
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(!restarted.is_paused());
+        let next = crate::nzb_core::schedule::ScheduleDecision {
+            pause_windows: vec!["quiet@2026-10-21".into()],
+            ..open.clone()
+        };
+        restarted.apply_schedule(&next, true);
+        assert!(
+            restarted.is_paused(),
+            "the next window must pause again after a resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_during_a_disk_hold_keeps_the_overlapping_window() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let manager = file_manager(tempdir.path());
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        // The disk guard holds the queue, then a pause window opens on top of
+        // it. Both holds are live at once, so both must be persisted.
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            active_rule_ids: vec!["quiet".into()],
+            pause: true,
+            pause_windows: vec!["quiet@2026-10-20".into()],
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+
+        // A restart rebuilds both holds. Recording a single ranked owner lost
+        // the schedule hold here, so the guard lifting its own hold later
+        // resumed downloads straight through the rest of the window.
+        drop(manager);
+        let restarted = file_manager(tempdir.path());
+        restarted.restore_from_db().unwrap();
+        assert!(restarted.is_paused());
+        assert_eq!(
+            restarted.global_pause_reason(),
+            Some(PauseReason::DiskSpace)
+        );
+
+        restarted.set_min_free_space(1);
+        restarted.enforce_disk_guard();
+        assert_eq!(
+            restarted.global_pause_reason(),
+            Some(PauseReason::Schedule),
+            "a restart dropped the schedule hold overlapping the disk hold"
+        );
+
+        // The window closing is what resumes the queue.
+        restarted.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(!restarted.is_paused());
+    }
+
+    #[tokio::test]
+    async fn an_expiring_timed_pause_leaves_a_disk_hold_in_place() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        manager.pause_all();
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+
+        manager.expire_user_hold();
+        assert!(
+            manager.is_paused(),
+            "a timed pause expiring resumed with the disk still full"
+        );
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::DiskSpace));
+    }
+
+    #[tokio::test]
+    async fn a_user_pause_outlives_the_disk_hold_it_overlapped() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        // "Pause for 2h" covers the low-disk warning; space frees while the
+        // user pause still runs.
+        manager.set_min_free_space(u64::MAX);
+        manager.enforce_disk_guard();
+        manager.pause_all();
+        manager.pause_for(60);
+        // The guard notices space is back and lifts only its own hold.
+        manager.set_min_free_space(1);
+        manager.enforce_disk_guard();
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+
+        // The user pause expiring must not bring the disk hold back or, worse,
+        // resume while it should still be holding.
+        manager.expire_user_hold();
+        assert!(!manager.is_paused());
+    }
+
+    #[tokio::test]
+    async fn a_manual_resume_is_recorded_so_the_next_tick_does_not_re_pause() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+        let open = decision(&["quiet@2026-10-20"]);
+
+        manager.apply_schedule(&open, true);
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+        manager.resume_all();
+        assert!(!manager.is_paused());
+
+        // The same occurrence on the next tick stays resumed...
+        manager.apply_schedule(&open, true);
+        assert!(!manager.is_paused());
+        // ...while the next window pauses again.
+        manager.apply_schedule(&decision(&["quiet@2026-10-21"]), true);
+        assert!(manager.is_paused());
+    }
+
+    fn decision(windows: &[&str]) -> crate::nzb_core::schedule::ScheduleDecision {
+        crate::nzb_core::schedule::ScheduleDecision {
+            active_rule_ids: windows.iter().map(|window| window.to_string()).collect(),
+            pause: !windows.is_empty(),
+            pause_windows: windows.iter().map(|window| window.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn one_of_two_overlapping_windows_closing_does_not_pause_again() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        // A (20:00-24:00) and B (22:00-02:00) are open together.
+        let both = decision(&["a@2026-10-19", "b@2026-10-19"]);
+        manager.apply_schedule(&both, true);
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+
+        // The user resumes inside the overlap.
+        manager.resume_all();
+        assert!(!manager.is_paused());
+
+        // Still inside both windows: no rising edge, so no re-pause.
+        manager.apply_schedule(&both, true);
+        assert!(!manager.is_paused());
+
+        // A closes at midnight while B is still open. The old key changed, so
+        // a joined key looked like a new window; the occurrence that is still
+        // open is the same one, so the resume must hold.
+        let just_b = decision(&["b@2026-10-19"]);
+        manager.apply_schedule(&just_b, true);
+        assert!(
+            !manager.is_paused(),
+            "a window closing out of an overlap re-paused a manual resume"
+        );
+
+        // The next occurrence of B does pause again.
+        manager.apply_schedule(&decision(&["b@2026-10-20"]), true);
+        assert!(manager.is_paused(), "the next window must pause");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_pause_cancels_the_first_timers_auto_resume() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        // The first timer expires at +60s, then a plain Pause All replaces it:
+        // the queue must stay paused when that timer wakes up.
+        manager.pause_for(60);
+        // Let the spawned timer register its sleep before the clock moves; a
+        // paused clock does not wake a task that has not been polled yet.
+        tokio::task::yield_now().await;
+        manager.pause_all();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        // Let the timer task run to its comparison.
+        tokio::task::yield_now().await;
+        assert!(
+            manager.is_paused(),
+            "an earlier timed pause resumed a later plain pause"
+        );
+        assert_eq!(manager.pause_remaining_secs(), None);
+
+        // A later timed pause is not cancelled by an earlier timer either: at
+        // +61s a 120s pause is still running, and the first timer must not
+        // resume it.
+        manager.pause_for(120);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            manager.is_paused(),
+            "the earlier timer resumed a newer timed pause"
+        );
+        assert!(manager.pause_remaining_secs().is_some_and(|secs| secs > 0));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_pause_expiring_pauses_into_an_open_window() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+        let open = decision(&["quiet@2026-10-20"]);
+
+        manager.pause_for(60);
+        tokio::task::yield_now().await;
+        // The window opens while the user's timed pause still covers it.
+        manager.apply_schedule(&open, true);
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Global));
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            manager.is_paused(),
+            "the timed pause resumed straight into an open window"
+        );
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+    }
+
+    #[tokio::test]
+    async fn disabling_the_schedule_inside_a_window_lifts_its_pause() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("queued", JobStatus::Queued, tempdir.path()));
+
+        let open = crate::nzb_core::schedule::ScheduleDecision {
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+
+        // Turning the schedule off substitutes an idle decision, which is the
+        // window closing from the queue's point of view.
+        manager.apply_schedule(&open, false);
+        assert!(!manager.is_paused());
+        assert!(!manager.schedule_pause_active());
+
+        // And re-enabling it opens a fresh window.
+        manager.apply_schedule(&open, true);
+        assert!(manager.is_paused());
+        assert_eq!(manager.global_pause_reason(), Some(PauseReason::Schedule));
+    }
+
+    #[tokio::test]
+    async fn schedule_speed_cap_overlays_the_configured_limit_without_rewriting_it() {
+        let (manager, _tempdir) = manager();
+        manager.set_speed_limit(5_000_000);
+        assert_eq!(manager.configured_speed_limit(), 5_000_000);
+
+        let cap = crate::nzb_core::schedule::ScheduleDecision {
+            speed_limit_bps: Some(1_000_000),
+            ..Default::default()
+        };
+        manager.apply_schedule(&cap, true);
+        assert_eq!(manager.scheduled_speed_cap(), Some(1_000_000));
+        assert_eq!(manager.configured_speed_limit(), 5_000_000);
+        // The limiter the downloader reads is the cap, not the user's value.
+        assert_eq!(manager.get_speed_limit(), 1_000_000);
+
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert_eq!(manager.scheduled_speed_cap(), None);
+        assert_eq!(manager.configured_speed_limit(), 5_000_000);
+        // ...and ending the window puts the user's limit back on the wire.
+        assert_eq!(manager.get_speed_limit(), 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_cap_of_zero_means_unlimited_even_over_a_configured_limit() {
+        let (manager, _tempdir) = manager();
+        manager.set_speed_limit(5_000_000);
+
+        let cap = crate::nzb_core::schedule::ScheduleDecision {
+            speed_limit_bps: Some(0),
+            ..Default::default()
+        };
+        manager.apply_schedule(&cap, true);
+        assert_eq!(manager.scheduled_speed_cap(), Some(0));
+        assert_eq!(
+            manager.get_speed_limit(),
+            0,
+            "an explicit 0 cap lifts the user's limit for the window"
+        );
+
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert_eq!(manager.get_speed_limit(), 5_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_disabled_schedule_applies_nothing_and_lifts_an_active_cap() {
+        let (manager, _tempdir) = manager();
+        manager.set_speed_limit(5_000_000);
+
+        let cap = crate::nzb_core::schedule::ScheduleDecision {
+            speed_limit_bps: Some(1_000_000),
+            disabled_servers: vec!["backup".into()],
+            pause: true,
+            ..Default::default()
+        };
+        manager.apply_schedule(&cap, true);
+        assert_eq!(manager.get_speed_limit(), 1_000_000);
+        assert!(manager.schedule_pause_active());
+
+        // Toggling the schedule off must release everything it applied, even
+        // though the decision it is handed still says otherwise.
+        manager.apply_schedule(&cap, false);
+        assert_eq!(manager.scheduled_speed_cap(), None);
+        assert_eq!(manager.get_speed_limit(), 5_000_000);
+        assert!(manager.schedule_disabled_servers().is_empty());
+        assert!(!manager.schedule_pause_active());
+        assert!(!manager.is_paused());
+    }
+
+    #[tokio::test]
+    async fn schedule_server_exclusions_leave_the_configured_list_alone() {
+        let (manager, _tempdir) = manager();
+        let server = |id: &str| {
+            let mut config = ServerConfig::new(id, format!("{id}.example.com"));
+            config.enabled = true;
+            config
+        };
+        manager.update_servers(vec![server("primary"), server("backup")]);
+        assert!(manager.get_servers().iter().all(|s| s.enabled));
+
+        let decision = crate::nzb_core::schedule::ScheduleDecision {
+            disabled_servers: vec!["backup".into()],
+            ..Default::default()
+        };
+        manager.apply_schedule(&decision, true);
+        assert_eq!(manager.schedule_disabled_servers(), vec!["backup"]);
+        assert!(
+            manager
+                .get_servers()
+                .iter()
+                .find(|s| s.id == "backup")
+                .is_some_and(|s| s.enabled),
+            "the configured list keeps its own enabled flags"
+        );
+        assert!(
+            manager
+                .live_servers()
+                .iter()
+                .find(|s| s.id == "backup")
+                .is_some_and(|s| !s.enabled),
+            "the dispatcher sees the exclusion"
+        );
+
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+        assert!(manager.schedule_disabled_servers().is_empty());
+        assert!(manager.live_servers().iter().all(|s| s.enabled));
+    }
+
+    #[tokio::test]
     async fn preflight_storage_hold_reports_disk_space_and_resumes_when_space_frees() {
         let (manager, tempdir) = manager();
         insert_job(&manager, job("held", JobStatus::Paused, tempdir.path()));
@@ -5946,6 +8966,40 @@ mod global_pause_tests {
             .job
             .error_message = Some("server unavailable".to_string());
         assert_eq!(manager.pause_reason("srv"), Some(PauseReason::Server));
+    }
+
+    /// Neither loading nor an idle monitor tick may write pause settings.
+    ///
+    /// The e2e seed inserts its own `globally_paused` row after the backend's
+    /// first start; if boot materialises the defaults the seed collides with
+    /// them.
+    #[tokio::test]
+    async fn a_fresh_database_gets_no_pause_settings_from_boot() {
+        let (manager, _tempdir) = manager();
+        manager.restore_from_db().unwrap();
+        manager.apply_schedule(
+            &crate::nzb_core::schedule::ScheduleDecision::default(),
+            true,
+        );
+
+        for key in [
+            "globally_paused",
+            QueueManager::USER_HOLD_SETTING,
+            QueueManager::SCHEDULE_HOLD_SETTING,
+            QueueManager::DISK_SPACE_HOLD_SETTING,
+            QueueManager::PAUSE_OWNER_SETTING,
+            QueueManager::SCHEDULE_WINDOWS_SETTING,
+            QueueManager::SCHEDULE_TRIGGERED_SETTING,
+            QueueManager::SCHEDULE_RESUMED_SETTING,
+            QueueManager::SCHEDULE_USER_PAUSED_SETTING,
+        ] {
+            assert_eq!(
+                manager.db.lock().get_setting(key),
+                None,
+                "{key} was written on load"
+            );
+        }
+        assert!(!manager.is_paused());
     }
 
     #[tokio::test]
@@ -6628,6 +9682,129 @@ mod global_pause_tests {
         assert!(!foreign.with_file_name("SameName.2").exists());
     }
 
+    /// A progress save waiting on the database (a slow history query, say)
+    /// must not hold the job list: queue and status polls read `get_jobs()`
+    /// and have to answer while the save is still pending.
+    #[tokio::test]
+    async fn queue_reads_are_not_blocked_behind_a_pending_progress_save() {
+        let (manager, tempdir) = manager();
+        insert_job(
+            &manager,
+            job("busy", JobStatus::Downloading, tempdir.path()),
+        );
+
+        let db_guard = manager.db.lock();
+        let saver = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.persist_job_progress("busy"))
+        };
+        // Let the save take its snapshot and block on the database lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !saver.is_finished(),
+            "save should be waiting on the DB lock"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || {
+                let _ = tx.send(manager.get_jobs().len());
+            })
+        };
+        let seen = rx.recv_timeout(Duration::from_secs(2));
+        drop(db_guard);
+        saver.join().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            seen.expect("get_jobs() blocked behind a pending progress save"),
+            1
+        );
+        assert!(
+            manager
+                .db
+                .lock()
+                .queue_load_job_data("busy")
+                .unwrap()
+                .is_some(),
+            "the save completes once the database is free"
+        );
+    }
+
+    fn db_status(manager: &QueueManager, id: &str) -> JobStatus {
+        manager
+            .db
+            .lock()
+            .queue_list()
+            .unwrap()
+            .into_iter()
+            .find(|j| j.id == id)
+            .expect("queue row")
+            .status
+    }
+
+    /// Run a progress save that snapshots `from`, then, while it waits on the
+    /// database, apply a pause or resume the way the control paths do (job
+    /// list, then database) and let the save finish. The database must keep
+    /// the newer status.
+    fn status_change_during_pending_save(from: JobStatus, to: JobStatus) {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("raced", from, tempdir.path()));
+        manager.persist_job_progress("raced");
+        assert_eq!(db_status(&manager, "raced"), from);
+
+        let db_guard = manager.db.lock();
+        let saver = {
+            let manager = Arc::clone(&manager);
+            std::thread::spawn(move || manager.persist_job_progress("raced"))
+        };
+        // Let the save take its snapshot and block on the database lock.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !saver.is_finished(),
+            "save should be waiting on the DB lock"
+        );
+        {
+            let mut jobs = manager.jobs.lock();
+            let state = jobs.get_mut("raced").unwrap();
+            state.job.status = to;
+            state.persisted_status = Some(to);
+            db_guard
+                .queue_update_progress("raced", to, 0, 0, 0, 0)
+                .unwrap();
+        }
+        drop(db_guard);
+        saver.join().unwrap();
+
+        assert_eq!(
+            db_status(&manager, "raced"),
+            to,
+            "a stale progress save overwrote the newer status"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_progress_save_does_not_undo_a_pause() {
+        status_change_during_pending_save(JobStatus::Downloading, JobStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn pending_progress_save_does_not_undo_a_resume() {
+        status_change_during_pending_save(JobStatus::Paused, JobStatus::Downloading);
+    }
+
+    /// A status set only in memory (pause all, say) still reaches the
+    /// database through the next progress save.
+    #[tokio::test]
+    async fn progress_save_persists_an_in_memory_status_change() {
+        let (manager, tempdir) = manager();
+        insert_job(&manager, job("mem", JobStatus::Downloading, tempdir.path()));
+        manager.persist_job_progress("mem");
+        manager.jobs.lock().get_mut("mem").unwrap().job.status = JobStatus::Paused;
+        manager.persist_job_progress("mem");
+        assert_eq!(db_status(&manager, "mem"), JobStatus::Paused);
+    }
+
     #[tokio::test]
     async fn checkpoint_carries_download_accounting_across_a_restart() {
         let (manager, tempdir) = manager();
@@ -6693,6 +9870,7 @@ mod global_pause_tests {
             .db
             .lock()
             .history_insert(&HistoryEntry {
+                client_removal: None,
                 id: finished.id.clone(),
                 name: finished.name.clone(),
                 category: finished.category.clone(),
@@ -6711,6 +9889,8 @@ mod global_pause_tests {
                 retry_data: None,
                 delete_archives: None,
                 post_processing: None,
+                par2_volumes_fetched: None,
+                par2_volumes_available: None,
             })
             .unwrap();
         insert_job(&manager, finished);
@@ -6856,7 +10036,118 @@ mod hopeless_tests {
             content_articles_checked: 0,
             content_articles_failed: 0,
             content_articles_total: content_articles,
+            has_par2_set: par2_articles > 0,
+            recovery_blocks_known: true,
+            confirmed_missing_files: std::collections::HashSet::new(),
+            confirmed_missing_unattributed: 0,
         }
+    }
+
+    /// A tracker for a job with a PAR2 set carrying `recovery_blocks` slices.
+    fn par2_tracker(recovery_blocks: u64) -> HopelessTracker {
+        let mut t = make_tracker(1000, 0);
+        t.has_par2_set = true;
+        t.recovery_blocks_total = recovery_blocks;
+        t.recovery_capacity_bytes = recovery_blocks * 750_000;
+        t
+    }
+
+    fn fail(t: &mut HopelessTracker, file: &str, kind: nzb_dispatch::ArticleFailureKind) {
+        t.record_file_failure(Some(file), false, 750_000, kind);
+    }
+
+    #[test]
+    fn parity_aborts_when_damage_exceeds_zero_recovery() {
+        let mut t = par2_tracker(0);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        let abort = t.check(true, true, 100.2).expect("no recovery: hopeless");
+        assert_eq!(abort.tier, "parity");
+        assert!(
+            abort
+                .reason
+                .contains("slice(s) missing but the release only carries 0 recovery slice(s)"),
+            "{}",
+            abort.reason
+        );
+    }
+
+    #[test]
+    fn parity_does_not_abort_within_recovery() {
+        let mut t = par2_tracker(20);
+        for _ in 0..6 {
+            fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    #[test]
+    fn parity_counts_each_damaged_file_once_at_least() {
+        let mut t = par2_tracker(2);
+        for file in ["a", "b", "c"] {
+            fail(&mut t, file, nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert_eq!(t.damaged_slices_lower_bound(), 3);
+        assert_eq!(t.check(true, true, 100.2).unwrap().tier, "parity");
+    }
+
+    #[test]
+    fn parity_ignores_decode_errors_and_transient_failures() {
+        let mut t = par2_tracker(0);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::DecodeError);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::Timeout);
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::ServerDown);
+        assert_eq!(t.damaged_slices_lower_bound(), 0);
+        assert!(t.parity_check().is_none());
+    }
+
+    #[test]
+    fn parity_stands_aside_when_a_volume_block_count_is_unknown() {
+        let mut t = par2_tracker(0);
+        t.recovery_blocks_known = false;
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        assert!(t.parity_check().is_none());
+    }
+
+    #[test]
+    fn parity_waits_for_obfuscated_files_to_be_classified() {
+        let mut t = par2_tracker(0);
+        t.pending_file_classifications.insert("x".into());
+        fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    #[test]
+    fn job_without_par2_keeps_the_article_grace() {
+        let mut t = make_tracker(1000, 0);
+        for _ in 0..3 {
+            fail(&mut t, "mkv", nzb_dispatch::ArticleFailureKind::NotFound);
+        }
+        assert!(t.check(true, true, 100.2).is_none());
+    }
+
+    fn map(damaged: usize, unknown: usize, recovery: u32) -> SliceMapSummary {
+        let mut states = vec![SliceVerdict::Damaged; damaged];
+        states.extend(vec![SliceVerdict::Unknown; unknown]);
+        SliceMapSummary {
+            states,
+            recovery_block_count: recovery,
+            damaged,
+            unknown,
+        }
+    }
+
+    #[test]
+    fn parity_diagnosis_uses_confirmed_damage_only() {
+        assert_eq!(
+            parity_diagnosis(&map(7, 0, 0), Some(5)).as_deref(),
+            Some("7 slice(s) missing but the release only carries 5 recovery slice(s)")
+        );
+        // Unknown slices are unestablished and never tip the balance.
+        assert_eq!(parity_diagnosis(&map(2, 40, 0), Some(2)), None);
+        // The index's own count can cover what filenames do not declare.
+        assert_eq!(parity_diagnosis(&map(3, 0, 4), Some(0)), None);
+        // Unknown declared recovery: no decision.
+        assert_eq!(parity_diagnosis(&map(9, 0, 0), None), None);
     }
 
     #[test]
